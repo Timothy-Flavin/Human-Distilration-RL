@@ -88,7 +88,7 @@ def main():
     metrics = MetricsLogger()
     router = LLMRouter(buffers['curriculum'], buffers['ssl'])
     
-    TOTAL_ITERATIONS = 10
+    TOTAL_ITERATIONS = 20
     
     for iteration in range(TOTAL_ITERATIONS):
         print(f"\n=== Starting Iteration {iteration} ===")
