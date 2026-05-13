@@ -138,14 +138,16 @@ def main():
             # Supervised Updates
             if len(buffers['example']) >= 32 and args.bc:
                 metrics.start_timer("agent_updating_bc")
-                obs, labels = buffers['example'].sample(32)
-                agent.supervised_update(obs, labels, anti=False)
+                for si in range(10):
+                    obs, labels = buffers['example'].sample(32)
+                    agent.supervised_update(obs, labels, anti=False)
                 metrics.stop_timer("agent_updating_bc")
                 
             if len(buffers['anti_example']) >= 32 and args.anti_bc:
                 metrics.start_timer("agent_updating_anti_bc")
-                obs, labels = buffers['anti_example'].sample(32)
-                agent.supervised_update(obs, labels, anti=True)
+                for si in range(10):
+                    obs, labels = buffers['anti_example'].sample(32)
+                    agent.supervised_update(obs, labels, anti=True)
                 metrics.stop_timer("agent_updating_anti_bc")
                 
             # Curriculum Updates (Local RL)
