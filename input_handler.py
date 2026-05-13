@@ -4,8 +4,8 @@ def process_events(events, current_mode, text_buffer):
     step_dir = 0
     submitted_note = None
     reset = False
-    branch_timeline = False # Tells wrapper to truncate future history
-    decision = None # "accept" or "reject"
+    branch_timeline = False 
+    decision = None 
     new_mode = current_mode
 
     # Handle continuous stepping in 'step' mode
@@ -54,7 +54,7 @@ def process_events(events, current_mode, text_buffer):
                         new_mode = "realtime"
                         branch_timeline = True  # We are taking control!
                     else:
-                        new_mode = "decision" # Wait for human to accept/reject
+                        new_mode = "decision" # Transition to decision
                         
                 # Toggle Agent
                 elif event.key == pygame.K_TAB:
@@ -62,7 +62,7 @@ def process_events(events, current_mode, text_buffer):
                         new_mode = "agent"
                         branch_timeline = True  # Agent is taking control!
                     else:
-                        new_mode = "decision"
+                        new_mode = "decision" # Transition to decision
                         
                 elif event.key == pygame.K_RETURN:
                     new_mode = "note"
