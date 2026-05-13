@@ -7,7 +7,7 @@ import argparse
 from Agent import Agent
 from buffers import ReplayBuffer
 
-def evaluate_return(agent, env_name, num_episodes=10):
+def evaluate_return(agent, env_name, num_episodes=25):
     env = gym.make(env_name)
     total_returns = []
     
