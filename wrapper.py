@@ -174,7 +174,7 @@ class InteractiveGymWrapper:
             print(f"✅ [Override] Accepted {self.override_source} segment.")
             if self.buffers:
                 # 1. Push up to 100 steps of the rejected segment to anti-example buffer.
-                max_anti_frames = 50
+                max_anti_frames = 100
                 prev_obs = self.trajectory[self.override_start_frame]['obs']
                 for step in self.discarded_trajectory[:max_anti_frames]:
                     self.buffers['anti_example'].push(prev_obs, step['action'])
@@ -204,8 +204,6 @@ class InteractiveGymWrapper:
             self._restore_state(self.current_frame_idx)
 
         self.override_source = None
-        if self.metrics:
-            self.metrics.stop_timer("human_overriding")
 
     def step_forward(self, action, source="rl"):
         """Advances the environment if at the end of the buffer, or steps forward in history."""
@@ -301,8 +299,13 @@ class InteractiveGymWrapper:
             )
 
             # Timer management
-            if self.mode in ["realtime", "agent"] and new_mode == "decision":
+            if self.mode in ["realtime", "agent"] and new_mode not in ["realtime", "agent"]:
                 if self.metrics: self.metrics.stop_timer("human_overriding")
+            
+            if new_mode in ["realtime", "agent"] and self.mode not in ["realtime", "agent"]:
+                # Only start if we are in an override state or just branched
+                if self.override_source is not None or branch_timeline:
+                    if self.metrics: self.metrics.start_timer("human_overriding")
 
             if new_mode == "note" and self.mode != "note" and self.metrics:
                 self.metrics.start_timer("human_annotating")
@@ -317,7 +320,6 @@ class InteractiveGymWrapper:
             # Timeline Branch Check
             if branch_timeline:
                 self._branch_timeline(source=self.mode)
-                if self.metrics: self.metrics.start_timer("human_overriding")
 
             if decision:
                 self._handle_decision(decision)

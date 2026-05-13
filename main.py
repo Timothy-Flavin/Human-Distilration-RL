@@ -35,7 +35,7 @@ def run_rl_collection(agent, env, num_episodes, metrics, update=False):
         })
 
         while not (terminated or truncated):
-            action = agent.predict(obs)
+            action = agent.predict(obs, deterministic=False)
             next_obs, reward, terminated, truncated, info = env.step(action)
             frame = env.render()
             
@@ -96,7 +96,7 @@ def main():
         # Step 1: Base RL Collection
         print("Collecting RL experience...")
         if args.algo == "ppo":
-            nep = 10
+            nep = 20
         else:
             nep = 5
         episodes = run_rl_collection(agent, env, num_episodes=nep, metrics=metrics, update=args.rl)

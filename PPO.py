@@ -36,7 +36,8 @@ class Critic(nn.Module):
         return self.net(x)
 
 class PPOAgent(Agent):
-    def __init__(self, obs_dim=8, action_dim=4, name="PPO", save_dir="./default_environment", device_name="cpu", lr=3e-4, gamma=0.99, K_epochs=8, eps_clip=0.2, entropy_coef=0.01, gae_lambda=0.95):
+    def __init__(self, obs_dim=8, action_dim=4, name="PPO", save_dir="./default_environment", device_name="cpu", lr=3e-4, gamma=0.99, K_epochs=4, eps_clip=0.2, entropy_coef=0.05, gae_lambda=0.95):
+
         super().__init__(obs_dim, action_dim, name, save_dir, device_name)
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -101,10 +102,11 @@ class PPOAgent(Agent):
 
     def rl_update(self, batch_size=None, local: bool = False) -> dict:
         # PPO needs a decent batch size to be stable. 
-        # If not specified, we expect at least 32 steps.
-        min_batch = batch_size if batch_size else 64
+        # If not specified, we expect at least 256 steps.
+        min_batch = batch_size if batch_size else 256
         if len(self.buffer) < min_batch:
             return {}
+
 
         # Convert buffer to tensors
         obs = torch.tensor(np.array([t['obs'] for t in self.buffer]), dtype=torch.float32).to(self.device_name)
@@ -156,6 +158,8 @@ class PPOAgent(Agent):
             # Take gradient step
             self.optimizer.zero_grad()
             loss.mean().backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
             self.optimizer.step()
             total_loss += loss.mean().item()
 
