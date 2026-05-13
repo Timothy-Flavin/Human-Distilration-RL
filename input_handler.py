@@ -4,12 +4,21 @@ def process_events(events, current_mode, text_buffer):
     step_dir = 0
     submitted_note = None
     reset = False
-    branch_timeline = False # NEW: Tells wrapper to truncate future history
+    branch_timeline = False # Tells wrapper to truncate future history
+    decision = None # "accept" or "reject"
     new_mode = current_mode
+
+    # Handle continuous stepping in 'step' mode
+    keys = pygame.key.get_pressed()
+    if current_mode == "step":
+        if keys[pygame.K_RIGHT]:
+            step_dir = 1
+        elif keys[pygame.K_LEFT]:
+            step_dir = -1
 
     for event in events:
         if event.type == pygame.QUIT:
-            return "quit", text_buffer, None, 0, False, False
+            return "quit", text_buffer, None, 0, False, False, None
 
         # --- TEXT INPUT MODE ---
         if current_mode == "note":
@@ -25,7 +34,17 @@ def process_events(events, current_mode, text_buffer):
                     text_buffer = text_buffer[:-1]
             elif event.type == pygame.TEXTINPUT:
                 text_buffer += event.text
-                
+        
+        # --- DECISION MODE (Accept/Reject Override) ---
+        elif current_mode == "decision":
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_a:
+                    decision = "accept"
+                    new_mode = "step"
+                elif event.key == pygame.K_r:
+                    decision = "reject"
+                    new_mode = "step"
+
         # --- PLAYBACK / CONTROL MODES ---
         else:
             if event.type == pygame.KEYDOWN:
@@ -35,7 +54,7 @@ def process_events(events, current_mode, text_buffer):
                         new_mode = "realtime"
                         branch_timeline = True  # We are taking control!
                     else:
-                        new_mode = "step"
+                        new_mode = "decision" # Wait for human to accept/reject
                         
                 # Toggle Agent
                 elif event.key == pygame.K_TAB:
@@ -43,22 +62,21 @@ def process_events(events, current_mode, text_buffer):
                         new_mode = "agent"
                         branch_timeline = True  # Agent is taking control!
                     else:
-                        new_mode = "step"
+                        new_mode = "decision"
                         
                 elif event.key == pygame.K_RETURN:
                     new_mode = "note"
                     text_buffer = ""
                 elif event.key == pygame.K_r:
                     reset = True
+                elif event.key == pygame.K_q:
+                    new_mode = "finish"
 
                 # Stepping
-                if current_mode == "step":
-                    if event.key == pygame.K_RIGHT:
-                        step_dir = 1
-                    elif event.key == pygame.K_LEFT:
-                        step_dir = -1
+                # (Stepping is now handled continuously above)
+                pass
 
-    return new_mode, text_buffer, submitted_note, step_dir, reset, branch_timeline
+    return new_mode, text_buffer, submitted_note, step_dir, reset, branch_timeline, decision
 
 def get_realtime_action(keys):
     """
