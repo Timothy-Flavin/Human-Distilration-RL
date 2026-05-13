@@ -39,19 +39,67 @@ class LLMRouter:
             )
 
     def _mock_llm_classify(self, text, obs):
-        """Mocks LLM classification logic."""
+        """
+        Mocks LLM classification logic with specific keywords.
+        
+        LunarLander State Context:
+        [0] x_pos, [1] y_pos, [2] x_vel, [3] y_vel, [4] angle, [5] angular_vel, [6] leg1_contact, [7] leg2_contact
+        
+        Actions:
+        0: None, 1: Left Engine, 2: Main Engine, 3: Right Engine
+        """
         text = text.lower()
+        
+        # --- GOALS (Reward Functions) ---
+        if "gain stability" in text:
+            return {
+                "type": "GOAL",
+                "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize velocity and angular velocity to encourage stability\n    return base_r - 0.1 * (abs(next_obs[2]) + abs(next_obs[3]) + abs(next_obs[5]))"
+            }
+        elif "soft landing" in text:
+            return {
+                "type": "GOAL",
+                "code": "def custom_reward(obs, next_obs, base_r):\n    # Reward low vertical velocity when close to ground\n    reward = base_r\n    if next_obs[1] < 0.2:\n        reward += 2.0 if abs(next_obs[3]) < 0.1 else -1.0\n    return reward"
+            }
+            
+        # --- HEURISTICS (SSL / Feature Selection) ---
+        elif "fix spin" in text:
+            # Mask: [5] is angular velocity
+            # If spinning left (positive ang_vel), fire right engine (3). 
+            # If spinning right (negative), fire left (1).
+            action = 3 if obs['angular_vel'] > 0 else 1
+            return {
+                "type": "HEURISTIC",
+                "action": action,
+                "feature_mask": [5]
+            }
+        elif "center lander" in text:
+            # Mask: [0] is x_pos
+            action = 1 if obs['x_pos'] > 0 else 3
+            return {
+                "type": "HEURISTIC",
+                "action": action,
+                "feature_mask": [0]
+            }
+        elif "descend slow" in text:
+            # Mask: [3] is y_vel
+            return {
+                "type": "HEURISTIC",
+                "action": 2, # Main engine
+                "feature_mask": [3]
+            }
+            
+        # Default fallback
         if "reward" in text or "goal" in text:
             return {
                 "type": "GOAL",
                 "code": "def custom_reward(obs, next_obs, base_r):\n    return base_r + 10 if next_obs['y_vel'] > -0.1 else base_r - 1"
             }
         elif "look at" in text or "ignore" in text:
-            # Heuristic example: "Look at the x position"
             return {
                 "type": "HEURISTIC",
-                "action": 0, # NOOP
-                "feature_mask": [0] # x_pos is index 0 in LunarLander
+                "action": 0,
+                "feature_mask": [0]
             }
         else:
             return {"type": "GENERIC"}
