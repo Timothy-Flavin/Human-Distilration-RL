@@ -342,11 +342,10 @@ class InteractiveGymWrapper:
             if self.mode == "step":
                 if step_dir != 0:
                     step_counter += 1
-                    if step_counter % 2 == 0: 
-                        if step_dir == 1:
-                            self.step_forward(action=0, source="rl")
-                        elif step_dir == -1:
-                            self.step_backward()
+                    if step_dir == 1:
+                        self.step_forward(action=0, source="rl")
+                    elif step_dir == -1:
+                        self.step_backward()
                 else:
                     step_counter = 0
 
