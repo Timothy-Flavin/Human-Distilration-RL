@@ -26,6 +26,10 @@ class InteractiveGymWrapper:
 
         # Data Buffers & Seed State
         self.trajectory = initial_trajectory if initial_trajectory is not None else []
+        # Ensure initial trajectory has sources
+        for step in self.trajectory:
+            if "source" not in step: step["source"] = "rl"
+
         self.notes = []
         self.current_frame_idx = len(self.trajectory) - 1 if self.trajectory else -1
         self.current_obs = self.trajectory[-1]["obs"] if self.trajectory else None
@@ -35,10 +39,14 @@ class InteractiveGymWrapper:
         # Override state
         self.override_start_frame = -1
         self.discarded_trajectory = []
+        self.override_source = None # "realtime" or "agent"
 
     def load_trajectory(self, trajectory, seed):
         """Loads a pre-recorded trajectory into the wrapper for review."""
         self.trajectory = trajectory
+        for step in self.trajectory:
+            if "source" not in step: step["source"] = "rl"
+
         self.current_seed = seed
         self.current_frame_idx = 0
         self.current_obs = self.trajectory[0]["obs"]
@@ -46,7 +54,6 @@ class InteractiveGymWrapper:
         self._restore_state(0)
 
     def _format_obs(self, obs):
-
         """Formats observations for human readability (LunarLander specific)."""
         if isinstance(obs, np.ndarray) and len(obs) == 8:
             return {
@@ -68,19 +75,19 @@ class InteractiveGymWrapper:
         self.notes = []
         self.current_frame_idx = -1
         self.current_obs = obs
-        self._record_step(obs, 0, 0, False, False, info)
+        self._record_step(obs, 0, 0, False, False, info, source="rl")
 
-    def _record_step(self, obs, action, reward, terminated, truncated, info):
+    def _record_step(self, obs, action, reward, terminated, truncated, info, source="rl"):
         frame = self.env.render()
-        if frame is None:
-            return # Avoid recording if render fails or returns None
+        if frame is None and self.trajectory:
+            # Try to inherit frame if render fails (e.g. during fast stepping)
+            frame = self.trajectory[-1].get("frame_image")
 
         # Attempt to capture internal state for O(1) branching
-
         try:
             env_state = self.env.unwrapped.get_state()
         except AttributeError:
-            env_state = None  # Safe failure, will trigger rollback later
+            env_state = None  
 
         # Initialize Pygame surface on the first render
         if self.screen is None and frame is not None:
@@ -95,7 +102,8 @@ class InteractiveGymWrapper:
             "frame_image": frame,
             "env_state": env_state,
             "terminated": terminated,
-            "truncated": truncated
+            "truncated": truncated,
+            "source": source
         }
         self.trajectory.append(step_data)
         self.current_frame_idx += 1
@@ -112,18 +120,18 @@ class InteractiveGymWrapper:
                     return False
                 return all(self._verify_observations(o1, o2, atol) for o1, o2 in zip(obs1, obs2))
             elif isinstance(obs1, np.ndarray) or isinstance(obs2, np.ndarray):
-                # Use allclose for floats to avoid strict equality failure on tiny drifts
                 return np.allclose(obs1, obs2, atol=atol)
             else:
                 return obs1 == obs2
         except Exception:
-            # If shapes mismatch or types don't align, it's a desync
             return False
 
     def _restore_state(self, target_frame_idx):
         """Restores environment state to target_frame_idx."""
+        if target_frame_idx < 0: return
+
         # 1. Try O(1) state restoration first
-        saved_state = self.trajectory[target_frame_idx]["env_state"]
+        saved_state = self.trajectory[target_frame_idx].get("env_state")
         state_restored = False
 
         if saved_state is not None:
@@ -136,52 +144,49 @@ class InteractiveGymWrapper:
 
         # 2. Fallback to O(N) Deterministic Replay
         if not state_restored:
-            print("[Timeline] Triggering O(N) Deterministic Replay...")
+            print(f"[Timeline] Triggering O(N) Deterministic Replay to frame {target_frame_idx}...")
             self.env.reset(seed=self.current_seed)
             for i in range(1, target_frame_idx + 1):
                 past_action = self.trajectory[i]["action"]
                 self.env.step(past_action)
             print("✅ [Timeline] Fast-forward complete.")
 
-    def _branch_timeline(self):
+    def _branch_timeline(self, source):
         """Prepares for branching by saving the future trajectory."""
-        if self.current_frame_idx >= len(self.trajectory) - 1:
-            self.override_start_frame = self.current_frame_idx
-            self.discarded_trajectory = []
-            return 
-
-        print(f"\n[Timeline] Preparing to branch at frame {self.current_frame_idx}...")
+        print(f"\n[Timeline] Preparing to branch at frame {self.current_frame_idx} (Source: {source})...")
 
         self.override_start_frame = self.current_frame_idx
+        self.override_source = source
+
+        # Save the future as discarded
         self.discarded_trajectory = self.trajectory[self.current_frame_idx + 1:]
 
-        # Truncate
+        # Truncate trajectory
         self.trajectory = self.trajectory[:self.current_frame_idx + 1]
         self.notes = [n for n in self.notes if n["frame"] <= self.current_frame_idx]
 
+        # Ensure env matches current_frame_idx
         self._restore_state(self.current_frame_idx)
 
     def _handle_decision(self, decision):
         """Processes Accept/Reject decision for an override."""
         if decision == "accept":
-            print("✅ [Override] Accepted.")
+            print(f"✅ [Override] Accepted {self.override_source} segment.")
             if self.buffers:
-                # 1. Push up to 100 steps of the rejected (RL) segment to anti-example buffer.
-                # We cap this because there is no guarantee the entire future trajectory was "bad".
-                # We use the observation from the frame where the action was actually taken.
-                max_anti_frames = 100
+                # 1. Push up to 100 steps of the rejected segment to anti-example buffer.
+                max_anti_frames = 50
                 prev_obs = self.trajectory[self.override_start_frame]['obs']
                 for step in self.discarded_trajectory[:max_anti_frames]:
                     self.buffers['anti_example'].push(prev_obs, step['action'])
                     prev_obs = step['obs']
 
-                # 2. Push EVERY step of the new (Human) segment to example buffer
-                # Again, ensuring we pair the action with the observation it was taken from.
-                prev_obs = self.trajectory[self.override_start_frame]['obs']
-                new_part = self.trajectory[self.override_start_frame + 1:]
-                for step in new_part:
-                    self.buffers['example'].push(prev_obs, step['action'])
-                    prev_obs = step['obs']
+                # 2. Push human segment to example buffer (ONLY if source was realtime)
+                if self.override_source == "realtime":
+                    prev_obs = self.trajectory[self.override_start_frame]['obs']
+                    new_part = self.trajectory[self.override_start_frame + 1:]
+                    for step in new_part:
+                        self.buffers['example'].push(prev_obs, step['action'])
+                        prev_obs = step['obs']
 
             self.discarded_trajectory = []
 
@@ -190,31 +195,35 @@ class InteractiveGymWrapper:
             # Restore trajectory to original state before override
             self.trajectory = self.trajectory[:self.override_start_frame + 1] + self.discarded_trajectory
             self.discarded_trajectory = []
-            
+
             # Reset current frame to the branching point
             self.current_frame_idx = self.override_start_frame
             self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
-            
+
             # Restore env state to the branching point
             self._restore_state(self.current_frame_idx)
 
-    def step_forward(self, action):
+        self.override_source = None
+
+    def step_forward(self, action, source="rl"):
         """Advances the environment if at the end of the buffer, or steps forward in history."""
         if self.current_frame_idx < len(self.trajectory) - 1:
             self.current_frame_idx += 1
+            self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
             return
 
         obs, reward, terminated, truncated, info = self.env.step(action)
-        self._record_step(obs, action, reward, terminated, truncated, info)
+        self._record_step(obs, action, reward, terminated, truncated, info, source=source)
         self.current_obs = obs
 
         if terminated or truncated:
-            self.mode = "decision" # Force decision at end of episode if we were overriding
+            self.mode = "decision" 
 
     def step_backward(self):
         """Steps backward through the saved trajectory history."""
         if self.current_frame_idx > 0:
             self.current_frame_idx -= 1
+            self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
 
     def draw_overlay(self):
         """Draws UI elements (mode, frame index, text buffer, existing notes)."""
@@ -226,7 +235,6 @@ class InteractiveGymWrapper:
             surf = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
             self.screen.blit(surf, (0, 0))
         else:
-            # Fallback if frame_image is missing (e.g. trajectory from run_rl_collection)
             self.screen.fill((50, 50, 50))
             msg = self.font.render("No Image Frame Saved", True, (255, 255, 255))
             self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2))
@@ -234,6 +242,9 @@ class InteractiveGymWrapper:
         # Mode display
         color = (255, 255, 0)
         if self.mode == "decision": color = (255, 0, 0)
+        elif self.mode == "realtime": color = (0, 255, 0)
+        elif self.mode == "agent": color = (0, 255, 255)
+
         mode_surf = self.font.render(f"MODE: {self.mode.upper()}", True, color)
         self.screen.blit(mode_surf, (10, 10))
 
@@ -242,6 +253,10 @@ class InteractiveGymWrapper:
             True, (200, 200, 200)
         )
         self.screen.blit(frame_surf, (10, 40))
+
+        source = self.trajectory[self.current_frame_idx].get("source", "rl")
+        source_surf = self.small_font.render(f"SOURCE: {source.upper()}", True, (200, 200, 200))
+        self.screen.blit(source_surf, (10, 60))
 
         if self.mode == "note":
             bg_rect = pygame.Rect(0, self.screen.get_height() - 50, self.screen.get_width(), 50)
@@ -255,13 +270,13 @@ class InteractiveGymWrapper:
             overlay.fill((0, 0, 0))
             self.screen.blit(overlay, (0, self.screen.get_height() // 2 - 50))
 
-            msg = self.font.render("[A]ccept Override or [R]eject Override?", True, (255, 255, 255))
+            msg = self.font.render(f"[A]ccept {self.override_source.title()} or [R]eject?", True, (255, 255, 255))
             self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2 - 20))
 
         current_note = next((n["text"] for n in self.notes if n["frame"] == self.current_frame_idx), None)
         if current_note:
             note_display = self.small_font.render(f"NOTE: {current_note}", True, (255, 100, 100))
-            self.screen.blit(note_display, (10, 70))
+            self.screen.blit(note_display, (10, 80))
 
         pygame.display.flip()
 
@@ -270,9 +285,7 @@ class InteractiveGymWrapper:
         if not self.trajectory:
             self.reset_env()
         else:
-            # If we have a trajectory but no screen yet, try to initialize it
             if self.screen is None:
-                # Default size if no frames are present
                 self.screen = pygame.display.set_mode((600, 400))
                 pygame.display.set_caption("Interactive Replay Review")
 
@@ -281,25 +294,27 @@ class InteractiveGymWrapper:
         while self.running:
             events = pygame.event.get()
 
-            # Use the input handler that includes the decision and branch_timeline returns
             new_mode, self.text_buffer, submitted_note, step_dir, reset, branch_timeline, decision = process_events(
                 events, self.mode, self.text_buffer
             )
 
+            # Timer management
             if self.mode in ["realtime", "agent"] and new_mode == "decision":
                 if self.metrics: self.metrics.stop_timer("human_overriding")
+
+            if new_mode == "note" and self.mode != "note" and self.metrics:
+                self.metrics.start_timer("human_annotating")
+            elif self.mode == "note" and new_mode != "note" and self.metrics:
+                self.metrics.stop_timer("human_annotating")
 
             self.mode = new_mode
             if self.mode in ["quit", "finish"]:
                 self.running = False
                 break
 
-            if self.mode == "note" and self.metrics:
-                self.metrics.start_timer("human_annotating")
-
             # Timeline Branch Check
             if branch_timeline:
-                self._branch_timeline()
+                self._branch_timeline(source=self.mode)
                 if self.metrics: self.metrics.start_timer("human_overriding")
 
             if decision:
@@ -309,7 +324,6 @@ class InteractiveGymWrapper:
                 self.reset_env()
 
             if submitted_note:
-                if self.metrics: self.metrics.stop_timer("human_annotating")
                 note_data = {
                     "frame": self.current_frame_idx,
                     "text": submitted_note,
@@ -326,34 +340,35 @@ class InteractiveGymWrapper:
                     )
 
             if self.mode == "step":
-                # Only step every N frames of the loop to keep it controllable
                 if step_dir != 0:
                     step_counter += 1
-                    if step_counter % 2 == 0: # Step every 2 ticks (approx 15 fps)
+                    if step_counter % 2 == 0: 
                         if step_dir == 1:
-                            self.step_forward(action=0)
+                            self.step_forward(action=0, source="rl")
                         elif step_dir == -1:
                             self.step_backward()
                 else:
                     step_counter = 0
 
             elif self.mode == "realtime":
-
                 keys = pygame.key.get_pressed()
                 action = get_realtime_action(keys)
-                self.step_forward(action)
-                if self.metrics: self.metrics.log_frames(1, source="human")
+                self.step_forward(action, source="human")
+                if self.metrics: 
+                    self.metrics.log_frames(1, source="human")
 
             elif self.mode == "agent":
                 if self.agent is not None:
-                    action = self.agent.predict(self.trajectory[self.current_frame_idx]["obs"]) 
+                    # Note: We must use the current_obs from history or live env
+                    action = self.agent.predict(self.current_obs) 
                 else:
                     action = self.env.action_space.sample()
-                self.step_forward(action)
-                if self.metrics: self.metrics.log_frames(1, source="rl")
+                self.step_forward(action, source="rl")
+                if self.metrics: 
+                    self.metrics.log_frames(1, source="rl")
 
             self.draw_overlay()
             self.clock.tick(self.fps)
 
         pygame.quit()
-        return self.trajectory, self.notes
+        return self.trajectory, self.notes, self.current_seed

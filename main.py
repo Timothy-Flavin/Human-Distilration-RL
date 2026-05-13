@@ -106,7 +106,21 @@ def main():
                 initial_trajectory=best_ep['trajectory'],
                 initial_seed=best_ep['seed']
             )
-            wrapper.run()
+            corrected_trajectory, annotations, final_seed = wrapper.run()
+            
+            # --- NEW: Push the FULL corrected trajectory to the RL Replay Buffer ---
+            # This follows the requirement: "a full episode ... to add to the RL buffer as a new episode"
+            for i in range(len(corrected_trajectory) - 1):
+                step = corrected_trajectory[i]
+                next_step = corrected_trajectory[i+1]
+                agent.store_transition(
+                    step['obs'], 
+                    next_step['action'], 
+                    next_step['reward'], 
+                    next_step['obs'], 
+                    next_step['terminated'] or next_step['truncated']
+                )
+
             agent.checkpoint_model(specific_name=f"interactive_review_{iteration}")
             
             # Step 3: LLM Routing
