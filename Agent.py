@@ -16,13 +16,13 @@ class Agent(ABC):
         """Returns actions for the given observations."""
         pass
 
-    def predict(self, observations):
+    def predict(self, observations, deterministic: bool = True):
         """Convenience method for single observation prediction."""
         if not isinstance(observations, torch.Tensor):
             observations = torch.tensor(observations, dtype=torch.float32).to(self.device_name)
         if len(observations.shape) == 1:
             observations = observations.unsqueeze(0)
-        action = self.act(observations, deterministic=True)
+        action = self.act(observations, deterministic=deterministic)
         return action.cpu().item()
 
     @abstractmethod
