@@ -4,6 +4,8 @@ import numpy as np
 import random
 
 from Agent import Agent
+from CQL import CQLAgent
+from PPO import PPOAgent
 from wrapper import InteractiveGymWrapper
 from buffers import ReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuffer
 from metrics import MetricsLogger
@@ -67,7 +69,12 @@ def main():
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     
-    agent = Agent(obs_dim=obs_dim, action_dim=action_dim, name="Agent", save_dir=f"./{env_name}", device_name="cpu")
+    if args.algo == "cql":
+        agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL", save_dir=f"./{env_name}", device_name="cpu")
+    elif args.algo == "ppo":
+        agent = PPOAgent(obs_dim=obs_dim, action_dim=action_dim, name="PPO", save_dir=f"./{env_name}", device_name="cpu")
+    else:
+        raise ValueError(f"Unknown algorithm: {args.algo}")
     
     # 2. Setup Buffers & Router
     buffers = {
@@ -88,7 +95,11 @@ def main():
         
         # Step 1: Base RL Collection
         print("Collecting RL experience...")
-        episodes = run_rl_collection(agent, env, num_episodes=5, metrics=metrics, update=args.rl)
+        if args.algo == "ppo":
+            nep = 10
+        else:
+            nep = 5
+        episodes = run_rl_collection(agent, env, num_episodes=nep, metrics=metrics, update=args.rl)
         agent.checkpoint_model(specific_name=f"rl_collection_{iteration}")
         
         # Step 2: Human Interactive Review
@@ -109,17 +120,19 @@ def main():
             corrected_trajectory, annotations, final_seed = wrapper.run()
             
             # --- NEW: Push the FULL corrected trajectory to the RL Replay Buffer ---
-            # This follows the requirement: "a full episode ... to add to the RL buffer as a new episode"
-            for i in range(len(corrected_trajectory) - 1):
-                step = corrected_trajectory[i]
-                next_step = corrected_trajectory[i+1]
-                agent.store_transition(
-                    step['obs'], 
-                    next_step['action'], 
-                    next_step['reward'], 
-                    next_step['obs'], 
-                    next_step['terminated'] or next_step['truncated']
-                )
+            # Note: RL agent actions from interactive window go to RL buffer here, 
+            # while human actions only went to BC buffer during the interactive session.
+            if args.algo != "ppo":
+                for i in range(len(corrected_trajectory) - 1):
+                    step = corrected_trajectory[i]
+                    next_step = corrected_trajectory[i+1]
+                    agent.store_transition(
+                        step['obs'], 
+                        next_step['action'], 
+                        next_step['reward'], 
+                        next_step['obs'], 
+                        next_step['terminated'] or next_step['truncated']
+                    )
 
             agent.checkpoint_model(specific_name=f"interactive_review_{iteration}")
             
@@ -200,6 +213,7 @@ if __name__ == "__main__":
 
     # String argument
     parser.add_argument("--file_name", type=str, required=True)
+    parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
 
     args = parser.parse_args()
 

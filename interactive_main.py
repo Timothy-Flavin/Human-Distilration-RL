@@ -12,6 +12,14 @@ class DummyAgent(Agent):
         # Returns a tensor of shape (batch_size,)
         return torch.ones(observations.shape[0], dtype=torch.long) * 2
 
+    def store_transition(self, obs, action, reward, next_obs, done): pass
+    def rl_update(self, batch_size=64, local: bool = False): return {}
+    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False): return {}
+    def ssl_update(self, batch): return {}
+    def get_logits(self, obs): return torch.zeros((obs.shape[0], self.action_dim))
+    def checkpoint_model(self, specific_name=None): pass
+    def load_model(self, path): pass
+
 def main():
     # Initialize your Gymnasium environment
     env = gym.make("LunarLander-v3", render_mode="rgb_array")

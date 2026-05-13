@@ -204,6 +204,8 @@ class InteractiveGymWrapper:
             self._restore_state(self.current_frame_idx)
 
         self.override_source = None
+        if self.metrics:
+            self.metrics.stop_timer("human_overriding")
 
     def step_forward(self, action, source="rl"):
         """Advances the environment if at the end of the buffer, or steps forward in history."""

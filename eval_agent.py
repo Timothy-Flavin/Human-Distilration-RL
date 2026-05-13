@@ -5,6 +5,8 @@ import gymnasium as gym
 import numpy as np
 import argparse
 from Agent import Agent
+from CQL import CQLAgent
+from PPO import PPOAgent
 from buffers import ReplayBuffer
 
 def evaluate_return(agent, env_name, num_episodes=25):
@@ -33,9 +35,9 @@ def calculate_cross_entropy(agent, buffer, anti=False):
     batch_size = min(len(buffer), 1024)
     obs, labels = buffer.sample(batch_size)
     
-    agent.q_net.eval()
+    # We assume the agent has a way to set eval mode or it doesn't matter for get_logits
     with torch.no_grad():
-        logits = agent.q_net(obs.to(agent.device_name))
+        logits = agent.get_logits(obs.to(agent.device_name))
         labels = labels.to(agent.device_name)
         
         if not anti:
@@ -55,6 +57,7 @@ def main():
     parser.add_argument("--env_name", type=str, default="LunarLander-v3")
     parser.add_argument("--example_buffer", type=str, help="Path to serialized example buffer (optional)")
     parser.add_argument("--anti_example_buffer", type=str, help="Path to serialized anti-example buffer (optional)")
+    parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
     args = parser.parse_args()
     
     # 1. Initialize Agent
@@ -65,7 +68,11 @@ def main():
     action_dim = temp_env.action_space.n
     temp_env.close()
     
-    agent = Agent(obs_dim=obs_dim, action_dim=action_dim, device_name="cpu")
+    if args.algo == "cql":
+        agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, device_name="cpu")
+    elif args.algo == "ppo":
+        agent = PPOAgent(obs_dim=obs_dim, action_dim=action_dim, device_name="cpu")
+    
     agent.load_model(args.agent_path)
     
     # 2. Measure Return
