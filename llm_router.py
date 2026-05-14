@@ -2,28 +2,27 @@ import json
 import re
 
 class LLMRouter:
-    def __init__(self, curriculum_buffer, ssl_buffer, llm_client=None):
+    def __init__(self, curriculum_buffer, ssl_buffer, global_buffer=None, example_buffer=None):
         self.curriculum_buffer = curriculum_buffer
         self.ssl_buffer = ssl_buffer
-        self.llm_client = llm_client # Placeholder for an actual LLM API client
+        self.global_buffer = global_buffer
+        self.example_buffer = example_buffer
 
     def process(self, item):
         """Processes a single item from the LLMBuffer."""
         note_text = item['note_text']
         obs_context = item['current_obs_dict']
         
-        # Extract historical actions up to the note_frame_idx
-        historical_actions = [step['action'] for step in item['episode_trajectory'][:item['note_frame_idx'] + 1]]
+        # Extract historical actions up to the note_frame_idx (exclude dummy action at index 0)
+        historical_actions = [step['action'] for step in item['episode_trajectory'][1:item['note_frame_idx'] + 1]]
         
-        # In a real implementation, we would call the LLM here.
-        # For now, we'll use a mock or simplified logic.
         classification = self._mock_llm_classify(note_text, obs_context)
         
         if classification['type'] == 'GENERIC':
             self.curriculum_buffer.push(
                 seed=item['seed'],
                 start_frame=item['note_frame_idx'],
-                trajectory_length=50, # Default length
+                trajectory_length=50, 
                 reward_function_callable=lambda obs, next_obs, r: r,
                 historical_actions=historical_actions
             )
@@ -37,11 +36,32 @@ class LLMRouter:
                 historical_actions=historical_actions
             )
         elif classification['type'] == 'HEURISTIC':
-            self.ssl_buffer.push(
-                obs=item['episode_trajectory'][item['note_frame_idx']]['obs'],
-                action=classification['action'],
-                feature_mask=classification['feature_mask']
-            )
+            # R4.2: Pull all states meeting the rule from the buffers
+            rule = classification.get('rule')
+            if rule:
+                mined_count = 0
+                # Mine from global buffer
+                if self.global_buffer:
+                    for obs, action in self.global_buffer.buffer:
+                        if rule(obs.numpy()):
+                            self.ssl_buffer.push(obs, classification['action'], classification['feature_mask'])
+                            mined_count += 1
+                
+                # Mine from example buffer
+                if self.example_buffer:
+                    for obs, action in self.example_buffer.buffer:
+                        if rule(obs.numpy()):
+                            self.ssl_buffer.push(obs, classification['action'], classification['feature_mask'])
+                            mined_count += 1
+                
+                print(f"[SSL Mining] Found {mined_count} matching states for rule.")
+            else:
+                # Fallback to just the current frame
+                self.ssl_buffer.push(
+                    obs=item['episode_trajectory'][item['note_frame_idx']]['obs'],
+                    action=classification['action'],
+                    feature_mask=classification['feature_mask']
+                )
 
     def _mock_llm_classify(self, text, obs):
         """
@@ -69,40 +89,32 @@ class LLMRouter:
             
         # --- HEURISTICS (SSL / Feature Selection) ---
         elif "unrecoverable spin" in text:
-            # Rule: If angular velocity is extreme (> 0.5), ignore everything else and stabilize.
-            # Mask: [5] is angular velocity. 
-            # High positive -> fire Right (3), High negative -> fire Left (1)
             ang_vel = obs['angular_vel']
             if abs(ang_vel) > 0.5:
                 return {
                     "type": "HEURISTIC",
                     "action": 3 if ang_vel > 0 else 1,
-                    "feature_mask": [5] # Focus only on spin
+                    "feature_mask": [5],
+                    "rule": lambda o: abs(o[5]) > 0.4 # Slightly lower threshold for buffer mining
                 }
         
         elif "catch drift" in text:
-            # Rule: Moving horizontal fast ([2]) while angled ([4]) means you need to "catch" 
-            # the center of mass. Ignore coordinates, focus on velocities and angles.
-            # If drifting right (+) and angled right (-), need to fire right engine to tilt back.
             x_vel = obs['x_vel']
-            angle = obs['angle']
             if abs(x_vel) > 0.5:
-                # Mask: [2] x_vel, [4] angle, [5] angular_vel
-                # This reinforces the "catch" logic regardless of where the lander is in space [0, 1]
                 return {
                     "type": "HEURISTIC",
                     "action": 3 if x_vel > 0 else 1,
-                    "feature_mask": [2, 4, 5] 
+                    "feature_mask": [2, 4, 5],
+                    "rule": lambda o: abs(o[2]) > 0.4
                 }
 
         elif "emergency thrust" in text:
-            # Rule: If falling too fast ([3]), ignore horizontal drift and positioning.
-            # Mask: [3] y_vel, [7, 8] leg contacts
             if obs['y_vel'] < -0.8:
                 return {
                     "type": "HEURISTIC",
-                    "action": 2, # Main engine
-                    "feature_mask": [3, 6, 7]
+                    "action": 2,
+                    "feature_mask": [3, 6, 7],
+                    "rule": lambda o: o[3] < -0.7
                 }
             
         # Default fallback
