@@ -37,6 +37,7 @@ class CQLAgent(Agent):
         
         # Internal replay buffer for standard RL
         self.replay_buffer = [] 
+        self.local_replay_buffer = []
         self.max_buffer_size = 50000
 
     def act(self, observations: torch.Tensor, deterministic: bool = False, epsilon=0.1):
@@ -47,28 +48,39 @@ class CQLAgent(Agent):
             q_values = self.q_net(observations)
             return torch.argmax(q_values, dim=-1)
 
-    def store_transition(self, obs, action, reward, next_obs, done):
-        self.replay_buffer.append((obs, action, reward, next_obs, done))
+    def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
+        self.replay_buffer.append((obs, action, reward, next_obs, terminated, truncated))
         if len(self.replay_buffer) > self.max_buffer_size:
             self.replay_buffer.pop(0)
 
+    def store_local_transition(self, obs, action, reward, next_obs, terminated, truncated):
+        """Stores transition in a separate buffer for localized curriculum training."""
+        self.local_replay_buffer.append((obs, action, reward, next_obs, terminated, truncated))
+        if len(self.local_replay_buffer) > self.max_buffer_size:
+            self.local_replay_buffer.pop(0)
+
     def rl_update(self, batch_size=64, local: bool = False) -> dict:
-        if len(self.replay_buffer) < batch_size:
+        target_buffer = self.local_replay_buffer if local else self.replay_buffer
+        if len(target_buffer) < batch_size:
             return {}
 
-        batch = random.sample(self.replay_buffer, batch_size)
-        obs, action, reward, next_obs, done = zip(*batch)
+        batch = random.sample(target_buffer, batch_size)
+        obs, action, reward, next_obs, terminated, truncated = zip(*batch)
         
         obs = torch.tensor(np.array(obs), dtype=torch.float32).to(self.device_name)
         action = torch.tensor(action, dtype=torch.long).to(self.device_name).unsqueeze(1)
         reward = torch.tensor(reward, dtype=torch.float32).to(self.device_name).unsqueeze(1)
         next_obs = torch.tensor(np.array(next_obs), dtype=torch.float32).to(self.device_name)
-        done = torch.tensor(done, dtype=torch.float32).to(self.device_name).unsqueeze(1)
+        terminated = torch.tensor(terminated, dtype=torch.float32).to(self.device_name).unsqueeze(1)
+        truncated = torch.tensor(truncated, dtype=torch.float32).to(self.device_name).unsqueeze(1)
 
-        # Standard DQN Update
+        # Standard DQN Update with explicit Terminated/Truncated handling
+        # Terminated: next value is 0
+        # Truncated: bootstrap next value
         with torch.no_grad():
             next_q = self.q_target(next_obs).max(1, keepdim=True)[0]
-            target_q = reward + (1 - done) * self.gamma * next_q
+            # If terminated, target is just reward. If truncated, we bootstrap.
+            target_q = reward + (1 - terminated) * self.gamma * next_q
 
         current_q = self.q_net(obs).gather(1, action)
         td_loss = F.mse_loss(current_q, target_q)
@@ -132,13 +144,16 @@ class CQLAgent(Agent):
     def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
         return self.q_net(obs)
 
+    def _save_checkpoint(self, path):
+        torch.save(self.q_net.state_dict(), path)
+
     def checkpoint_model(self, specific_name=None):
         if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
+            os.makedirs(self.save_dir, exist_ok=True)
         filename = f"{self.name}_{specific_name if specific_name else 'latest'}.pt"
         path = os.path.join(self.save_dir, filename)
-        torch.save(self.q_net.state_dict(), path)
-        print(f"[Checkpoint] Saved model to {path}")
+        self._save_checkpoint(path)
+        print(f"[Checkpoint] Saved CQL model to {path}")
 
     def load_model(self, path):
         self.q_net.load_state_dict(torch.load(path, map_location=self.device_name))

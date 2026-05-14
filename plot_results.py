@@ -91,8 +91,16 @@ def plot_metrics(metrics_path, output_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--metrics_file", type=str, required=True, help="Path to metrics_latest.json")
-    parser.add_argument("--output_dir", type=str, default="./plots")
+    parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
+    parser.add_argument("--env", type=str, default="LunarLander-v3")
+    parser.add_argument("--experiment_name", type=str, default="default_experiment")
+    parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
     
-    plot_metrics(args.metrics_file, args.output_dir)
+    metrics_path = os.path.join("results", args.algo, args.env, args.experiment_name, "metrics_latest.json")
+    output_dir = args.output_dir if args.output_dir else os.path.join("results", args.algo, args.env, args.experiment_name, "plots")
+    
+    if not os.path.exists(metrics_path):
+        print(f"Error: Metrics file not found at {metrics_path}")
+    else:
+        plot_metrics(metrics_path, output_dir)

@@ -12,6 +12,9 @@ class LLMRouter:
         note_text = item['note_text']
         obs_context = item['current_obs_dict']
         
+        # Extract historical actions up to the note_frame_idx
+        historical_actions = [step['action'] for step in item['episode_trajectory'][:item['note_frame_idx'] + 1]]
+        
         # In a real implementation, we would call the LLM here.
         # For now, we'll use a mock or simplified logic.
         classification = self._mock_llm_classify(note_text, obs_context)
@@ -21,7 +24,8 @@ class LLMRouter:
                 seed=item['seed'],
                 start_frame=item['note_frame_idx'],
                 trajectory_length=50, # Default length
-                reward_function_callable=lambda obs, next_obs, r: r
+                reward_function_callable=lambda obs, next_obs, r: r,
+                historical_actions=historical_actions
             )
         elif classification['type'] == 'GOAL':
             reward_fn = self._create_reward_fn(classification['code'])
@@ -29,7 +33,8 @@ class LLMRouter:
                 seed=item['seed'],
                 start_frame=item['note_frame_idx'],
                 trajectory_length=100,
-                reward_function_callable=reward_fn
+                reward_function_callable=reward_fn,
+                historical_actions=historical_actions
             )
         elif classification['type'] == 'HEURISTIC':
             self.ssl_buffer.push(
@@ -63,31 +68,42 @@ class LLMRouter:
             }
             
         # --- HEURISTICS (SSL / Feature Selection) ---
-        elif "fix spin" in text:
-            # Mask: [5] is angular velocity
-            # If spinning left (positive ang_vel), fire right engine (3). 
-            # If spinning right (negative), fire left (1).
-            action = 3 if obs['angular_vel'] > 0 else 1
-            return {
-                "type": "HEURISTIC",
-                "action": action,
-                "feature_mask": [5]
-            }
-        elif "center lander" in text:
-            # Mask: [0] is x_pos
-            action = 1 if obs['x_pos'] > 0 else 3
-            return {
-                "type": "HEURISTIC",
-                "action": action,
-                "feature_mask": [0]
-            }
-        elif "descend slow" in text:
-            # Mask: [3] is y_vel
-            return {
-                "type": "HEURISTIC",
-                "action": 2, # Main engine
-                "feature_mask": [3]
-            }
+        elif "unrecoverable spin" in text:
+            # Rule: If angular velocity is extreme (> 0.5), ignore everything else and stabilize.
+            # Mask: [5] is angular velocity. 
+            # High positive -> fire Right (3), High negative -> fire Left (1)
+            ang_vel = obs['angular_vel']
+            if abs(ang_vel) > 0.5:
+                return {
+                    "type": "HEURISTIC",
+                    "action": 3 if ang_vel > 0 else 1,
+                    "feature_mask": [5] # Focus only on spin
+                }
+        
+        elif "catch drift" in text:
+            # Rule: Moving horizontal fast ([2]) while angled ([4]) means you need to "catch" 
+            # the center of mass. Ignore coordinates, focus on velocities and angles.
+            # If drifting right (+) and angled right (-), need to fire right engine to tilt back.
+            x_vel = obs['x_vel']
+            angle = obs['angle']
+            if abs(x_vel) > 0.5:
+                # Mask: [2] x_vel, [4] angle, [5] angular_vel
+                # This reinforces the "catch" logic regardless of where the lander is in space [0, 1]
+                return {
+                    "type": "HEURISTIC",
+                    "action": 3 if x_vel > 0 else 1,
+                    "feature_mask": [2, 4, 5] 
+                }
+
+        elif "emergency thrust" in text:
+            # Rule: If falling too fast ([3]), ignore horizontal drift and positioning.
+            # Mask: [3] y_vel, [7, 8] leg contacts
+            if obs['y_vel'] < -0.8:
+                return {
+                    "type": "HEURISTIC",
+                    "action": 2, # Main engine
+                    "feature_mask": [3, 6, 7]
+                }
             
         # Default fallback
         if "reward" in text or "goal" in text:

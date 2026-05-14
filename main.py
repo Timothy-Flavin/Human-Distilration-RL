@@ -2,6 +2,7 @@ import gymnasium as gym
 import torch
 import numpy as np
 import random
+import os
 
 from Agent import Agent
 from CQL import CQLAgent
@@ -40,7 +41,7 @@ def run_rl_collection(agent, env, num_episodes, metrics, update=False):
             frame = env.render()
             
             # Store for standard RL
-            agent.store_transition(obs, action, reward, next_obs, terminated or truncated)
+            agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
             
             # Perform standard RL update
             if update:
@@ -65,14 +66,19 @@ def main():
     global args
     # 1. Setup Environment & Agent
     env_name = "LunarLander-v3"
+    
+    # Organized result structure: ./results/{algorithm}/{environment}/{experiment_name}/
+    results_base_dir = os.path.join("results", args.algo, env_name, args.experiment_name)
+    os.makedirs(results_base_dir, exist_ok=True)
+
     env = gym.make(env_name, render_mode="rgb_array")
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     
     if args.algo == "cql":
-        agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL", save_dir=f"./{env_name}", device_name="cpu")
+        agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL", save_dir=results_base_dir, device_name="cpu")
     elif args.algo == "ppo":
-        agent = PPOAgent(obs_dim=obs_dim, action_dim=action_dim, name="PPO", save_dir=f"./{env_name}", device_name="cpu")
+        agent = PPOAgent(obs_dim=obs_dim, action_dim=action_dim, name="PPO", save_dir=results_base_dir, device_name="cpu")
     else:
         raise ValueError(f"Unknown algorithm: {args.algo}")
     
@@ -131,7 +137,8 @@ def main():
                         next_step['action'], 
                         next_step['reward'], 
                         next_step['obs'], 
-                        next_step['terminated'] or next_step['truncated']
+                        next_step['terminated'],
+                        next_step['truncated']
                     )
 
             agent.checkpoint_model(specific_name=f"interactive_review_{iteration}")
@@ -166,9 +173,54 @@ def main():
             # Curriculum Updates (Local RL)
             if len(buffers['curriculum']) > 0 and args.curriculum:
                 metrics.start_timer("agent_updating_local_rl")
-                for task in buffers['curriculum']:
-                    metrics.log_frames(task.get('trajectory_length', 50), source="curriculum")
-                    agent.rl_update(local=True)
+                print(f"\n[Curriculum] Processing tasks...")
+                
+                while not buffers['curriculum'].is_empty():
+                    task = buffers['curriculum'].pop()
+                    print(f" > Task: Seed {task['seed']}, Start Frame {task['start_frame']}")
+                    
+                    # Training Loop: Replay the targeted segment multiple times
+                    num_local_epochs = 5
+                    for epoch in range(num_local_epochs):
+                        # 1. Restore Environment to the starting frame of the task
+                        # Use historical actions for perfect reconstruction
+                        obs, info = env.reset(seed=task['seed'])
+                        if task['historical_actions']:
+                            for action in task['historical_actions']:
+                                obs, _, terminated, truncated, _ = env.step(action)
+                                if terminated or truncated: break
+                        
+                        # 2. Collect Experience from this point and update
+                        n_frames = 0
+                        for _ in range(task.get('trajectory_length', 100)):
+                            action = agent.predict(obs, deterministic=False)
+                            next_obs, reward, terminated, truncated, info = env.step(action)
+                            
+                            # Standard reward for the GLOBAL buffer (so it learns standard env physics)
+                            agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
+                            
+                            # Custom reward for the LOCAL buffer (so it learns the curriculum task)
+                            local_reward = reward
+                            if task.get('reward_fn'):
+                                local_reward = task['reward_fn'](obs, next_obs, reward)
+                            
+                            if hasattr(agent, 'store_local_transition'):
+                                agent.store_local_transition(obs, action, local_reward, next_obs, terminated, truncated)
+                            else:
+                                # Fallback if agent doesn't support local buffers yet
+                                agent.store_transition(obs, action, local_reward, next_obs, terminated, truncated)
+                            
+                            env.render() # Visual verification
+                            
+                            # 3. Perform a localized RL update PER FRAME
+                            agent.rl_update(local=True)
+                            
+                            n_frames += 1
+                            if terminated or truncated: break
+                            obs = next_obs
+                        
+                        metrics.log_frames(n_frames, source="curriculum")
+                        
                 metrics.stop_timer("agent_updating_local_rl")
                 
             # SSL Updates
@@ -178,9 +230,9 @@ def main():
                 agent.ssl_update(batch)
                 metrics.stop_timer("agent_updating_ssl")
 
-            # Save buffers for evaluation
-            buffers['example'].save(f"./{env_name}/example_buffer_{iteration}.pt")
-            buffers['anti_example'].save(f"./{env_name}/anti_example_buffer_{iteration}.pt")
+            # Save buffers
+            buffers['example'].save(os.path.join(results_base_dir, f"example_buffer_{iteration}.pt"))
+            buffers['anti_example'].save(os.path.join(results_base_dir, f"anti_example_buffer_{iteration}.pt"))
                 
         agent.checkpoint_model(specific_name=f"agent_update_{iteration}")
         
@@ -194,8 +246,8 @@ def main():
         
         # Step 5: Log Telemetry
         metrics.log_iteration()
-        metrics.save_to_json(f"./{env_name}/{args.file_name}_metrics_{iteration}.json")
-        metrics.save_to_json(f"./{env_name}/{args.file_name}_metrics_latest.json")
+        metrics.save_to_json(os.path.join(results_base_dir, f"metrics_{iteration}.json"))
+        metrics.save_to_json(os.path.join(results_base_dir, "metrics_latest.json"))
         
     env.close()
 
@@ -212,7 +264,7 @@ if __name__ == "__main__":
     parser.add_argument("--curriculum", action="store_true")
 
     # String argument
-    parser.add_argument("--file_name", type=str, required=True)
+    parser.add_argument("--experiment_name", type=str, default="default_experiment")
     parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
 
     args = parser.parse_args()
