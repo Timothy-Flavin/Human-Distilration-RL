@@ -1,0 +1,17 @@
+--- Iteration Metrics ---
+Rl experience: 1562.06s
+Human overriding: 0.00s
+Human reviewing: 0.00s
+Human annotating: 0.00s
+Llm processing: 0.00s
+Agent updating bc: 0.00s
+Agent updating anti bc: 0.00s
+Agent updating local rl: 0.00s
+Agent updating ssl: 0.00s
+Frames (RL): 83755
+Frames (HUMAN): 0
+Frames (CURRICULUM): 0
+Frames (SSL): 0
+Eval Return: -55.76 +/- 71.81
+-------------------------
+python main.py --rl 
