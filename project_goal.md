@@ -67,3 +67,7 @@ Create a `MetricsLogger` class to record human and compute time to justify your 
 * `time_llm_processing`
 * `time_agent_updating` (Separated by BC, Anti-BC, curriculum RL, and SSL)
 * `frames_generated_online_rl` vs. `frames_generated_human` vs. `frames_generated_curriculum` vs. `frames_generated_ssl`
+
+### Stage 4: Analysing the results for publication
+
+Each of these phases needs to be ablated with performance graphed and total real-world time taken into account.
