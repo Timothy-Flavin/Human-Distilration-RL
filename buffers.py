@@ -63,13 +63,20 @@ class CurriculumBuffer:
     def __init__(self):
         self.tasks = collections.deque()
 
-    def push(self, seed, start_frame, trajectory_length, reward_function_callable):
+    def push(self, seed, start_frame, trajectory_length, reward_function_callable, historical_actions=None):
         self.tasks.append({
             "seed": seed,
             "start_frame": start_frame,
             "trajectory_length": trajectory_length,
-            "reward_fn": reward_function_callable
+            "reward_fn": reward_function_callable,
+            "historical_actions": historical_actions # Actions taken to reach start_frame
         })
+
+    def pop(self):
+        return self.tasks.popleft() if self.tasks else None
+
+    def is_empty(self):
+        return len(self.tasks) == 0
 
     def __iter__(self):
         return iter(self.tasks)

@@ -59,6 +59,7 @@ class PPOAgent(Agent):
         
         # Online buffer for PPO
         self.buffer = []
+        self.local_buffer = []
 
     def act(self, observations: torch.Tensor, deterministic: bool = False):
         with torch.no_grad():
@@ -71,16 +72,28 @@ class PPOAgent(Agent):
                 action = dist.sample()
             return action
 
-    def store_transition(self, obs, action, reward, next_obs, done):
+    def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         self.buffer.append({
             'obs': obs,
             'action': action,
             'reward': reward,
             'next_obs': next_obs,
-            'done': done
+            'terminated': terminated,
+            'truncated': truncated
         })
 
-    def _calculate_gae(self, obs, rewards, dones, next_obs):
+    def store_local_transition(self, obs, action, reward, next_obs, terminated, truncated):
+        """Stores transition in a separate buffer for localized curriculum training."""
+        self.local_buffer.append({
+            'obs': obs,
+            'action': action,
+            'reward': reward,
+            'next_obs': next_obs,
+            'terminated': terminated,
+            'truncated': truncated
+        })
+
+    def _calculate_gae(self, obs, rewards, terminateds, truncateds, next_obs):
         with torch.no_grad():
             values = self.critic(obs).squeeze(-1)
             next_values = self.critic(next_obs).squeeze(-1)
@@ -94,29 +107,38 @@ class PPOAgent(Agent):
         last_gae_lam = 0
         
         for t in reversed(range(len(rewards))):
-            delta = rewards[t] + self.gamma * next_values[t] * (1 - dones[t]) - values[t]
-            advantages[t] = last_gae_lam = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * last_gae_lam
+            # Terminated (done) vs Truncated (bootstrap)
+            # If terminated, next value is 0. If truncated, we bootstrap with next_values[t]
+            mask = 1.0 - terminateds[t]
+            # Truncation doesn't zero out the future return, but it does end the current GAE chain calculation
+            # for that segment if we consider it a boundary. However, in GAE, we usually just want to know
+            # if we should bootstrap.
+            delta = rewards[t] + self.gamma * next_values[t] * (1 - terminateds[t]) - values[t]
+            # If truncated, we don't zero out next_values, but we might reset the GAE chain if it's a hard boundary.
+            # Usually, truncated means the episode ended for time, so we DO bootstrap.
+            # Terminated means the task ended, so we DO NOT bootstrap.
+            advantages[t] = last_gae_lam = delta + self.gamma * self.gae_lambda * (1 - terminateds[t]) * (1 - truncateds[t]) * last_gae_lam
             
         returns = advantages + values
         return advantages, returns
 
     def rl_update(self, batch_size=None, local: bool = False) -> dict:
-        # PPO needs a decent batch size to be stable. 
-        # If not specified, we expect at least 256 steps.
-        min_batch = batch_size if batch_size else 256
-        if len(self.buffer) < min_batch:
+        target_buffer = self.local_buffer if local else self.buffer
+        
+        min_batch = batch_size if batch_size else (32 if local else 256)
+        if len(target_buffer) < min_batch:
             return {}
 
-
         # Convert buffer to tensors
-        obs = torch.tensor(np.array([t['obs'] for t in self.buffer]), dtype=torch.float32).to(self.device_name)
-        actions = torch.tensor(np.array([t['action'] for t in self.buffer]), dtype=torch.long).to(self.device_name)
-        rewards = torch.tensor(np.array([t['reward'] for t in self.buffer]), dtype=torch.float32).to(self.device_name)
-        dones = torch.tensor(np.array([t['done'] for t in self.buffer]), dtype=torch.float32).to(self.device_name)
-        next_obs = torch.tensor(np.array([t['next_obs'] for t in self.buffer]), dtype=torch.float32).to(self.device_name)
+        obs = torch.tensor(np.array([t['obs'] for t in target_buffer]), dtype=torch.float32).to(self.device_name)
+        actions = torch.tensor(np.array([t['action'] for t in target_buffer]), dtype=torch.long).to(self.device_name)
+        rewards = torch.tensor(np.array([t['reward'] for t in target_buffer]), dtype=torch.float32).to(self.device_name)
+        terminateds = torch.tensor(np.array([t['terminated'] for t in target_buffer]), dtype=torch.float32).to(self.device_name)
+        truncateds = torch.tensor(np.array([t['truncated'] for t in target_buffer]), dtype=torch.float32).to(self.device_name)
+        next_obs = torch.tensor(np.array([t['next_obs'] for t in target_buffer]), dtype=torch.float32).to(self.device_name)
 
         # Calculate Advantages and Returns using GAE
-        advantages, returns = self._calculate_gae(obs, rewards, dones, next_obs)
+        advantages, returns = self._calculate_gae(obs, rewards, terminateds, truncateds, next_obs)
         
         # Normalize advantages safely
         if advantages.numel() > 1:
@@ -129,7 +151,6 @@ class PPOAgent(Agent):
         # Optimize policy for K epochs
         total_loss = 0
         for _ in range(self.K_epochs):
-            # Evaluating old actions and values
             logits = self.actor(obs)
             probs = F.softmax(logits, dim=-1)
             dist = Categorical(probs)
@@ -139,7 +160,6 @@ class PPOAgent(Agent):
             if state_values.dim() == 0:
                 state_values = state_values.unsqueeze(0)
 
-            # Finding the ratio (pi_theta / pi_theta__old)
             with torch.no_grad():
                 old_logits = self.actor_old(obs)
                 old_probs = F.softmax(old_logits, dim=-1)
@@ -147,15 +167,11 @@ class PPOAgent(Agent):
                 old_logprobs = old_dist.log_prob(actions)
             
             ratios = torch.exp(logprobs - old_logprobs)
-
-            # Finding Surrogate Loss
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
 
-            # Final loss of PPO
             loss = -torch.min(surr1, surr2) + 0.5 * F.mse_loss(state_values, returns) - self.entropy_coef * dist_entropy
 
-            # Take gradient step
             self.optimizer.zero_grad()
             loss.mean().backward()
             nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
@@ -163,11 +179,13 @@ class PPOAgent(Agent):
             self.optimizer.step()
             total_loss += loss.mean().item()
 
-        # Copy new weights into old policy
         self.actor_old.load_state_dict(self.actor.state_dict())
 
-        # Clear buffer
-        self.buffer = []
+        # Clear the specific buffer
+        if local:
+            self.local_buffer = []
+        else:
+            self.buffer = []
 
         return {"ppo_loss": total_loss / self.K_epochs}
 
@@ -222,16 +240,19 @@ class PPOAgent(Agent):
     def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
         return self.actor(obs)
 
-    def checkpoint_model(self, specific_name=None):
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
-        filename = f"{self.name}_{specific_name if specific_name else 'latest'}.pt"
-        path = os.path.join(self.save_dir, filename)
+    def _save_checkpoint(self, path):
         torch.save({
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
             'optimizer': self.optimizer.state_dict(),
         }, path)
+
+    def checkpoint_model(self, specific_name=None):
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir, exist_ok=True)
+        filename = f"{self.name}_{specific_name if specific_name else 'latest'}.pt"
+        path = os.path.join(self.save_dir, filename)
+        self._save_checkpoint(path)
         print(f"[Checkpoint] Saved PPO model to {path}")
 
     def load_model(self, path):

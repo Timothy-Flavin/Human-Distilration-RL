@@ -26,7 +26,7 @@ class Agent(ABC):
         return action.cpu().item()
 
     @abstractmethod
-    def store_transition(self, obs, action, reward, next_obs, done):
+    def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         """Stores a transition in the agent's internal memory (if applicable)."""
         pass
 
@@ -50,9 +50,18 @@ class Agent(ABC):
         """Returns the raw logits for the given observations."""
         pass
 
-    @abstractmethod
     def checkpoint_model(self, specific_name=None):
         """Saves the model weights."""
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir, exist_ok=True)
+        filename = f"{self.name}_{specific_name if specific_name else 'latest'}.pt"
+        path = os.path.join(self.save_dir, filename)
+        self._save_checkpoint(path)
+        print(f"[Checkpoint] Saved {self.name} model to {path}")
+
+    @abstractmethod
+    def _save_checkpoint(self, path):
+        """Internal method to save weights to a specific path."""
         pass
 
     @abstractmethod
