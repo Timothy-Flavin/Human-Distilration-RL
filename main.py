@@ -92,7 +92,10 @@ def main():
     }
     
     metrics = MetricsLogger()
-    router = LLMRouter(buffers['curriculum'], buffers['ssl'])
+    # R4.2: Router needs access to global buffers for mining
+    # For CQL, we use its internal replay_buffer. For PPO, we'd need to expose its buffer or use the episodes.
+    global_buffer_proxy = MagicReplayProxy(agent) 
+    router = LLMRouter(buffers['curriculum'], buffers['ssl'], global_buffer=global_buffer_proxy, example_buffer=buffers['example'])
     
     TOTAL_ITERATIONS = 20
     
@@ -101,10 +104,7 @@ def main():
         
         # Step 1: Base RL Collection
         print("Collecting RL experience...")
-        if args.algo == "ppo":
-            nep = 20
-        else:
-            nep = 5
+        nep = 20 if args.algo == "ppo" else 5
         episodes = run_rl_collection(agent, env, num_episodes=nep, metrics=metrics, update=args.rl)
         agent.checkpoint_model(specific_name=f"rl_collection_{iteration}")
         
@@ -125,20 +125,14 @@ def main():
             )
             corrected_trajectory, annotations, final_seed = wrapper.run()
             
-            # --- NEW: Push the FULL corrected trajectory to the RL Replay Buffer ---
-            # Note: RL agent actions from interactive window go to RL buffer here, 
-            # while human actions only went to BC buffer during the interactive session.
+            # Push corrected trajectory to RL buffer
             if args.algo != "ppo":
                 for i in range(len(corrected_trajectory) - 1):
                     step = corrected_trajectory[i]
                     next_step = corrected_trajectory[i+1]
                     agent.store_transition(
-                        step['obs'], 
-                        next_step['action'], 
-                        next_step['reward'], 
-                        next_step['obs'], 
-                        next_step['terminated'],
-                        next_step['truncated']
+                        step['obs'], next_step['action'], next_step['reward'], 
+                        next_step['obs'], next_step['terminated'], next_step['truncated']
                     )
 
             agent.checkpoint_model(specific_name=f"interactive_review_{iteration}")
@@ -150,85 +144,66 @@ def main():
                 item = buffers['llm'].pop()
                 router.process(item)
             metrics.stop_timer("llm_processing")
-            agent.checkpoint_model(specific_name=f"llm_routing_{iteration}")
             
-            # Step 4: Multi-Faceted Agent Update
-            print("Updating Agent...")
-            
-            # Supervised Updates
-            if len(buffers['example']) >= 32 and args.bc:
-                metrics.start_timer("agent_updating_bc")
-                for si in range(10):
+            # Step 4: Multi-Faceted Update (R5.1: Unified Update Epochs)
+            print("Updating Agent (Unified Pipeline)...")
+            num_unified_epochs = 5
+            for epoch in range(num_unified_epochs):
+                # Supervised BC
+                if len(buffers['example']) >= 32 and args.bc:
+                    metrics.start_timer("agent_updating_bc")
                     obs, labels = buffers['example'].sample(32)
                     agent.supervised_update(obs, labels, anti=False)
-                metrics.stop_timer("agent_updating_bc")
-                
-            if len(buffers['anti_example']) >= 32 and args.anti_bc:
-                metrics.start_timer("agent_updating_anti_bc")
-                for si in range(10):
+                    metrics.stop_timer("agent_updating_bc")
+                    
+                # Supervised Anti-BC
+                if len(buffers['anti_example']) >= 32 and args.anti_bc:
+                    metrics.start_timer("agent_updating_anti_bc")
                     obs, labels = buffers['anti_example'].sample(32)
                     agent.supervised_update(obs, labels, anti=True)
-                metrics.stop_timer("agent_updating_anti_bc")
+                    metrics.stop_timer("agent_updating_anti_bc")
                 
-            # Curriculum Updates (Local RL)
+                # SSL Updates
+                if len(buffers['ssl']) >= 8 and args.semi_supervised:
+                    metrics.start_timer("agent_updating_ssl")
+                    batch = buffers['ssl'].sample(8)
+                    agent.ssl_update(batch)
+                    metrics.log_frames(len(batch), source="ssl")
+                    metrics.stop_timer("agent_updating_ssl")
+
+            # Curriculum Updates (Localized RL)
+            # Curriculum is special because it involves environment interaction
             if len(buffers['curriculum']) > 0 and args.curriculum:
                 metrics.start_timer("agent_updating_local_rl")
-                print(f"\n[Curriculum] Processing tasks...")
-                
+                print(f"[Curriculum] Replaying tasks...")
+                # We consume curriculum tasks once per iteration but can do multiple local epochs
                 while not buffers['curriculum'].is_empty():
                     task = buffers['curriculum'].pop()
-                    print(f" > Task: Seed {task['seed']}, Start Frame {task['start_frame']}")
-                    
-                    # Training Loop: Replay the targeted segment multiple times
-                    num_local_epochs = 5
-                    for epoch in range(num_local_epochs):
-                        # 1. Restore Environment to the starting frame of the task
-                        # Use historical actions for perfect reconstruction
+                    for local_epoch in range(args.num_local_epochs):
                         obs, info = env.reset(seed=task['seed'])
                         if task['historical_actions']:
                             for action in task['historical_actions']:
-                                obs, _, terminated, truncated, _ = env.step(action)
-                                if terminated or truncated: break
+                                obs, _, term, trunc, _ = env.step(action)
+                                if term or trunc: break
                         
-                        # 2. Collect Experience from this point and update
                         n_frames = 0
-                        for _ in range(task.get('trajectory_length', 100)):
+                        traj_len = args.curriculum_traj_len if args.curriculum_traj_len > 0 else task.get('trajectory_length', 100)
+                        for _ in range(traj_len):
                             action = agent.predict(obs, deterministic=False)
-                            next_obs, reward, terminated, truncated, info = env.step(action)
+                            next_obs, reward, term, trunc, info = env.step(action)
+                            agent.store_transition(obs, action, reward, next_obs, term, trunc)
                             
-                            # Standard reward for the GLOBAL buffer (so it learns standard env physics)
-                            agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
-                            
-                            # Custom reward for the LOCAL buffer (so it learns the curriculum task)
-                            local_reward = reward
-                            if task.get('reward_fn'):
-                                local_reward = task['reward_fn'](obs, next_obs, reward)
-                            
+                            local_reward = task['reward_fn'](obs, next_obs, reward) if task.get('reward_fn') else reward
                             if hasattr(agent, 'store_local_transition'):
-                                agent.store_local_transition(obs, action, local_reward, next_obs, terminated, truncated)
-                            else:
-                                # Fallback if agent doesn't support local buffers yet
-                                agent.store_transition(obs, action, local_reward, next_obs, terminated, truncated)
+                                agent.store_local_transition(obs, action, local_reward, next_obs, term, trunc)
                             
-                            env.render() # Visual verification
-                            
-                            # 3. Perform a localized RL update PER FRAME
+                            env.render()
                             agent.rl_update(local=True)
-                            
                             n_frames += 1
-                            if terminated or truncated: break
+                            if term or trunc: break
                             obs = next_obs
-                        
                         metrics.log_frames(n_frames, source="curriculum")
-                        
                 metrics.stop_timer("agent_updating_local_rl")
-                
-            # SSL Updates
-            if len(buffers['ssl']) >= 8 and args.semi_supervised:
-                metrics.start_timer("agent_updating_ssl")
-                batch = buffers['ssl'].sample(8)
-                agent.ssl_update(batch)
-                metrics.stop_timer("agent_updating_ssl")
 
             # Save buffers
             buffers['example'].save(os.path.join(results_base_dir, f"example_buffer_{iteration}.pt"))
@@ -251,23 +226,29 @@ def main():
         
     env.close()
 
+class MagicReplayProxy:
+    """Helper to expose agent's internal buffer to the router for mining."""
+    def __init__(self, agent):
+        self.agent = agent
+    @property
+    def buffer(self):
+        if hasattr(self.agent, 'replay_buffer'):
+            return [(step[0], step[1]) for step in self.agent.replay_buffer]
+        elif hasattr(self.agent, 'buffer'):
+            return [(step['obs'], step['action']) for step in self.agent.buffer]
+        return []
+
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser()
-
-    # Boolean flags (default = False)
     parser.add_argument("--rl", action="store_true")
     parser.add_argument("--bc", action="store_true")
     parser.add_argument("--anti_bc", action="store_true")
     parser.add_argument("--semi_supervised", action="store_true")
     parser.add_argument("--curriculum", action="store_true")
-
-    # String argument
     parser.add_argument("--experiment_name", type=str, default="default_experiment")
     parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
-
+    parser.add_argument("--num_local_epochs", type=int, default=5)
+    parser.add_argument("--curriculum_traj_len", type=int, default=0)
     args = parser.parse_args()
-
-    print(args)
     main()

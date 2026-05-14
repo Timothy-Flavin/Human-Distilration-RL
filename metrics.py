@@ -8,6 +8,7 @@ class MetricsLogger:
         self.timers = {
             "rl_experience": 0.0,
             "human_overriding": 0.0,
+            "human_reviewing": 0.0,
             "human_annotating": 0.0,
             "llm_processing": 0.0,
             "agent_updating_bc": 0.0,
@@ -20,7 +21,8 @@ class MetricsLogger:
         self.frames = {
             "rl": 0,
             "human": 0,
-            "curriculum": 0
+            "curriculum": 0,
+            "ssl": 0
         }
         
         # Evaluation results
