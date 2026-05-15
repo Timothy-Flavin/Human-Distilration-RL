@@ -109,7 +109,7 @@ def main():
         agent.checkpoint_model(specific_name=f"rl_collection_{iteration}")
         
         # Step 2: Human Interactive Review
-        if args.bc or args.anti_bc or args.semi_supervised or args.curriculum:
+        if args.bc or args.anti_bc or args.ssl or args.curriculum:
             print("Starting Human Interactive Review...")
             
             # Sample the episode with the lowest return for review
@@ -124,7 +124,11 @@ def main():
                 initial_seed=best_ep['seed']
             )
             corrected_trajectory, annotations, final_seed = wrapper.run()
-            
+            totr = 0
+            #print(corrected_trajectory)
+            for ti in range(len(corrected_trajectory)):
+                totr+=corrected_trajectory[ti]['reward']
+            print(f"Total reward for corrected trajectory: {totr}")
             # Push corrected trajectory to RL buffer
             if args.algo != "ppo":
                 for i in range(len(corrected_trajectory) - 1):
@@ -164,7 +168,7 @@ def main():
                     metrics.stop_timer("agent_updating_anti_bc")
                 
                 # SSL Updates
-                if len(buffers['ssl']) >= 8 and args.semi_supervised:
+                if len(buffers['ssl']) >= 8 and args.ssl:
                     metrics.start_timer("agent_updating_ssl")
                     batch = buffers['ssl'].sample(8)
                     agent.ssl_update(batch)
@@ -244,7 +248,7 @@ if __name__ == "__main__":
     parser.add_argument("--rl", action="store_true")
     parser.add_argument("--bc", action="store_true")
     parser.add_argument("--anti_bc", action="store_true")
-    parser.add_argument("--semi_supervised", action="store_true")
+    parser.add_argument("--ssl", action="store_true")
     parser.add_argument("--curriculum", action="store_true")
     parser.add_argument("--experiment_name", type=str, default="default_experiment")
     parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
