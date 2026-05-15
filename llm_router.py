@@ -76,7 +76,7 @@ class LLMRouter:
         text = text.lower()
         
         # --- GOALS (Reward Functions) ---
-        if "gain stability" in text:
+        if "gain stability" in text or "gain control" in text:
             return {
                 "type": "GOAL",
                 "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize velocity and angular velocity to encourage stability\n    return base_r - 0.1 * (abs(next_obs[2]) + abs(next_obs[3]) + abs(next_obs[5]))"
