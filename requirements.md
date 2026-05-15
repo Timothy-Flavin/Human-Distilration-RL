@@ -13,6 +13,7 @@ This document defines the absolute requirements for the Freshman project, derive
 - **R2.3**: Accept/Reject: Decision-based trajectory commitment.
 - **R2.4**: Resume Logic: Deterministic replay using historical actions to branch from any frame.
 - **R2.5**: Context-Aware Annotation: Capture exact observation magnitudes and human-readable formatting.
+- **R2.6**: BC: Human takes control with spacebar, those actions are behavior cloned to shortcut learning
 
 ## 3. Curriculum Learning (Stage 3)
 - **R3.1**: Annotation Classification: `Goal`, `Heuristic`, `Generic`.

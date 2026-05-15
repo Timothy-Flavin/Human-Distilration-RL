@@ -13,6 +13,8 @@ from metrics import MetricsLogger
 from llm_router import LLMRouter
 from eval_agent import evaluate_return, calculate_cross_entropy
 
+torch.set_num_threads(4)
+
 def run_rl_collection(agent, env, num_episodes, metrics, update=False):
     metrics.start_timer("rl_experience")
     episodes = []
