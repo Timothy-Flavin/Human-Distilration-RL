@@ -10,7 +10,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --algo) ALGO="$2"; shift ;;
         --name) EXP_NAME="$2"; shift ;;
-        --rl|--bc|--anti_bc|--semi_supervised|--curriculum) FLAGS="$FLAGS $1" ;;
+        --rl|--bc|--anti_bc|--ssl|--curriculum) FLAGS="$FLAGS $1" ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift

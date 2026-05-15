@@ -376,7 +376,7 @@ class InteractiveGymWrapper:
                 self.step_forward(action, source="rl")
                 if self.metrics: 
                     self.metrics.log_frames(1, source="rl")
-            print(self.current_obs)
+            #print(self.current_obs)
             self.draw_overlay()
             self.clock.tick(self.fps)
 
