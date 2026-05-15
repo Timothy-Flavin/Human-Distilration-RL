@@ -217,12 +217,18 @@ class InteractiveGymWrapper:
             self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
             return
 
+        # Prevent stepping the environment if the episode is already over
+        if self.trajectory and (self.trajectory[-1]["terminated"] or self.trajectory[-1]["truncated"]):
+            return
+
         obs, reward, terminated, truncated, info = self.env.step(action)
         self._record_step(obs, action, reward, terminated, truncated, info, source=source)
         self.current_obs = obs
 
         if terminated or truncated:
-            self.mode = "decision" 
+            # Only trigger a decision if we actively branched the timeline
+            if self.override_source is not None:
+                self.mode = "decision"
 
     def step_backward(self):
         """Steps backward through the saved trajectory history."""
@@ -274,10 +280,12 @@ class InteractiveGymWrapper:
             overlay.set_alpha(180)
             overlay.fill((0, 0, 0))
             self.screen.blit(overlay, (0, self.screen.get_height() // 2 - 50))
-
-            msg = self.font.render(f"[A]ccept {self.override_source.title()} or [R]eject?", True, (255, 255, 255))
+            
+            # Add a fallback string if override_source is None
+            source_name = self.override_source.title() if self.override_source else "Changes"
+            msg = self.font.render(f"[A]ccept {source_name} or [R]eject?", True, (255, 255, 255))
             self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2 - 20))
-
+        
         current_note = next((n["text"] for n in self.notes if n["frame"] == self.current_frame_idx), None)
         if current_note:
             note_display = self.small_font.render(f"NOTE: {current_note}", True, (255, 100, 100))
@@ -376,7 +384,7 @@ class InteractiveGymWrapper:
                 self.step_forward(action, source="rl")
                 if self.metrics: 
                     self.metrics.log_frames(1, source="rl")
-            print(self.current_obs)
+            #print(self.current_obs)
             self.draw_overlay()
             self.clock.tick(self.fps)
 

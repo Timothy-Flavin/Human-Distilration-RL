@@ -76,10 +76,30 @@ class LLMRouter:
         text = text.lower()
         
         # --- GOALS (Reward Functions) ---
-        if "gain stability" in text:
+        if "gain stability" in text or "gain control" in text:
             return {
                 "type": "GOAL",
                 "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize velocity and angular velocity to encourage stability\n    return base_r - 0.1 * (abs(next_obs[2]) + abs(next_obs[3]) + abs(next_obs[5]))"
+            }
+        if "straighten out" in text:
+            return {
+                "type": "GOAL",
+                "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize linear velocities (x, y), tilt angle, and rotation speed to kill drift\n    # next_obs[2]: v_x, next_obs[3]: v_y, next_obs[4]: angle, next_obs[5]: v_angle\n    drift_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[3]))\n    tilt_penalty = 0.5 * abs(next_obs[4]) + 0.1 * abs(next_obs[5])\n    return base_r - (drift_penalty + tilt_penalty)"
+            }
+        elif "hover down" in text:
+            return {
+                "type": "GOAL",
+                "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vy is negative for downward movement\n    target_vy = -0.3\n    # Penalize horizontal velocity (2), angle (4), and angular velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[4]) + abs(next_obs[5]))\n    # Reward staying close to the slow downward target speed\n    speed_reward = -abs(next_obs[3] - target_vy)\n    return base_r + speed_reward - stability_penalty"
+            }
+        elif "hover left" in text:
+            return {
+                "type": "GOAL",
+                "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vx is negative for moving left\n    target_vx = -0.3\n    # Penalize vertical movement (3) and rotational velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    # Reward staying close to the slow leftward target speed\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
+            }
+        if "hover right" in text:
+            return {
+                "type": "GOAL",
+                "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vx is positive for moving right\n    target_vx = 0.3\n    # Penalize vertical movement (3) and rotational velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    # Reward staying close to the slow rightward target speed\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
             }
         elif "soft landing" in text:
             return {
