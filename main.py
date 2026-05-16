@@ -151,12 +151,46 @@ def main():
 
             agent.checkpoint_model(specific_name=f"interactive_review_{iteration}")
             
-            # Step 3: LLM Routing
+            # Step 3: LLM Routing & Verification
             print("Processing LLM Buffer...")
             metrics.start_timer("llm_processing")
             while not buffers['llm'].is_empty():
                 item = buffers['llm'].pop()
-                router.process(item)
+                classification = router.classify(item)
+                
+                if classification['type'] == 'HEURISTIC':
+                    verified = False
+                    while not verified:
+                        # Re-open wrapper for verification playback
+                        v_wrapper = InteractiveGymWrapper(
+                            env, agent=agent, buffers=buffers, metrics=metrics,
+                            initial_trajectory=item['episode_trajectory'],
+                            initial_seed=item['seed']
+                        )
+                        decision, new_text = v_wrapper.run_verification(
+                            start_frame=item['note_frame_idx'],
+                            action=classification['action'],
+                            termination_rule=classification.get('termination_rule', lambda o: True),
+                            phrase=classification.get('phrase', item['note_text'])
+                        )
+                        
+                        if decision == "accept":
+                            router.commit(item, classification)
+                            verified = True
+                        elif decision == "reject":
+                            verified = True # Discard
+                        elif decision == "rephrase" and new_text:
+                            item['note_text'] = new_text
+                            classification = router.classify(item)
+                            if classification['type'] != 'HEURISTIC':
+                                router.commit(item, classification)
+                                verified = True
+                            # Else: Continue loop with new heuristic classification
+                        else:
+                            verified = True # Fallback
+                else:
+                    # Goals and Generics are committed immediately
+                    router.commit(item, classification)
             metrics.stop_timer("llm_processing")
             
             # Step 4: Curriculum Updates (Localized RL)

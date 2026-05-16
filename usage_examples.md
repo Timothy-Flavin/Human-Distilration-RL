@@ -26,9 +26,20 @@ These phrases trigger the creation of a `CurriculumBuffer` task with an auxiliar
 | `hover right` | Horizontal Control | Rewards matching a slow rightward target velocity (0.3). |
 | `soft landing` | Touchdown Prep | Rewards low vertical velocity when near the pad (`y < 0.2`). |
 
-## 3. Workflow for Testing
+## 3. Heuristic Verification Phase
+After you close the interactive review window, the system will process any `HEURISTIC` annotations. For each one, a **Verification Playback** will start:
+
+1. **Simulation**: The environment will jump to the frame you annotated and perform the suggested action until the termination condition is met (or a timeout occurs).
+2. **Review**: Watch the playback to ensure the action (e.g., firing the engine) produces the desired result (e.g., killing rotation).
+3. **Decision**:
+   - **[A]ccept**: Commits the heuristic to the SSL pipeline for buffer mining.
+   - **[R]eject**: Discards the heuristic entirely.
+   - **[P]rephrase**: Opens a text input for you to rewrite the heuristic. The system will immediately re-classify and re-verify the new text.
+
+## 4. Workflow for Testing
 1. **Interactive Review**: Run `main.py` and wait for the interactive window.
 2. **Identify Moment**: Use arrow keys to find a frame where the agent is failing (e.g., drifting too fast).
 3. **Annotate**: Press `Enter`, type a phrase from the "Golden Path" (e.g., `catch drift`), and press `Enter` again to submit.
-4. **Finish**: Close the window or press `q` to trigger the unified update.
-5. **Verify**: Check the console output for `[SSL Mining] Found X matching states` or `[Curriculum] Replaying tasks`.
+4. **Finish**: Close the window or press `q`.
+5. **Verify**: If you left a heuristic, the verification playback will start. Press `A` to accept if it looks correct.
+6. **Unified Update**: Check the console output for `[SSL Mining] Found X matching states` or `[Curriculum] Replaying tasks`.

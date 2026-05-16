@@ -10,14 +10,20 @@ class LLMRouter:
         self.example_buffer = example_buffer
 
     def process(self, item):
-        """Processes a single item from the LLMBuffer."""
-        note_text = item['note_text']
-        obs_context = item['current_obs_dict']
-        
+        """Processes a single item from the LLMBuffer (Classify then Commit)."""
+        classification = self.classify(item)
+        if classification:
+            return self.commit(item, classification)
+        return None
+
+    def classify(self, item):
+        """Classifies a single item without pushing to buffers."""
+        return self._mock_llm_classify(item['note_text'], item['current_obs_dict'])
+
+    def commit(self, item, classification):
+        """Commits a classification by pushing to curriculum or SSL buffers."""
         # Extract historical actions up to the note_frame_idx (exclude dummy action at index 0)
         historical_actions = [step['action'] for step in item['episode_trajectory'][1:item['note_frame_idx'] + 1]]
-        
-        classification = self._mock_llm_classify(note_text, obs_context)
         
         if classification['type'] == 'GENERIC':
             self.curriculum_buffer.push(
@@ -38,21 +44,22 @@ class LLMRouter:
             )
         elif classification['type'] == 'HEURISTIC':
             # R4.2: Pull all states meeting the rule from the buffers
-            rule = classification.get('rule')
+            rule = classification.get('rule') # trigger_rule
+            term_rule = classification.get('termination_rule')
             if rule:
                 mined_count = 0
                 # Mine from global buffer
                 if self.global_buffer:
                     for obs, action in self.global_buffer.buffer:
                         if rule(obs.numpy()):
-                            self.ssl_buffer.push(obs, classification['action'], classification['feature_mask'])
+                            self.ssl_buffer.push(obs, classification['action'], classification['feature_mask'], termination_rule=term_rule)
                             mined_count += 1
                 
                 # Mine from example buffer
                 if self.example_buffer:
                     for obs, action in self.example_buffer.buffer:
                         if rule(obs.numpy()):
-                            self.ssl_buffer.push(obs, classification['action'], classification['feature_mask'])
+                            self.ssl_buffer.push(obs, classification['action'], classification['feature_mask'], termination_rule=term_rule)
                             mined_count += 1
                 
                 print(f"[SSL Mining] Found {mined_count} matching states for heuristic: {classification.get('name', 'Unknown')}")
@@ -61,8 +68,10 @@ class LLMRouter:
                 self.ssl_buffer.push(
                     obs=item['episode_trajectory'][item['note_frame_idx']]['obs'],
                     action=classification['action'],
-                    feature_mask=classification['feature_mask']
+                    feature_mask=classification['feature_mask'],
+                    termination_rule=term_rule
                 )
+        return classification
 
     def _mock_llm_classify(self, text, obs):
         """
@@ -78,19 +87,20 @@ class LLMRouter:
             # Dynamic action assignment for direction-dependent rules
             if action is None:
                 if h_name == "UNRECOVERABLE_SPIN_PREVENTION":
-                    # obs is the dict formatted by wrapper
                     ang_vel = obs['angular_vel']
-                    action = 1 if ang_vel > 0 else 3 # If spinning left (+), fire left (1) to rotate right
+                    action = 1 if ang_vel > 0 else 3 
                 elif h_name == "DRIFT_CATCHER":
                     x_vel = obs['x_vel']
-                    action = 3 if x_vel > 0 else 1 # If drifting right (+), fire right (3) to rotate left
+                    action = 3 if x_vel > 0 else 1 
             
             return {
                 "type": "HEURISTIC",
                 "name": h_name,
                 "action": action,
                 "feature_mask": h_data['feature_mask'],
-                "rule": h_data['rule']
+                "rule": h_data['trigger_rule'],
+                "termination_rule": h_data['termination_rule'],
+                "phrase": h_data['phrase']
             }
 
         # --- 2. GOALS (Reward Functions) ---

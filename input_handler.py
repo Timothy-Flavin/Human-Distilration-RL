@@ -44,6 +44,10 @@ def process_events(events, current_mode, text_buffer):
                 elif event.key == pygame.K_r:
                     decision = "reject"
                     new_mode = "step"
+                elif event.key == pygame.K_p:
+                    decision = "rephrase"
+                    new_mode = "note"
+                    text_buffer = ""
 
         # --- PLAYBACK / CONTROL MODES ---
         else:

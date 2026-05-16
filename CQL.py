@@ -142,10 +142,12 @@ class CQLAgent(Agent):
     def ssl_update(self, batch) -> dict:
         self.q_net.train()
         total_loss = 0
+        samples_used = 0
         for item in batch:
             obs = item['obs'].to(self.device_name)
             action = item['action'].to(self.device_name)
             mask = item['feature_mask']
+            term_rule = item.get('termination_rule')
             noise_scale = 0.5
             N = 5
             aug_losses = []
@@ -153,14 +155,24 @@ class CQLAgent(Agent):
                 noisy_obs = obs.clone()
                 unimportant_indices = [i for i in range(self.obs_dim) if i not in mask]
                 noisy_obs[unimportant_indices] += torch.randn(len(unimportant_indices), device=self.device_name) * noise_scale
+                
+                # R4.3: Ensure noise doesn't push state past termination condition
+                if term_rule is not None:
+                    if term_rule(noisy_obs.cpu().numpy()):
+                        continue # Skip this augmentation
+                
                 aug_logits = self.q_net(noisy_obs.unsqueeze(0))
                 aug_losses.append(self.criterion(aug_logits, action.unsqueeze(0)))
-            loss = torch.stack(aug_losses).mean()
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            total_loss += loss.item()
-        return {"ssl_loss": total_loss / len(batch)}
+            
+            if aug_losses:
+                loss = torch.stack(aug_losses).mean()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+                samples_used += 1
+        
+        return {"ssl_loss": total_loss / samples_used if samples_used > 0 else 0.0}
 
     def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
         return self.q_net(obs)

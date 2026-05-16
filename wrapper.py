@@ -236,7 +236,7 @@ class InteractiveGymWrapper:
             self.current_frame_idx -= 1
             self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
 
-    def draw_overlay(self):
+    def draw_overlay(self, verification_phrase=None):
         """Draws UI elements (mode, frame index, text buffer, existing notes)."""
         if self.screen is None or not self.trajectory:
             return
@@ -255,6 +255,7 @@ class InteractiveGymWrapper:
         if self.mode == "decision": color = (255, 0, 0)
         elif self.mode == "realtime": color = (0, 255, 0)
         elif self.mode == "agent": color = (0, 255, 255)
+        elif self.mode == "verification": color = (255, 100, 255)
 
         mode_surf = self.font.render(f"MODE: {self.mode.upper()}", True, color)
         self.screen.blit(mode_surf, (10, 10))
@@ -269,6 +270,10 @@ class InteractiveGymWrapper:
         source_surf = self.small_font.render(f"SOURCE: {source.upper()}", True, (200, 200, 200))
         self.screen.blit(source_surf, (10, 60))
 
+        if verification_phrase:
+            msg = self.small_font.render(f"HEURISTIC: {verification_phrase}", True, (255, 255, 255))
+            self.screen.blit(msg, (10, 90))
+
         if self.mode == "note":
             bg_rect = pygame.Rect(0, self.screen.get_height() - 50, self.screen.get_width(), 50)
             pygame.draw.rect(self.screen, (0, 0, 0), bg_rect)
@@ -276,14 +281,14 @@ class InteractiveGymWrapper:
             self.screen.blit(note_surf, (10, self.screen.get_height() - 40))
 
         if self.mode == "decision":
-            overlay = pygame.Surface((self.screen.get_width(), 100))
+            overlay = pygame.Surface((self.screen.get_width(), 120))
             overlay.set_alpha(180)
             overlay.fill((0, 0, 0))
-            self.screen.blit(overlay, (0, self.screen.get_height() // 2 - 50))
+            self.screen.blit(overlay, (0, self.screen.get_height() // 2 - 60))
             
             # Add a fallback string if override_source is None
-            source_name = self.override_source.title() if self.override_source else "Changes"
-            msg = self.font.render(f"[A]ccept {source_name} or [R]eject?", True, (255, 255, 255))
+            source_name = self.override_source.title() if self.override_source else "Heuristic"
+            msg = self.font.render(f"[A]ccept {source_name}, [R]eject, or [P]rephrase?", True, (255, 255, 255))
             self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2 - 20))
         
         current_note = next((n["text"] for n in self.notes if n["frame"] == self.current_frame_idx), None)
@@ -292,6 +297,68 @@ class InteractiveGymWrapper:
             self.screen.blit(note_display, (10, 80))
 
         pygame.display.flip()
+
+    def run_verification(self, start_frame, action, termination_rule, phrase):
+        """Plays back a heuristic and waits for user decision."""
+        print(f"\n[Verification] Starting playback for: '{phrase}'")
+        self._restore_state(start_frame)
+        self.mode = "verification"
+        self.running = True
+        
+        # We need a fresh trajectory for verification to avoid polluting history
+        # but we want to keep the image frames for display
+        verification_obs = self.trajectory[start_frame]["obs"]
+        
+        timeout_frames = 100
+        frames_run = 0
+        final_decision = None
+        rephrased_text = None
+
+        while self.running:
+            events = pygame.event.get()
+            new_mode, self.text_buffer, submitted_note, step_dir, reset, branch_timeline, decision = process_events(
+                events, self.mode, self.text_buffer
+            )
+
+            if submitted_note:
+                rephrased_text = submitted_note
+                final_decision = "rephrase"
+                self.running = False
+                break
+
+            if decision:
+                final_decision = decision
+                self.running = False
+                break
+
+            self.mode = new_mode
+            if self.mode == "quit":
+                self.running = False
+                break
+
+            if self.mode == "verification":
+                # Check termination or timeout
+                if not termination_rule(verification_obs) and frames_run < timeout_frames:
+                    obs, reward, term, trunc, info = self.env.step(action)
+                    verification_obs = obs
+                    frame = self.env.render()
+                    
+                    # Add to trajectory for drawing
+                    self.trajectory.append({
+                        "obs": obs,
+                        "frame_image": frame,
+                        "source": "heuristic"
+                    })
+                    self.current_frame_idx = len(self.trajectory) - 1
+                    frames_run += 1
+                else:
+                    print(f"[Verification] Termination condition met or timeout reached at frame {frames_run}.")
+                    self.mode = "decision"
+
+            self.draw_overlay(verification_phrase=phrase)
+            self.clock.tick(self.fps)
+
+        return final_decision, rephrased_text
 
     def run(self):
         self.running = True
