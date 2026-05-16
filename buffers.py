@@ -106,3 +106,20 @@ class SemiSupervisedBuffer:
 
     def __len__(self):
         return len(self.buffer)
+
+class ObservationBuffer:
+    """Buffer for storing observations (e.g., for KL-divergence targets)."""
+    def __init__(self, capacity=10000):
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def push(self, obs):
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.tensor(obs, dtype=torch.float32)
+        self.buffer.append(obs)
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
+        return torch.stack(batch)
+
+    def __len__(self):
+        return len(self.buffer)

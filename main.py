@@ -8,17 +8,18 @@ from Agent import Agent
 from CQL import CQLAgent
 from PPO import PPOAgent
 from wrapper import InteractiveGymWrapper
-from buffers import ReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuffer
+from buffers import ReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuffer, ObservationBuffer
 from metrics import MetricsLogger
 from llm_router import LLMRouter
 from eval_agent import evaluate_return, calculate_cross_entropy
 
 torch.set_num_threads(4)
 
-def run_rl_collection(agent, env, num_episodes, metrics, update=False):
+def run_rl_collection(agent, env, num_frames, metrics, update=False):
     metrics.start_timer("rl_experience")
     episodes = []
-    for _ in range(num_episodes):
+    total_frames = 0
+    while total_frames < num_frames:
         seed = np.random.randint(0, 1000000)
         obs, info = env.reset(seed=seed)
         terminated = False
@@ -60,6 +61,9 @@ def run_rl_collection(agent, env, num_episodes, metrics, update=False):
             })
             obs = next_obs
             metrics.log_frames(1, source="rl")
+            total_frames += 1
+            if total_frames >= num_frames:
+                break
         episodes.append({"trajectory": trajectory, "seed": seed})
     metrics.stop_timer("rl_experience")
     return episodes
@@ -84,18 +88,26 @@ def main():
     else:
         raise ValueError(f"Unknown algorithm: {args.algo}")
     
+    # For curriculum method 'separate' or 'kl'
+    aux_agent = None
+    if args.curriculum and args.curriculum_method in ['separate', 'kl']:
+        if args.algo == "cql":
+            aux_agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL_Aux", save_dir=results_base_dir, device_name="cpu")
+        elif args.algo == "ppo":
+            aux_agent = PPOAgent(obs_dim=obs_dim, action_dim=action_dim, name="PPO_Aux", save_dir=results_base_dir, device_name="cpu")
+
     # 2. Setup Buffers & Router
     buffers = {
         'example': ReplayBuffer(capacity=10000),
         'anti_example': ReplayBuffer(capacity=10000),
         'llm': LLMBuffer(),
         'curriculum': CurriculumBuffer(),
-        'ssl': SemiSupervisedBuffer(capacity=5000)
+        'ssl': SemiSupervisedBuffer(capacity=5000),
+        'kl_target': ObservationBuffer(capacity=10000)
     }
     
     metrics = MetricsLogger()
     # R4.2: Router needs access to global buffers for mining
-    # For CQL, we use its internal replay_buffer. For PPO, we'd need to expose its buffer or use the episodes.
     global_buffer_proxy = MagicReplayProxy(agent) 
     router = LLMRouter(buffers['curriculum'], buffers['ssl'], global_buffer=global_buffer_proxy, example_buffer=buffers['example'])
     
@@ -106,8 +118,8 @@ def main():
         
         # Step 1: Base RL Collection
         print("Collecting RL experience...")
-        nep = 20 if args.algo == "ppo" else 5
-        episodes = run_rl_collection(agent, env, num_episodes=nep, metrics=metrics, update=args.rl)
+        n_frames = 5000 if args.algo == "ppo" else 3000
+        episodes = run_rl_collection(agent, env, num_frames=n_frames, metrics=metrics, update=args.rl)
         agent.checkpoint_model(specific_name=f"rl_collection_{iteration}")
         
         # Step 2: Human Interactive Review
@@ -126,11 +138,7 @@ def main():
                 initial_seed=best_ep['seed']
             )
             corrected_trajectory, annotations, final_seed = wrapper.run()
-            totr = 0
-            #print(corrected_trajectory)
-            for ti in range(len(corrected_trajectory)):
-                totr+=corrected_trajectory[ti]['reward']
-            print(f"Total reward for corrected trajectory: {totr}")
+            
             # Push corrected trajectory to RL buffer
             if args.algo != "ppo":
                 for i in range(len(corrected_trajectory) - 1):
@@ -151,15 +159,101 @@ def main():
                 router.process(item)
             metrics.stop_timer("llm_processing")
             
-            # Step 4: Multi-Faceted Update (R5.1: Unified Update Epochs)
+            # Step 4: Curriculum Updates (Localized RL)
+            # Must happen before Unified Update to prepare aux_agent and kl_target buffer
+            if len(buffers['curriculum']) > 0 and args.curriculum:
+                metrics.start_timer("agent_updating_local_rl")
+                print(f"[Curriculum] Replaying tasks (Method: {args.curriculum_method})...")
+                
+                while not buffers['curriculum'].is_empty():
+                    task = buffers['curriculum'].pop()
+                    
+                    if args.curriculum_method in ['separate', 'kl']:
+                        # Copy main agent to aux agent
+                        if args.algo == "ppo":
+                            aux_agent.actor.load_state_dict(agent.actor.state_dict())
+                            aux_agent.critic.load_state_dict(agent.critic.state_dict())
+                            aux_agent.actor_old.load_state_dict(agent.actor.state_dict())
+                        else:
+                            aux_agent.q_net.load_state_dict(agent.q_net.state_dict())
+                            aux_agent.q_target.load_state_dict(agent.q_net.state_dict())
+
+                    train_agent = aux_agent if args.curriculum_method in ['separate', 'kl'] else agent
+                    
+                    for local_epoch in range(args.num_local_epochs):
+                        obs, info = env.reset(seed=task['seed'])
+                        if task['historical_actions']:
+                            for action in task['historical_actions']:
+                                obs, _, term, trunc, _ = env.step(action)
+                                if term or trunc: break
+                        
+                        n_frames = 0
+                        traj_len = args.curriculum_traj_len if args.curriculum_traj_len > 0 else task.get('trajectory_length', 100)
+                        for _ in range(traj_len):
+                            action = train_agent.predict(obs, deterministic=False)
+                            next_obs, reward, term, trunc, info = env.step(action)
+                            
+                            local_reward = task['reward_fn'](obs, next_obs, reward) if task.get('reward_fn') else reward
+                            
+                            if args.curriculum_method == 'main':
+                                # Train main agent on both
+                                agent.store_transition(obs, action, reward, next_obs, term, trunc) # True rewards
+                                agent.store_local_transition(obs, action, local_reward, next_obs, term, trunc) # Aux rewards
+                                agent.rl_update(local=True)
+                                agent.rl_update(local=False)
+                            elif args.curriculum_method == 'separate':
+                                # Train aux agent on local
+                                aux_agent.store_transition(obs, action, local_reward, next_obs, term, trunc)
+                                aux_agent.rl_update()
+                                # Expose behavior to main agent with true rewards
+                                agent.store_transition(obs, action, reward, next_obs, term, trunc)
+                            elif args.curriculum_method == 'kl':
+                                # Train aux agent on local
+                                aux_agent.store_transition(obs, action, local_reward, next_obs, term, trunc)
+                                aux_agent.rl_update()
+                                # Store observations for targeted KL
+                                buffers['kl_target'].push(obs)
+                            
+                            env.render()
+                            n_frames += 1
+                            if term or trunc: break
+                            obs = next_obs
+                        metrics.log_frames(n_frames, source="curriculum")
+                
+                metrics.stop_timer("agent_updating_local_rl")
+
+            # Step 5: Multi-Faceted Update (R5.1: Unified Update Epochs)
             print("Updating Agent (Unified Pipeline)...")
             num_unified_epochs = 5
             for epoch in range(num_unified_epochs):
+                # Standard RL update (global buffer)
+                if args.rl:
+                    agent.rl_update()
+
+                # Targeted KL penalty (only on curriculum observations)
+                if args.curriculum and args.curriculum_method == 'kl' and len(buffers['kl_target']) >= 32:
+                    kl_obs = buffers['kl_target'].sample(32)
+                    agent.kl_update(kl_obs, aux_agent)
+
                 # Supervised BC
                 if len(buffers['example']) >= 32 and args.bc:
                     metrics.start_timer("agent_updating_bc")
                     obs, labels = buffers['example'].sample(32)
-                    agent.supervised_update(obs, labels, anti=False)
+                    
+                    advantages = None
+                    if args.awbc:
+                        # Estimate advantage using current critic/Q-net
+                        with torch.no_grad():
+                            if args.algo == "ppo":
+                                values = agent.critic(obs.to(agent.device_name)).squeeze()
+                                advantages = torch.ones_like(labels, dtype=torch.float32)
+                            else:
+                                q_values = agent.q_net(obs.to(agent.device_name))
+                                v_values = q_values.max(1)[0]
+                                q_selected = q_values.gather(1, labels.to(agent.device_name).unsqueeze(1)).squeeze()
+                                advantages = F.relu(q_selected - v_values + 1.0)
+                    
+                    agent.supervised_update(obs, labels, anti=False, advantages=advantages)
                     metrics.stop_timer("agent_updating_bc")
                     
                 # Supervised Anti-BC
@@ -177,43 +271,13 @@ def main():
                     metrics.log_frames(len(batch), source="ssl")
                     metrics.stop_timer("agent_updating_ssl")
 
-            # Curriculum Updates (Localized RL)
-            # Curriculum is special because it involves environment interaction
-            if len(buffers['curriculum']) > 0 and args.curriculum:
-                metrics.start_timer("agent_updating_local_rl")
-                print(f"[Curriculum] Replaying tasks...")
-                # We consume curriculum tasks once per iteration but can do multiple local epochs
-                while not buffers['curriculum'].is_empty():
-                    task = buffers['curriculum'].pop()
-                    for local_epoch in range(args.num_local_epochs):
-                        obs, info = env.reset(seed=task['seed'])
-                        if task['historical_actions']:
-                            for action in task['historical_actions']:
-                                obs, _, term, trunc, _ = env.step(action)
-                                if term or trunc: break
-                        
-                        n_frames = 0
-                        traj_len = args.curriculum_traj_len if args.curriculum_traj_len > 0 else task.get('trajectory_length', 100)
-                        for _ in range(traj_len):
-                            action = agent.predict(obs, deterministic=False)
-                            next_obs, reward, term, trunc, info = env.step(action)
-                            agent.store_transition(obs, action, reward, next_obs, term, trunc)
-                            
-                            local_reward = task['reward_fn'](obs, next_obs, reward) if task.get('reward_fn') else reward
-                            if hasattr(agent, 'store_local_transition'):
-                                agent.store_local_transition(obs, action, local_reward, next_obs, term, trunc)
-                            
-                            env.render()
-                            agent.rl_update(local=True)
-                            n_frames += 1
-                            if term or trunc: break
-                            obs = next_obs
-                        metrics.log_frames(n_frames, source="curriculum")
-                metrics.stop_timer("agent_updating_local_rl")
-
-            # Save buffers
+            # Save buffers and annotations
             buffers['example'].save(os.path.join(results_base_dir, f"example_buffer_{iteration}.pt"))
             buffers['anti_example'].save(os.path.join(results_base_dir, f"anti_example_buffer_{iteration}.pt"))
+            
+            # Save raw annotations for traceability
+            with open(os.path.join(results_base_dir, f"annotations_{iteration}.json"), "w") as f:
+                json.dump(annotations, f, indent=4)
                 
         agent.checkpoint_model(specific_name=f"agent_update_{iteration}")
         
@@ -238,8 +302,10 @@ class MagicReplayProxy:
         self.agent = agent
     @property
     def buffer(self):
+        # CQL uses a list of tuples: (obs, action, reward, next_obs, terminated, truncated)
         if hasattr(self.agent, 'replay_buffer'):
             return [(step[0], step[1]) for step in self.agent.replay_buffer]
+        # PPO uses a list of dicts: {'obs': ..., 'action': ..., ...}
         elif hasattr(self.agent, 'buffer'):
             return [(step['obs'], step['action']) for step in self.agent.buffer]
         return []
@@ -252,6 +318,8 @@ if __name__ == "__main__":
     parser.add_argument("--anti_bc", action="store_true")
     parser.add_argument("--ssl", action="store_true")
     parser.add_argument("--curriculum", action="store_true")
+    parser.add_argument("--awbc", action="store_true", help="Use Advantage Weighted Behavior Cloning")
+    parser.add_argument("--curriculum_method", type=str, default="main", choices=["main", "separate", "kl"])
     parser.add_argument("--experiment_name", type=str, default="default_experiment")
     parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
     parser.add_argument("--num_local_epochs", type=int, default=5)

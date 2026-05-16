@@ -31,12 +31,12 @@ class Agent(ABC):
         pass
 
     @abstractmethod
-    def rl_update(self, batch_size=64, local: bool = False) -> dict:
+    def rl_update(self, batch_size=64, local: bool = False, target_agent=None) -> dict:
         """Performs a Reinforcement Learning update."""
         pass
 
     @abstractmethod
-    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False) -> dict:
+    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False, advantages: torch.Tensor = None) -> dict:
         """Performs a Supervised Learning (Behavior Cloning) update."""
         pass
 
@@ -48,6 +48,11 @@ class Agent(ABC):
     @abstractmethod
     def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
         """Returns the raw logits for the given observations."""
+        pass
+
+    @abstractmethod
+    def kl_update(self, obs: torch.Tensor, target_agent) -> dict:
+        """Performs a KL-Divergence update towards a target agent's policy."""
         pass
 
     def checkpoint_model(self, specific_name=None):

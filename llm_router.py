@@ -1,5 +1,6 @@
 import json
 import re
+from LunarLander_v3_heuristics import HEURISTICS, get_heuristic_by_text
 
 class LLMRouter:
     def __init__(self, curriculum_buffer, ssl_buffer, global_buffer=None, example_buffer=None):
@@ -54,7 +55,7 @@ class LLMRouter:
                             self.ssl_buffer.push(obs, classification['action'], classification['feature_mask'])
                             mined_count += 1
                 
-                print(f"[SSL Mining] Found {mined_count} matching states for rule.")
+                print(f"[SSL Mining] Found {mined_count} matching states for heuristic: {classification.get('name', 'Unknown')}")
             else:
                 # Fallback to just the current frame
                 self.ssl_buffer.push(
@@ -66,16 +67,33 @@ class LLMRouter:
     def _mock_llm_classify(self, text, obs):
         """
         Mocks LLM classification logic with specific keywords.
-        
-        LunarLander State Context:
-        [0] x_pos, [1] y_pos, [2] x_vel, [3] y_vel, [4] angle, [5] angular_vel, [6] leg1_contact, [7] leg2_contact
-        
-        Actions:
-        0: None, 1: Left Engine, 2: Main Engine, 3: Right Engine
+        Reference LunarLander-V3.md for qualitative magnitudes.
         """
         text = text.lower()
         
-        # --- GOALS (Reward Functions) ---
+        # --- 1. Check Heuristics Library First (SSL) ---
+        h_name, h_data = get_heuristic_by_text(text)
+        if h_data:
+            action = h_data['action']
+            # Dynamic action assignment for direction-dependent rules
+            if action is None:
+                if h_name == "UNRECOVERABLE_SPIN_PREVENTION":
+                    # obs is the dict formatted by wrapper
+                    ang_vel = obs['angular_vel']
+                    action = 1 if ang_vel > 0 else 3 # If spinning left (+), fire left (1) to rotate right
+                elif h_name == "DRIFT_CATCHER":
+                    x_vel = obs['x_vel']
+                    action = 3 if x_vel > 0 else 1 # If drifting right (+), fire right (3) to rotate left
+            
+            return {
+                "type": "HEURISTIC",
+                "name": h_name,
+                "action": action,
+                "feature_mask": h_data['feature_mask'],
+                "rule": h_data['rule']
+            }
+
+        # --- 2. GOALS (Reward Functions) ---
         if "gain stability" in text or "gain control" in text:
             return {
                 "type": "GOAL",
@@ -84,22 +102,22 @@ class LLMRouter:
         if "straighten out" in text:
             return {
                 "type": "GOAL",
-                "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize linear velocities (x, y), tilt angle, and rotation speed to kill drift\n    # next_obs[2]: v_x, next_obs[3]: v_y, next_obs[4]: angle, next_obs[5]: v_angle\n    drift_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[3]))\n    tilt_penalty = 0.5 * abs(next_obs[4]) + 0.1 * abs(next_obs[5])\n    return base_r - (drift_penalty + tilt_penalty)"
+                "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize linear velocities (x, y), tilt angle, and rotation speed to kill drift\n    drift_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[3]))\n    tilt_penalty = 0.5 * abs(next_obs[4]) + 0.1 * abs(next_obs[5])\n    return base_r - (drift_penalty + tilt_penalty)"
             }
         elif "hover down" in text:
             return {
                 "type": "GOAL",
-                "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vy is negative for downward movement\n    target_vy = -0.3\n    # Penalize horizontal velocity (2), angle (4), and angular velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[4]) + abs(next_obs[5]))\n    # Reward staying close to the slow downward target speed\n    speed_reward = -abs(next_obs[3] - target_vy)\n    return base_r + speed_reward - stability_penalty"
+                "code": "def custom_reward(obs, next_obs, base_r):\n    target_vy = -0.3\n    stability_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[4]) + abs(next_obs[5]))\n    speed_reward = -abs(next_obs[3] - target_vy)\n    return base_r + speed_reward - stability_penalty"
             }
         elif "hover left" in text:
             return {
                 "type": "GOAL",
-                "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vx is negative for moving left\n    target_vx = -0.3\n    # Penalize vertical movement (3) and rotational velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    # Reward staying close to the slow leftward target speed\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
+                "code": "def custom_reward(obs, next_obs, base_r):\n    target_vx = -0.3\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
             }
         if "hover right" in text:
             return {
                 "type": "GOAL",
-                "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vx is positive for moving right\n    target_vx = 0.3\n    # Penalize vertical movement (3) and rotational velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    # Reward staying close to the slow rightward target speed\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
+                "code": "def custom_reward(obs, next_obs, base_r):\n    target_vx = 0.3\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
             }
         elif "soft landing" in text:
             return {
@@ -107,37 +125,7 @@ class LLMRouter:
                 "code": "def custom_reward(obs, next_obs, base_r):\n    # Reward low vertical velocity when close to ground\n    reward = base_r\n    if next_obs[1] < 0.2:\n        reward += 2.0 if abs(next_obs[3]) < 0.1 else -1.0\n    return reward"
             }
             
-        # --- HEURISTICS (SSL / Feature Selection) ---
-        elif "unrecoverable spin" in text:
-            ang_vel = obs['angular_vel']
-            if abs(ang_vel) > 0.5:
-                return {
-                    "type": "HEURISTIC",
-                    "action": 3 if ang_vel > 0 else 1,
-                    "feature_mask": [5],
-                    "rule": lambda o: abs(o[5]) > 0.4 # Slightly lower threshold for buffer mining
-                }
-        
-        elif "catch drift" in text:
-            x_vel = obs['x_vel']
-            if abs(x_vel) > 0.5:
-                return {
-                    "type": "HEURISTIC",
-                    "action": 3 if x_vel > 0 else 1,
-                    "feature_mask": [2, 4, 5],
-                    "rule": lambda o: abs(o[2]) > 0.4
-                }
-
-        elif "emergency thrust" in text:
-            if obs['y_vel'] < -0.8:
-                return {
-                    "type": "HEURISTIC",
-                    "action": 2,
-                    "feature_mask": [3, 6, 7],
-                    "rule": lambda o: o[3] < -0.7
-                }
-            
-        # Default fallback
+        # --- 3. Default Fallbacks ---
         if "reward" in text or "goal" in text:
             return {
                 "type": "GOAL",
