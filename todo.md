@@ -4,29 +4,29 @@ Read the project goals in `project_goal.md` or the more compressed `requirements
 The following gaps remain to achieve 100% alignment with `project_goal.md`.
 
 ## 1. Metrics & Telemetry (R5.2)
-- [ ] **Task**: Add `time_human_reviewing` to `MetricsLogger`.
-- [ ] **Task**: Update `InteractiveGymWrapper` to start/stop the `human_reviewing` timer when the interactive window is in reviewing mode. When the used is skimming through the playback footage the `human_reviewing` time should be incrementing to include time fiddling with the UI.
-- [ ] **Task**: Add `frames_generated_ssl` and `frames_generated_curriculum` to frame counters.
+- [X] **Task**: Add `time_human_reviewing` to `MetricsLogger`.
+- [X] **Task**: Update `InteractiveGymWrapper` to start/stop the `human_reviewing` timer when the interactive window is in reviewing mode. When the used is skimming through the playback footage the `human_reviewing` time should be incrementing to include time fiddling with the UI.
+- [X] **Task**: Add `frames_generated_ssl` and `frames_generated_curriculum` to frame counters.
 
 ## 2. SSL Buffer Mining (R4.2)
-- [ ] **Task**: Review the annotation recorder to ensure that the full set of composite episode actions are sent to the annotation pipeline at the time of the user hitting "Enter" on the annotation window. If the user annotates frame 60, then begins an override at frame 40 that lasts until frame 100, we don't want the annotation to be pointing to the new human frame 60, we want it to use the original 60 actions to move the agent to the frame 60 that was annotated. Likewise, If the human drives the agent into new territory then annotates "learn here" the curriculum needs to step the env to that human frame before learning to ensure that the goal/hueristic specified is related to the correct context. 
-- [ ] **Task**: Update `llm_router.py` to provide a `rule_lambda` or similar threshold-based check for heuristics.
+- [X] **Task**: Review the annotation recorder to ensure that the full set of composite episode actions are sent to the annotation pipeline at the time of the user hitting "Enter" on the annotation window. If the user annotates frame 60, then begins an override at frame 40 that lasts until frame 100, we don't want the annotation to be pointing to the new human frame 60, we want it to use the original 60 actions to move the agent to the frame 60 that was annotated. Likewise, If the human drives the agent into new territory then annotates "learn here" the curriculum needs to step the env to that human frame before learning to ensure that the goal/hueristic specified is related to the correct context. 
+- [X] **Task**: Update `llm_router.py` to provide a `rule_lambda` or similar threshold-based check for heuristics.
 - [X] **Task**: Modify `agent.ssl_update` or `main.py` to search the existing buffers for all transitions matching the heuristic rule, rather than just using the single annotated frame.
 
 ## 3. Unified Update Epochs (R5.1)
 - [X] **Task**: Refactor the update section in `main.py` to perform a unified update loop where all buffers are sampled and updated over $N$ epochs, ensuring consistent convergence.
 
 ## 4. LunarLander Formatter Enhancement (R2.5)
-- [ ] **Task**: Ensure the `InteractiveGymWrapper._format_obs` provides a full, pretty-printed JSON-like context for the LLM as requested in the ground truth.
+- [X] **Task**: Ensure the `InteractiveGymWrapper._format_obs` provides a full, pretty-printed JSON-like context for the LLM as requested in the ground truth.
 
 ## 5. Curriculum Stability (R3.3)
 Implement 3 methods for handling auxiliary curriculum learning selected by a command line arg.
-- [ ] **Task**: (Current) Perform RL updates on the auxiliary buffer using the main model and optimizer. 
-- [ ] **Task**: (Most stable) Keep a second Agent and copy the weights from the main agent, then train the second agent on the auxiliary reward curriculum stages. Train this agent on both the global and auxiliary buffers, and add the experience from the aux buffer to the `global_rl_buffer` with only the DEFAULT ENV REWARDS so that the auxiliary agent can focus on the annotations to show the main agent the desired behavior without skewing it's Q values towards the auxiliary tasks. (such as seeking instability to get the stabilize reward) 
-- [ ] **Task**: (Most Certain) In each iteration copy the main agent weights to the auxiliary agent, then train the auxilairy agent offline on the auxiliary buffer for some time, then while the main agent is training on the `global_rl_buffer`, add a KL-Divergence penalty pulling it towards the behavior of the auxiliary agent. 
+- [X] **Task**: (Current) Perform RL updates on the auxiliary buffer using the main model and optimizer. 
+- [X] **Task**: (Most stable) Keep a second Agent and copy the weights from the main agent, then train the second agent on the auxiliary reward curriculum stages. Train this agent on both the global and auxiliary buffers, and add the experience from the aux buffer to the `global_rl_buffer` with only the DEFAULT ENV REWARDS so that the auxiliary agent can focus on the annotations to show the main agent the desired behavior without skewing it's Q values towards the auxiliary tasks. (such as seeking instability to get the stabilize reward) 
+- [X] **Task**: (Most Certain) In each iteration copy the main agent weights to the auxiliary agent, then train the auxilairy agent offline on the auxiliary buffer for some time, then while the main agent is training on the `global_rl_buffer`, add a KL-Divergence penalty pulling it towards the behavior of the auxiliary agent. 
 
 ## 6. Count Frames, not Episodes (R5.1)
-- [ ] **Task**: Collect data from each stage for a set number of frames instead of a set number of episodes so that the total experience per iteration and per learning-method is consistent from run to run. Iteration 5 does not mean the same thing when one had a human episode that took 800 frames (100 model updates) while the other tipped over at frame 90
+- [X] **Task**: Collect data from each stage for a set number of frames instead of a set number of episodes so that the total experience per iteration and per learning-method is consistent from run to run. Iteration 5 does not mean the same thing when one had a human episode that took 800 frames (100 model updates) while the other tipped over at frame 90
 
 ## 7. Improved Cloning (R2.6)
-- [ ] **Task**: Add a command line arg and related implementation for advantage weighted behavior cloning to allow out-of-date human data to be ignored such as a trajectory where a human helped the Agent gain stability, then performed a clumsy landing. When the Agent gets better at landing, it should care less about the human's behavior.
+- [X] **Task**: Add a command line arg and related implementation for advantage weighted behavior cloning to allow out-of-date human data to be ignored such as a trajectory where a human helped the Agent gain stability, then performed a clumsy landing. When the Agent gets better at landing, it should care less about the human's behavior.

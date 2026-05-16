@@ -74,18 +74,15 @@ class CQLAgent(Agent):
         terminated = torch.tensor(terminated, dtype=torch.float32).to(self.device_name).unsqueeze(1)
         truncated = torch.tensor(truncated, dtype=torch.float32).to(self.device_name).unsqueeze(1)
 
-        # Standard DQN Update with explicit Terminated/Truncated handling
-        # Terminated: next value is 0
-        # Truncated: bootstrap next value
+        # Standard DQN Update
         with torch.no_grad():
             next_q = self.q_target(next_obs).max(1, keepdim=True)[0]
-            # If terminated, target is just reward. If truncated, we bootstrap.
             target_q = reward + (1 - terminated) * self.gamma * next_q
 
         current_q = self.q_net(obs).gather(1, action)
         td_loss = F.mse_loss(current_q, target_q)
 
-        # CQL Penalty: logsumexp(Q) - Q(s, a)
+        # CQL Penalty
         q_logits = self.q_net(obs)
         cql_loss = (torch.logsumexp(q_logits, dim=1) - current_q.squeeze()).mean()
 
@@ -101,13 +98,37 @@ class CQLAgent(Agent):
 
         return {"td_loss": td_loss.item(), "cql_loss": cql_loss.item(), "total_loss": loss.item()}
 
-    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False) -> dict:
+    def kl_update(self, obs: torch.Tensor, target_agent) -> dict:
+        self.q_net.train()
+        obs = obs.to(self.device_name)
+        q_logits = self.q_net(obs)
+        
+        with torch.no_grad():
+            target_logits = target_agent.get_logits(obs)
+            target_probs = F.softmax(target_logits, dim=-1)
+        
+        current_log_probs = F.log_softmax(q_logits, dim=-1)
+        kl_loss = F.kl_div(current_log_probs, target_probs, reduction='batchmean')
+        
+        self.optimizer.zero_grad()
+        kl_loss.backward()
+        self.optimizer.step()
+        
+        return {"kl_loss": kl_loss.item()}
+
+    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False, advantages: torch.Tensor = None) -> dict:
         self.q_net.train()
         logits = self.q_net(obs.to(self.device_name))
         labels = labels.to(self.device_name)
 
         if not anti:
-            loss = self.criterion(logits, labels)
+            if advantages is not None:
+                advantages = advantages.to(self.device_name)
+                # Weighted cross entropy
+                log_probs = F.log_softmax(logits, dim=-1)
+                loss = -(log_probs.gather(1, labels.unsqueeze(1)).squeeze() * advantages).mean()
+            else:
+                loss = self.criterion(logits, labels)
         else:
             probs = F.softmax(logits, dim=-1)
             prob_rejected = probs.gather(1, labels.unsqueeze(1)).squeeze(1)

@@ -57,15 +57,15 @@ class InteractiveGymWrapper:
         """Formats observations for human readability (LunarLander specific)."""
         if isinstance(obs, np.ndarray) and len(obs) == 8:
             return {
-                "horizontal_position": f"{obs[0]:.4f} (0 is center)",
-                "vertical_position": f"{obs[1]:.4f} (0 is landing pad height)",
-                "horizontal_velocity": f"{obs[2]:.4f}",
-                "vertical_velocity": f"{obs[3]:.4f}",
-                "angle": f"{obs[4]:.4f} (0 is vertical)",
-                "angular_velocity": f"{obs[5]:.4f}",
-                "left_leg_contact": "YES" if obs[6] > 0.5 else "NO",
-                "right_leg_contact": "YES" if obs[7] > 0.5 else "NO",
-                "status": "In Air" if obs[6] < 0.5 and obs[7] < 0.5 else "Touching Ground"
+                "x_pos": float(obs[0]),
+                "y_pos": float(obs[1]),
+                "x_vel": float(obs[2]),
+                "y_vel": float(obs[3]),
+                "angle": float(obs[4]),
+                "angular_vel": float(obs[5]),
+                "leg1_contact": bool(obs[6] > 0.5),
+                "leg2_contact": bool(obs[7] > 0.5),
+                "readable_summary": f"Pos:({obs[0]:.2f}, {obs[1]:.2f}), Vel:({obs[2]:.2f}, {obs[3]:.2f}), Angle:{obs[4]:.2f}"
             }
         return str(obs)
 
@@ -325,6 +325,11 @@ class InteractiveGymWrapper:
             elif self.mode == "note" and new_mode != "note" and self.metrics:
                 self.metrics.stop_timer("human_annotating")
 
+            if new_mode == "step" and self.mode != "step" and self.metrics:
+                self.metrics.start_timer("human_reviewing")
+            elif self.mode == "step" and new_mode != "step" and self.metrics:
+                self.metrics.stop_timer("human_reviewing")
+
             self.mode = new_mode
             if self.mode in ["quit", "finish"]:
                 self.running = False
@@ -358,13 +363,11 @@ class InteractiveGymWrapper:
 
             if self.mode == "step":
                 if step_dir != 0:
-                    if self.metrics: self.metrics.start_timer("human_reviewing")
                     step_counter += 1
                     if step_dir == 1:
                         self.step_forward(action=0, source="rl")
                     elif step_dir == -1:
                         self.step_backward()
-                    if self.metrics: self.metrics.stop_timer("human_reviewing")
                 else:
                     step_counter = 0
 

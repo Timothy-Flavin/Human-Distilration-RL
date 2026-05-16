@@ -189,14 +189,38 @@ class PPOAgent(Agent):
 
         return {"ppo_loss": total_loss / self.K_epochs}
 
-    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False) -> dict:
+    def kl_update(self, obs: torch.Tensor, target_agent) -> dict:
+        self.actor.train()
+        obs = obs.to(self.device_name)
+        logits = self.actor(obs)
+        
+        with torch.no_grad():
+            target_logits = target_agent.get_logits(obs)
+            target_probs = F.softmax(target_logits, dim=-1)
+        
+        current_log_probs = F.log_softmax(logits, dim=-1)
+        kl_loss = F.kl_div(current_log_probs, target_probs, reduction='batchmean')
+        
+        self.optimizer.zero_grad()
+        kl_loss.backward()
+        self.optimizer.step()
+        
+        self.actor_old.load_state_dict(self.actor.state_dict())
+        return {"kl_loss": kl_loss.item()}
+
+    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False, advantages: torch.Tensor = None) -> dict:
         self.actor.train()
         logits = self.actor(obs.to(self.device_name))
         labels = labels.to(self.device_name)
 
         if not anti:
-            # Standard BC: cross entropy loss
-            loss = self.criterion(logits, labels)
+            if advantages is not None:
+                advantages = advantages.to(self.device_name)
+                # Weighted cross entropy
+                log_probs = F.log_softmax(logits, dim=-1)
+                loss = -(log_probs.gather(1, labels.unsqueeze(1)).squeeze() * advantages).mean()
+            else:
+                loss = self.criterion(logits, labels)
         else:
             # Anti-BC: minimize probability of these actions
             probs = F.softmax(logits, dim=-1)
