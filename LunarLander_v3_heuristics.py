@@ -9,39 +9,45 @@ HEURISTICS = {
         "phrase": "extreme right drift",
         "action": 3, # Fire Right Engine to rotate Left
         "feature_mask": [2, 4, 5], # x_vel, angle, angular_vel
-        "rule": lambda o: o[2] > 0.7 and o[1] > 0.8
+        "trigger_rule": lambda o: o[2] > 0.7 and o[1] > 0.8,
+        "termination_rule": lambda o: o[4] > -0.05 # Until upright or leaning left
     },
     "RIGHT_DRIFT_LEAN_CORRECTION": {
         # Full: "Going right and leaning right while high up and right of the flag, you need to fire the right engine until rotating left slowely"
         "phrase": "right drift lean",
         "action": 3, # Fire Right Engine to rotate Left
         "feature_mask": [0, 1, 2, 4], # x_pos, y_pos, x_vel, angle
-        "rule": lambda o: o[2] > 0.2 and o[4] < -0.2 and o[1] > 0.8 and o[0] > 0.1
+        "trigger_rule": lambda o: o[2] > 0.2 and o[4] < -0.2 and o[1] > 0.8 and o[0] > 0.1,
+        "termination_rule": lambda o: o[4] > -0.05 # Until upright
     },
     "LEFT_DRIFT_HIGH_CORRECTION": {
         # Full: "you are moving left and you are 1.5x higher than you need to be to straighten out and your are left of center, you need to fire the left engine until slowely rotating right"
         "phrase": "left drift high",
         "action": 1, # Fire Left Engine to rotate Right
         "feature_mask": [0, 1, 2], # x_pos, y_pos, x_vel
-        "rule": lambda o: o[2] < -0.5 and o[1] > 1.0 and o[0] < -0.1
+        "trigger_rule": lambda o: o[2] < -0.5 and o[1] > 1.0 and o[0] < -0.1,
+        "termination_rule": lambda o: o[4] < 0.05 # Until upright
     },
     "UNRECOVERABLE_SPIN_PREVENTION": {
         "phrase": "unrecoverable spin",
         "action": None, # Depends on direction
         "feature_mask": [5], # angular_vel
-        "rule": lambda o: abs(o[5]) > 0.4
+        "trigger_rule": lambda o: abs(o[5]) > 0.4,
+        "termination_rule": lambda o: abs(o[5]) < 0.1 # Until rotation is almost zero
     },
     "DRIFT_CATCHER": {
         "phrase": "catch drift",
         "action": None, # Depends on direction
         "feature_mask": [2, 4, 5], # x_vel, angle, angular_vel
-        "rule": lambda o: abs(o[2]) > 0.4
+        "trigger_rule": lambda o: abs(o[2]) > 0.4,
+        "termination_rule": lambda o: abs(o[2]) < 0.1 # Until drift is killed
     },
     "EMERGENCY_LANDING_THRUST": {
         "phrase": "emergency thrust",
         "action": 2, # Main Engine
         "feature_mask": [3, 6, 7], # y_vel, leg contacts
-        "rule": lambda o: o[3] < -0.7
+        "trigger_rule": lambda o: o[3] < -0.7,
+        "termination_rule": lambda o: o[3] > -0.1 or o[6] or o[7] # Until vertical velocity is killed or touch ground
     }
 }
 

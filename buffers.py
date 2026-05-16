@@ -85,11 +85,11 @@ class CurriculumBuffer:
         return len(self.tasks)
 
 class SemiSupervisedBuffer:
-    """Buffer for SSL with feature masks."""
+    """Buffer for SSL with feature masks and termination conditions."""
     def __init__(self, capacity):
         self.buffer = collections.deque(maxlen=capacity)
 
-    def push(self, obs, action, feature_mask):
+    def push(self, obs, action, feature_mask, termination_rule=None):
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32)
         if not isinstance(action, torch.Tensor):
@@ -97,7 +97,8 @@ class SemiSupervisedBuffer:
         self.buffer.append({
             "obs": obs,
             "action": action,
-            "feature_mask": feature_mask
+            "feature_mask": feature_mask,
+            "termination_rule": termination_rule
         })
 
     def sample(self, batch_size):
