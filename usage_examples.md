@@ -7,7 +7,7 @@ These phrases map directly to the `HEURISTICS` library in `LunarLander_v3_heuris
 
 | Instruction Phrase | Heuristic Key | Action | Focus Features |
 | :--- | :--- | :--- | :--- |
-| `unrecoverable spin` | `UNRECOVERABLE_SPIN_PREVENTION` | Dynamic (Counter-rotate) | Angular Velocity |
+| `extreme spin` | `EXTREME_SPIN_PREVENTION` | Dynamic (Counter-rotate) | Angular Velocity |
 | `catch drift` | `DRIFT_CATCHER` | Dynamic (Counter-drift) | X-Vel, Angle, Ang-Vel |
 | `emergency thrust` | `EMERGENCY_LANDING_THRUST` | Main Engine (2) | Y-Vel, Leg Contacts |
 | `extreme right drift` | `EXTREME_RIGHT_DRIFT_CORRECTION` | Right Engine (3) | X-Vel, Angle, Ang-Vel |

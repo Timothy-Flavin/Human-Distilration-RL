@@ -2,6 +2,10 @@ import numpy as np
 # LunarLander-v3 Heuristics Library: "Rules of Thumb"
 # Action Mapping: 0: NOOP, 1: Rotate LEFT, 2: Main, 3: Rotate RIGHT
 
+def spin_correction(o):
+    if o(5)>0: return 3
+    else: return 1
+
 def drift_catcher_policy(o):
     """
     User-confirmed working logic for catching drift.
@@ -49,12 +53,12 @@ HEURISTICS = {
         "termination_rule": lambda o: o[4] < 0.05
     },
 
-    "UNRECOVERABLE_SPIN_PREVENTION": {
-        "phrase": "unrecoverable spin",
-        "action": None, 
+    "EXTREME_SPIN_PREVENTION": {
+        "phrase": "extreme spin",
+        "action": spin_correction, 
         "feature_mask": [5],
-        "trigger_rule": lambda o: abs(o[5]) > 0.4,
-        "termination_rule": lambda o: abs(o[5]) < 0.1
+        "trigger_rule": lambda o: abs(o[5]) > 0.4 and o[1]>0.5 and o[3]>-0.4,
+        "termination_rule": lambda o: abs(o[5]) < 0.1 or o[1]<0.3
     },
     "DRIFT_CATCHER": {
         "phrase": "catch drift",

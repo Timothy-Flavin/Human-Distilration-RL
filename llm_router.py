@@ -80,7 +80,7 @@ class LLMRouter:
         Reference LunarLander-V3.md for qualitative magnitudes.
         """
         text = text.lower()
-        
+        print(f"text {text} obs {obs}")
         # --- 1. Check Heuristics Library First (SSL) ---
         h_name, h_data = get_heuristic_by_text(text)
         if h_data:
