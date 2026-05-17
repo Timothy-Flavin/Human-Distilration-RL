@@ -31,8 +31,8 @@ class InteractiveGymWrapper:
             if "source" not in step: step["source"] = "rl"
 
         self.notes = []
-        self.current_frame_idx = len(self.trajectory) - 1 if self.trajectory else -1
-        self.current_obs = self.trajectory[-1]["obs"] if self.trajectory else None
+        self.current_frame_idx = 0 if self.trajectory else -1
+        self.current_obs = self.trajectory[0]["obs"] if self.trajectory else None
         self.current_seed = initial_seed  # Crucial for deterministic replay
         self.running = False
 
@@ -222,6 +222,8 @@ class InteractiveGymWrapper:
             return
 
         obs, reward, terminated, truncated, info = self.env.step(action)
+        print(f"action {action} obs: {obs}")
+
         self._record_step(obs, action, reward, terminated, truncated, info, source=source)
         self.current_obs = obs
 
@@ -280,15 +282,18 @@ class InteractiveGymWrapper:
             note_surf = self.font.render(f"> {self.text_buffer}_", True, (0, 255, 0))
             self.screen.blit(note_surf, (10, self.screen.get_height() - 40))
 
-        if self.mode == "decision":
+        if self.mode == "decision" or (self.mode == "step" and verification_phrase and self.current_frame_idx == len(self.trajectory) - 1):
             overlay = pygame.Surface((self.screen.get_width(), 120))
             overlay.set_alpha(180)
             overlay.fill((0, 0, 0))
             self.screen.blit(overlay, (0, self.screen.get_height() // 2 - 60))
             
-            # Add a fallback string if override_source is None
-            source_name = self.override_source.title() if self.override_source else "Heuristic"
-            msg = self.font.render(f"[A]ccept {source_name}, [R]eject, or [P]rephrase?", True, (255, 255, 255))
+            if verification_phrase:
+                msg = self.font.render(f"[A]ccept Heuristic, [R]eject, or [P]rephrase?", True, (255, 255, 255))
+            else:
+                source_name = self.override_source.title() if self.override_source else "Changes"
+                msg = self.font.render(f"[A]ccept {source_name} or [R]eject?", True, (255, 255, 255))
+
             self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2 - 20))
         
         current_note = next((n["text"] for n in self.notes if n["frame"] == self.current_frame_idx), None)
@@ -360,14 +365,26 @@ class InteractiveGymWrapper:
 
         return final_decision, rephrased_text
 
+    def ensure_screen(self):
+        """Ensures the Pygame screen is initialized."""
+        if self.screen is not None:
+            return
+
+        frame = self.env.render()
+        if frame is None and self.trajectory:
+            frame = self.trajectory[0].get("frame_image")
+
+        if frame is not None:
+            height, width, _ = frame.shape
+            self.screen = pygame.display.set_mode((width, height))
+            pygame.display.set_caption("Interactive Replay Review")
+
     def run(self):
         self.running = True
         if not self.trajectory:
             self.reset_env()
         else:
-            if self.screen is None:
-                self.screen = pygame.display.set_mode((600, 400))
-                pygame.display.set_caption("Interactive Replay Review")
+            self.ensure_screen()
 
         step_counter = 0
 
@@ -381,7 +398,7 @@ class InteractiveGymWrapper:
             # Timer management
             if self.mode in ["realtime", "agent"] and new_mode not in ["realtime", "agent"]:
                 if self.metrics: self.metrics.stop_timer("human_overriding")
-            
+
             if new_mode in ["realtime", "agent"] and self.mode not in ["realtime", "agent"]:
                 # Only start if we are in an override state or just branched
                 if self.override_source is not None or branch_timeline:
@@ -458,5 +475,4 @@ class InteractiveGymWrapper:
             self.draw_overlay()
             self.clock.tick(self.fps)
 
-        pygame.quit()
         return self.trajectory, self.notes, self.current_seed
