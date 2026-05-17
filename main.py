@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import random
 import os
+import json 
 
 from Agent import Agent
 from CQL import CQLAgent
@@ -12,6 +13,7 @@ from buffers import ReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuf
 from metrics import MetricsLogger
 from llm_router import LLMRouter
 from eval_agent import evaluate_return, calculate_cross_entropy
+from verification_manager import VerificationManager
 
 torch.set_num_threads(4)
 
@@ -109,16 +111,19 @@ def main():
     metrics = MetricsLogger()
     # R4.2: Router needs access to global buffers for mining
     global_buffer_proxy = MagicReplayProxy(agent) 
-    router = LLMRouter(buffers['curriculum'], buffers['ssl'], global_buffer=global_buffer_proxy, example_buffer=buffers['example'])
+    router = LLMRouter(buffers['curriculum'], buffers['ssl'], global_buffer=global_buffer_proxy, example_buffer=buffers['example'], metrics=metrics)
     
     TOTAL_ITERATIONS = 20
     
     for iteration in range(TOTAL_ITERATIONS):
         print(f"\n=== Starting Iteration {iteration} ===")
         
+        # Track heuristics for dynamic mining
+        active_heuristics = []
+        
         # Step 1: Base RL Collection
         print("Collecting RL experience...")
-        n_frames = 5000 if args.algo == "ppo" else 3000
+        n_frames = 5000 if args.algo == "ppo" else 2000
         episodes = run_rl_collection(agent, env, num_frames=n_frames, metrics=metrics, update=args.rl)
         agent.checkpoint_model(specific_name=f"rl_collection_{iteration}")
         
@@ -154,40 +159,14 @@ def main():
             # Step 3: LLM Routing & Verification
             print("Processing LLM Buffer...")
             metrics.start_timer("llm_processing")
+            v_manager = VerificationManager(env, agent, buffers, metrics)
             while not buffers['llm'].is_empty():
                 item = buffers['llm'].pop()
                 classification = router.classify(item)
                 
                 if classification['type'] == 'HEURISTIC':
-                    verified = False
-                    while not verified:
-                        # Re-open wrapper for verification playback
-                        v_wrapper = InteractiveGymWrapper(
-                            env, agent=agent, buffers=buffers, metrics=metrics,
-                            initial_trajectory=item['episode_trajectory'],
-                            initial_seed=item['seed']
-                        )
-                        decision, new_text = v_wrapper.run_verification(
-                            start_frame=item['note_frame_idx'],
-                            action=classification['action'],
-                            termination_rule=classification.get('termination_rule', lambda o: True),
-                            phrase=classification.get('phrase', item['note_text'])
-                        )
-                        
-                        if decision == "accept":
-                            router.commit(item, classification)
-                            verified = True
-                        elif decision == "reject":
-                            verified = True # Discard
-                        elif decision == "rephrase" and new_text:
-                            item['note_text'] = new_text
-                            classification = router.classify(item)
-                            if classification['type'] != 'HEURISTIC':
-                                router.commit(item, classification)
-                                verified = True
-                            # Else: Continue loop with new heuristic classification
-                        else:
-                            verified = True # Fallback
+                    v_manager.verify_heuristic(item, classification, router)
+                    active_heuristics.append(classification)
                 else:
                     # Goals and Generics are committed immediately
                     router.commit(item, classification)
@@ -297,12 +276,38 @@ def main():
                     agent.supervised_update(obs, labels, anti=True)
                     metrics.stop_timer("agent_updating_anti_bc")
                 
-                # SSL Updates
-                if len(buffers['ssl']) >= 8 and args.ssl:
+                # --- Dynamic SSL Mining (Temporary "borrow" frames) ---
+                if args.ssl and active_heuristics:
                     metrics.start_timer("agent_updating_ssl")
-                    batch = buffers['ssl'].sample(8)
-                    agent.ssl_update(batch)
-                    metrics.log_frames(len(batch), source="ssl")
+                    mining_batch = []
+                    
+                    # 1. Start with pristine verified data from the buffer
+                    if len(buffers['ssl']) > 0:
+                        mining_batch.extend(buffers['ssl'].sample(8))
+                        
+                    # 2. Temporarily borrow matching frames from the global buffer
+                    # We mine a small amount per epoch to keep updates fast and diverse
+                    for h in active_heuristics:
+                        rule = h.get('rule')
+                        if rule and global_buffer_proxy.buffer:
+                            # Sample some candidates from global buffer
+                            candidates = random.sample(global_buffer_proxy.buffer, min(len(global_buffer_proxy.buffer), 100))
+                            for obs, _ in candidates:
+                                obs_np = obs.numpy() if hasattr(obs, 'numpy') else obs
+                                if rule(obs_np):
+                                    target_action = h['action_fn'](obs_np) if h.get('action_fn') else h['action']
+                                    if target_action is not None:
+                                        mining_batch.append({
+                                            "obs": obs,
+                                            "action": target_action,
+                                            "feature_mask": h['feature_mask'],
+                                            "termination_rule": h.get('termination_rule')
+                                        })
+                                if len(mining_batch) >= 16: break
+                        if len(mining_batch) >= 16: break
+                    
+                    if len(mining_batch) >= 8:
+                        agent.ssl_update(mining_batch[:16])
                     metrics.stop_timer("agent_updating_ssl")
 
             # Save buffers and annotations

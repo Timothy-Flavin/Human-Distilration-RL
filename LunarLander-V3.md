@@ -7,7 +7,7 @@ This document defines the qualitative thresholds for the LunarLander-v3 environm
 - **Slowly**: `0.05 <= |v| < 0.2` (Controlled movement/rotation)
 - **Moderately**: `0.2 <= |v| < 0.5` (Standard flight speed)
 - **Fast**: `0.5 <= |v| < 1.0` (High energy, needs attention)
-- **Extremely Fast**: `|v| >= 1.0` (Dangerously high, likely terminal without immediate correction)
+- **Extremely Fast**: `|v| >= 1.0` (Dangerously high, likely terminal)
 
 ## 2. Positional Magnitudes (x_pos, y_pos)
 - **Centered**: `|x_pos| < 0.1`
@@ -20,21 +20,24 @@ This document defines the qualitative thresholds for the LunarLander-v3 environm
 ## 3. Orientation (angle)
 - **Straight/Vertical**: `|angle| < 0.05`
 - **Slightly Leaning**: `0.05 <= |angle| < 0.2`
-- **Leaning**: `0.2 <= |angle| < 0.5`
-- **Heavily Tilted**: `|angle| >= 0.5`
+- **Leaning**: `0.2 <= |angle| < 0.4`
+- **Heavily Tilted**: `|angle| >= 0.4`
+- **SIGN CONVENTION**:
+    - **Positive Angle (+)**: Leaning **LEFT** (Counter-Clockwise)
+    - **Negative Angle (-)**: Leaning **RIGHT** (Clockwise)
 
 ## 4. State Vector Mapping
 - `obs[0]`: `x_pos` (Horizontal position, 0 is center)
 - `obs[1]`: `y_pos` (Vertical position, 0 is landing pad)
-- `obs[2]`: `x_vel` (Horizontal velocity)
-- `obs[3]`: `y_vel` (Vertical velocity)
-- `obs[4]`: `angle` (Lander angle, 0 is vertical)
-- `obs[5]`: `angular_vel` (Rotational velocity)
+- `obs[2]`: `x_vel` (Horizontal velocity. **Positive (+)** is moving **RIGHT**, **Negative (-)** is moving **LEFT**)
+- `obs[3]`: `y_vel` (Vertical velocity. **Positive (+)** is moving **UP**, **Negative (-)** is moving **DOWN**)
+- `obs[4]`: `angle` (Lander angle, 0 is vertical. **Positive (+)** is **LEFT**, **Negative (-)** is **RIGHT**)
+- `obs[5]`: `angular_vel` (Rotational velocity. **Positive (+)** is rotating **LEFT/CCW**)
 - `obs[6]`: `leg1_contact` (Boolean)
 - `obs[7]`: `leg2_contact` (Boolean)
 
 ## 5. Action Mapping
 - `0`: NOOP
-- `1`: Fire Left Orientation Engine (Rotates Lander Right/Clockwise)
+- `1`: Rotate Lander **LEFT** (Counter-Clockwise)
 - `2`: Fire Main Engine (Thrust Upwards)
-- `3`: Fire Right Orientation Engine (Rotates Lander Left/Counter-Clockwise)
+- `3`: Rotate Lander **RIGHT** (Clockwise)

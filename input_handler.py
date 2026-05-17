@@ -85,9 +85,7 @@ def process_events(events, current_mode, text_buffer):
 def get_realtime_action(keys):
     """
     Maps continuous key presses to environment actions.
-    Note: Customize this mapping based on your specific Gymnasium environment.
-    Example mapping for discrete environments (e.g., LunarLander):
-    0: NOOP, 1: LEFT, 2: MAIN ENGINE, 3: RIGHT
+    Standard mapping: 0: NOOP, 1: LEFT, 2: MAIN ENGINE, 3: RIGHT
     """
     if keys[pygame.K_LEFT] or keys[pygame.K_a]:
         return 1

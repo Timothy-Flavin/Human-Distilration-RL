@@ -3,31 +3,35 @@ import torch
 import numpy as np
 from llm_router import LLMRouter
 from buffers import SemiSupervisedBuffer, CurriculumBuffer
+from unittest.mock import MagicMock, patch
 
 class TestSSLMining(unittest.TestCase):
     def test_buffer_mining(self):
+        # NOTE: Dynamic mining moved to main.py unified update loop for stability.
+        # This test now verifies that verified verification frames are committed,
+        # but historical mining happens externally.
+        
         cur_buf = CurriculumBuffer()
         ssl_buf = SemiSupervisedBuffer(capacity=100)
         
-        # Mock global buffer with some states
-        # [0] is x_pos. Rule: x_pos > 0.5
-        global_buffer = MagicMock()
-        global_buffer.buffer = [
-            (torch.tensor([0.1, 0, 0, 0, 0, 0, 0, 0]), 0),
-            (torch.tensor([0.6, 0, 0, 0, 0, 0, 0, 0]), 1),
-            (torch.tensor([0.8, 0, 0, 0, 0, 0, 0, 0]), 2),
-        ]
-        
-        router = LLMRouter(cur_buf, ssl_buf, global_buffer=global_buffer)
+        router = LLMRouter(cur_buf, ssl_buf)
         
         # Mock a heuristic item
         item = {
-            'note_text': "center lander", # This triggers a heuristic with a rule in my mock logic
+            'note_text': "catch drift",
             'current_obs_dict': {},
-            'episode_trajectory': [{'action': 0}, {'obs': np.zeros(8), 'action': 1}],
+            'episode_trajectory': [
+                {'obs': np.zeros(8), 'action': 0}, 
+                {'obs': np.zeros(8), 'action': 1}
+            ],
             'seed': 42,
-            'note_frame_idx': 1
+            'note_frame_idx': 0
         }
+        
+        # Mock verification trajectory (1 verified frame)
+        verif_traj = [
+            {'obs': np.array([0.5, 0, 0, 0, 0, 0, 0, 0]), 'action': 3, 'source': 'heuristic'}
+        ]
         
         # Manually trigger a heuristic with a rule for testing
         with patch.object(router, '_mock_llm_classify') as mock_classify:
@@ -35,15 +39,14 @@ class TestSSLMining(unittest.TestCase):
                 'type': 'HEURISTIC',
                 'action': 3,
                 'feature_mask': [0],
-                'rule': lambda o: o[0] > 0.5
+                'rule': lambda o: o[0] > 0.4,
+                'phrase': 'catch drift'
             }
-            router.process(item)
+            router.commit(item, mock_classify.return_value, verification_trajectory=verif_traj)
             
-        # Should have found 2 matching states (0.6 and 0.8)
-        self.assertEqual(len(ssl_buf), 2)
+        # Should have found 1 matching verified frame
+        self.assertEqual(len(ssl_buf), 1)
         self.assertEqual(ssl_buf.buffer[0]['action'], 3)
-
-from unittest.mock import MagicMock, patch
 
 if __name__ == '__main__':
     unittest.main()

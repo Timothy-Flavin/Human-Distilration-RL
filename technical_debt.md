@@ -5,22 +5,27 @@ This document identifies areas of the codebase that have become monolithic, brit
 ## 1. `main.py`
 
 ### Monolithic `main()` function
-The `main()` function has grown to encompass environment setup, buffer initialization, the primary iteration loop, and several complex sub-phases (Interactive Review, Routing/Verification, Curriculum, Unified Update).
-- **Issue**: Deep nesting and high cyclomatic complexity make it difficult to unit test the orchestration logic.
-- **Recommendation**: Refactor sub-phases into dedicated classes or functions (e.g., `UpdateOrchestrator`, `InteractionManager`).
+The `main()` function has been significantly simplified by moving the heuristic verification logic to `VerificationManager`.
+- **Status**: Partially refactored. The unified update loop and curriculum orchestration still reside in `main()`.
+- **Recommendation**: Continue decoupling sub-phases.
 
-### Nested Verification Loop in Step 3
-The logic for handling human rephrasing during heuristic verification is deeply nested within the iteration loop.
-- **Issue**: Brittle flow control; adding more interaction types (e.g., rephrasing a Goal) will make this unreadable.
-- **Recommendation**: Move the verification state machine into `InteractiveGymWrapper` or a dedicated `VerificationManager`.
-
-### Iteration Loop Bloat
-The `for iteration in range(TOTAL_ITERATIONS)` loop contains too much low-level code (saving files, printing metrics, evaluation).
-- **Issue**: It's hard to see the high-level "Stage 1 -> Stage 2 -> Stage 3" flow described in `project_goal.md`.
+### Deeply Nested Interaction Logic
+While cleaner, the verification manager still relies on importing `process_events` locally and manual state management.
+- **Recommendation**: Standardize the event loop interface across all interactive components.
 
 ---
 
-## 2. `llm_router.py`
+## 2. `verification_manager.py`
+
+### Manual Event Consumption
+`VerificationManager` currently manually consumes Pygame events before passing them to `process_events`.
+- **Issue**: This is brittle and can lead to missed events if the order of checks changes.
+- **Recommendation**: Refactor `process_events` to return raw key states or use a more robust Event Dispatcher.
+
+---
+
+## 3. `llm_router.py`
+...
 
 ### Long `if/elif` chain in `_mock_llm_classify`
 While heuristics have been moved to `LunarLander_v3_heuristics.py`, the `GOAL` definitions (reward function code strings) are still hardcoded in a long conditional block.
@@ -47,5 +52,13 @@ The `InteractiveGymWrapper` uses a string-based `self.mode` with logic scattered
 
 ### Duplicated SSL/BC Logic
 `CQLAgent` and `PPOAgent` have very similar `ssl_update` and `supervised_update` methods, with only the network call changing.
-- **Issue**: Bug fixes or improvements (like adding termination rule support) must be applied twice.
+- **Status**: Partially improved. Shared logic still exists but has been stabilized.
 - **Recommendation**: Pull shared training logic into the `Agent` base class or a specialized `Trainer` utility.
+
+### Previous Issue: Destructive SSL Noise
+The previous hardcoded `noise_scale=0.5` was too aggressive for normalized state features, leading to performance destruction.
+- **Fix**: Reduced to `0.05`.
+
+### Previous Issue: Per-Item Optimizer Steps
+`ssl_update` was previously calling `optimizer.step()` for every item in the batch.
+- **Fix**: Refactored to accumulate loss across the entire batch for stable gradient updates.

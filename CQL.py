@@ -143,13 +143,25 @@ class CQLAgent(Agent):
         self.q_net.train()
         total_loss = 0
         samples_used = 0
+        
+        # Accumulate loss for the whole batch
+        batch_loss = []
+        
         for item in batch:
-            obs = item['obs'].to(self.device_name)
-            action = item['action'].to(self.device_name)
+            obs = item['obs']
+            if not isinstance(obs, torch.Tensor):
+                obs = torch.tensor(obs, dtype=torch.float32)
+            obs = obs.to(self.device_name)
+            
+            action = item['action']
+            if not isinstance(action, torch.Tensor):
+                action = torch.tensor(action)
+            action = action.to(self.device_name)
             mask = item['feature_mask']
             term_rule = item.get('termination_rule')
-            noise_scale = 0.5
+            noise_scale = 0.05 # Reduced from 0.5 for stability
             N = 5
+            
             aug_losses = []
             for _ in range(N):
                 noisy_obs = obs.clone()
@@ -165,12 +177,16 @@ class CQLAgent(Agent):
                 aug_losses.append(self.criterion(aug_logits, action.unsqueeze(0)))
             
             if aug_losses:
-                loss = torch.stack(aug_losses).mean()
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                total_loss += loss.item()
+                item_loss = torch.stack(aug_losses).mean()
+                batch_loss.append(item_loss)
                 samples_used += 1
+        
+        if batch_loss:
+            loss = torch.stack(batch_loss).mean()
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            total_loss = loss.item() * samples_used
         
         return {"ssl_loss": total_loss / samples_used if samples_used > 0 else 0.0}
 

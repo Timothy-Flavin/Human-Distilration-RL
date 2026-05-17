@@ -1,53 +1,74 @@
 import numpy as np
-
 # LunarLander-v3 Heuristics Library: "Rules of Thumb"
-# Each heuristic maps a human "code-phrase" to a rule and a suggested action.
+# Action Mapping: 0: NOOP, 1: Rotate LEFT, 2: Main, 3: Rotate RIGHT
+
+def drift_catcher_policy(o):
+    """
+    User-confirmed working logic for catching drift.
+    To slow down horizontal drift, rotate opposite to velocity.
+    """
+    # [2]x_vel, [3]y_vel, [4]angle, [5]angular_vel
+    if o[3] < -0.05: return 2 # Priority: kill downward velocity
+    
+    # If moving Left (-), rotate Right (3) to lean right and kill velocity
+    # If moving Right (+), rotate Left (1) to lean left and kill velocity
+    if o[4] > -0.05 and o[2] < 0.00: return 3 # Moving Left -> Rotate Right
+    if o[4] <  0.05 and o[2] > 0.00: return 1 # Moving Right -> Rotate Left
+    
+    if o[4] > 0.10 and o[5] > 0: return 3 # Prevent over-tilt left (rotate right)
+    if o[4] < -0.10 and o[5] < 0: return 1 # Prevent over-tilt right (rotate left)
+    
+    return 0
+
+def sign(x):
+    return (x >= 0)
+
+def extreme(o):
+    return abs(o[2])>0.7 or abs(o[4])>0.7 
 
 HEURISTICS = {
     "EXTREME_RIGHT_DRIFT_CORRECTION": {
-        # Full: "The lander is facing right and moving right extremely quickly but it is still high up so it needs to fully prioritize rotating left"
         "phrase": "extreme right drift",
-        "action": 3, # Fire Right Engine to rotate Left
-        "feature_mask": [2, 4, 5], # x_vel, angle, angular_vel
+        "action": 1, # Rotate Left to lean against right drift
+        "feature_mask": [2, 4, 5],
         "trigger_rule": lambda o: o[2] > 0.7 and o[1] > 0.8,
-        "termination_rule": lambda o: o[4] > -0.05 # Until upright or leaning left
+        "termination_rule": lambda o: o[4] > 0.1 
     },
     "RIGHT_DRIFT_LEAN_CORRECTION": {
-        # Full: "Going right and leaning right while high up and right of the flag, you need to fire the right engine until rotating left slowely"
         "phrase": "right drift lean",
-        "action": 3, # Fire Right Engine to rotate Left
-        "feature_mask": [0, 1, 2, 4], # x_pos, y_pos, x_vel, angle
+        "action": 1, # Rotate Left
+        "feature_mask": [0, 1, 2, 4],
         "trigger_rule": lambda o: o[2] > 0.2 and o[4] < -0.2 and o[1] > 0.8 and o[0] > 0.1,
-        "termination_rule": lambda o: o[4] > -0.05 # Until upright
+        "termination_rule": lambda o: o[4] > -0.05
     },
     "LEFT_DRIFT_HIGH_CORRECTION": {
-        # Full: "you are moving left and you are 1.5x higher than you need to be to straighten out and your are left of center, you need to fire the left engine until slowely rotating right"
         "phrase": "left drift high",
-        "action": 1, # Fire Left Engine to rotate Right
-        "feature_mask": [0, 1, 2], # x_pos, y_pos, x_vel
+        "action": 3, # Rotate Right
+        "feature_mask": [0, 1, 2],
         "trigger_rule": lambda o: o[2] < -0.5 and o[1] > 1.0 and o[0] < -0.1,
-        "termination_rule": lambda o: o[4] < 0.05 # Until upright
+        "termination_rule": lambda o: o[4] < 0.05
     },
+
     "UNRECOVERABLE_SPIN_PREVENTION": {
         "phrase": "unrecoverable spin",
-        "action": None, # Depends on direction
-        "feature_mask": [5], # angular_vel
+        "action": None, 
+        "feature_mask": [5],
         "trigger_rule": lambda o: abs(o[5]) > 0.4,
-        "termination_rule": lambda o: abs(o[5]) < 0.1 # Until rotation is almost zero
+        "termination_rule": lambda o: abs(o[5]) < 0.1
     },
     "DRIFT_CATCHER": {
         "phrase": "catch drift",
-        "action": None, # Depends on direction
-        "feature_mask": [2, 4, 5], # x_vel, angle, angular_vel
-        "trigger_rule": lambda o: abs(o[2]) > 0.4,
-        "termination_rule": lambda o: abs(o[2]) < 0.1 # Until drift is killed
+        "action_fn": drift_catcher_policy,
+        "feature_mask": [0,2, 3, 4, 5], 
+        "trigger_rule": lambda o: abs(o[2]) > 0.2 and sign(o[0])==sign(o[2]) and not extreme(o),# drifting away from center
+        "termination_rule": lambda o: abs(o[2]) < 0.1
     },
     "EMERGENCY_LANDING_THRUST": {
         "phrase": "emergency thrust",
-        "action": 2, # Main Engine
-        "feature_mask": [3, 6, 7], # y_vel, leg contacts
+        "action": 2,
+        "feature_mask": [3, 6, 7],
         "trigger_rule": lambda o: o[3] < -0.7,
-        "termination_rule": lambda o: o[3] > -0.1 or o[6] or o[7] # Until vertical velocity is killed or touch ground
+        "termination_rule": lambda o: o[3] > -0.1 or o[6] or o[7]
     }
 }
 
@@ -55,15 +76,5 @@ def get_heuristic_by_text(text):
     text = text.lower()
     for key, h in HEURISTICS.items():
         if h['phrase'].lower() in text or key.lower() in text:
-            # Dynamic action assignment for direction-dependent rules
-            action = h['action']
-            if key == "UNRECOVERABLE_SPIN_PREVENTION":
-                # If rotating left (pos), fire right engine (3) to counter
-                # Wait, angular_vel positive is left. action 3 fires right engine (rotates left).
-                # To rotate RIGHT, fire LEFT engine (1).
-                # Let's check wrapper action mapping: 1: Left, 2: Main, 3: Right.
-                # Fire Right (3) -> Rotates Left. Fire Left (1) -> Rotates Right.
-                # If spinning left (pos), fire Left (1) to rotate right.
-                pass # Will be handled in router for more flexibility
             return key, h
     return None, None
