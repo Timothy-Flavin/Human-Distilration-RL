@@ -54,6 +54,3 @@ This document defines the qualitative thresholds for the LunarLander-v3 environm
 - `1`: Rotate Lander **LEFT** (Counter-Clockwise)
 - `2`: Fire Main Engine (Thrust Upwards)
 - `3`: Rotate Lander **RIGHT** (Clockwise)
-
-
-You are spinning out of control and going down fast, hit the correct rotation thruster until you start rotating slowely back towards the middle then try to thrust out of it with the main engine until you crash or have time to fully control the spin. {'x_pos': 0.12610730528831482, 'y_pos': 1.4390538930892944, 'x_vel': 0.3537416458129883, 'y_vel': -0.3047916293144226, 'angle': 0.519317090511322, 'angular_vel': 0.8656536340713501, 'leg1_contact': False, 'leg2_contact': False, 'readable_summary': 'Pos:(0.13, 1.44), Vel:(0.35, -0.30), Angle:0.52'}

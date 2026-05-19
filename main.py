@@ -100,18 +100,40 @@ def main():
 
     # 2. Setup Buffers & Router
     buffers = {
-        'example': ReplayBuffer(capacity=10000),
+        'example': ReplayBuffer(capacity=50000),
         'anti_example': ReplayBuffer(capacity=10000),
         'llm': LLMBuffer(),
         'curriculum': CurriculumBuffer(),
         'ssl': SemiSupervisedBuffer(capacity=5000),
         'kl_target': ObservationBuffer(capacity=10000)
     }
+
+    if args.preload_expert_data:
+        import pickle
+        if os.path.exists(args.preload_expert_data):
+            with open(args.preload_expert_data, 'rb') as f:
+                expert_dataset = pickle.load(f)
+            loaded_count = 0
+            for episode in expert_dataset:
+                for transition in episode:
+                    buffers['example'].push(transition['obs'], transition['action'])
+                    loaded_count += 1
+            print(f"[Preload] Successfully loaded {loaded_count} transitions from {args.preload_expert_data} into example_buffer.")
+        else:
+            print(f"[Preload] Warning: Expert data file not found at {args.preload_expert_data}")
     
     metrics = MetricsLogger()
     # R4.2: Router needs access to global buffers for mining
     global_buffer_proxy = MagicReplayProxy(agent) 
-    router = LLMRouter(buffers['curriculum'], buffers['ssl'], global_buffer=global_buffer_proxy, example_buffer=buffers['example'], metrics=metrics)
+    router = LLMRouter(
+        buffers['curriculum'], 
+        buffers['ssl'], 
+        global_buffer=global_buffer_proxy, 
+        example_buffer=buffers['example'], 
+        metrics=metrics,
+        noise_scale=args.noise_scale,
+        num_noisy_samples=args.num_noisy_samples
+    )
     
     TOTAL_ITERATIONS = 20
     
@@ -363,5 +385,8 @@ if __name__ == "__main__":
     parser.add_argument("--algo", type=str, default="cql", choices=["cql", "ppo"])
     parser.add_argument("--num_local_epochs", type=int, default=5)
     parser.add_argument("--curriculum_traj_len", type=int, default=0)
+    parser.add_argument("--noise_scale", type=float, default=0.1, help="Scale of Gaussian noise for NOISY_HUMAN augmentation")
+    parser.add_argument("--num_noisy_samples", type=int, default=5, help="Number of noisy samples per human frame")
+    parser.add_argument("--preload_expert_data", type=str, default=None, help="Path to a .pkl expert dataset to pre-populate the example_buffer")
     args = parser.parse_args()
     main()

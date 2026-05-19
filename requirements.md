@@ -26,6 +26,10 @@ This document defines the absolute requirements for the Freshman project, derive
 - **R4.2**: Buffer Mining: Search `global_rl_buffer` and `example_buffer` for all states matching the rule.
 - **R4.3**: Consistency Training: Add noise to unspecified features and ensure consistent action prediction (FixMatch style).
 
+## 6. Noisy Human Trajectories (Stage 3)
+- **R6.1**: Feature Isolation: Identify unimportant features from human comments.
+- **R6.2**: Data Augmentation: Generate noisy variations of human demonstrations by perturbing unimportant features to improve generalization and focus.
+
 ## 5. Unified Update & Telemetry
 - **R5.1**: Multi-Faceted Update: Incorporate curriculum, supervised, and SSL data sequentially for multiple epochs.
 - **R5.2**: Telemetry Tracker: Record detailed human vs compute time, including `reviewing` and `annotating` time.

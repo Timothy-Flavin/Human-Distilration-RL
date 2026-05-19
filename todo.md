@@ -8,10 +8,17 @@ The following gaps remain to achieve 100% alignment with `project_goal.md`.
 - [X] **Task**: Update `InteractiveGymWrapper` to start/stop the `human_reviewing` timer when the interactive window is in reviewing mode. When the used is skimming through the playback footage the `human_reviewing` time should be incrementing to include time fiddling with the UI.
 - [X] **Task**: Add `frames_generated_ssl` and `frames_generated_curriculum` to frame counters.
 
-## 2. SSL Buffer Mining (R4.2)
-- [X] **Task**: Review the annotation recorder to ensure that the full set of composite episode actions are sent to the annotation pipeline at the time of the user hitting "Enter" on the annotation window. If the user annotates frame 60, then begins an override at frame 40 that lasts until frame 100, we don't want the annotation to be pointing to the new human frame 60, we want it to use the original 60 actions to move the agent to the frame 60 that was annotated. Likewise, If the human drives the agent into new territory then annotates "learn here" the curriculum needs to step the env to that human frame before learning to ensure that the goal/hueristic specified is related to the correct context. 
-- [X] **Task**: Update `llm_router.py` to provide a `rule_lambda` or similar threshold-based check for heuristics.
-- [X] **Task**: Modify `agent.ssl_update` or `main.py` to search the existing buffers for all transitions matching the heuristic rule, rather than just using the single annotated frame.
+## 8. Noisy Human Trajectories (New Method)
+- [X] **Task**: Update `LLMRouter.classify` to recognize `NOISY_HUMAN` annotations where the user specifies unimportant features (e.g., "ignore x_pos", "don't care about height").
+- [X] **Task**: Implement noise addition logic in `LLMRouter.commit` for `NOISY_HUMAN` classifications. For each frame in the human-controlled segment of the trajectory, generate $N$ noisy variations of the observation by perturbing the unimportant features while keeping the action constant.
+- [X] **Task**: Ensure these noisy transitions are pushed to the `example_buffer` for Behavior Cloning.
+- [X] **Task**: Maintain the existing `HEURISTIC` (SSL Mining) method as a baseline for the paper's negative results. 
+- [X] **Task**: Add a `noise_scale` parameter to `LLMRouter` to control the magnitude of feature perturbation.
+
+## 2. SSL Buffer Mining (R4.2) [LEGACY - Negative Result]
+- [X] **Task**: Review the annotation recorder...
+- [X] **Task**: Update `llm_router.py` to provide a `rule_lambda`...
+- [X] **Task**: Modify `agent.ssl_update` or `main.py` to search...
 
 ## 3. Unified Update Epochs (R5.1)
 - [X] **Task**: Refactor the update section in `main.py` to perform a unified update loop where all buffers are sampled and updated over $N$ epochs, ensuring consistent convergence.

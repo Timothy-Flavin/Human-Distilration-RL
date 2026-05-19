@@ -30,6 +30,35 @@ def sign(x):
 def extreme(o):
     return abs(o[2])>0.7 or abs(o[4])>0.7 
 
+def counter_spin_then_thrust(o):
+    if o[4] > 0 and o[5] >= -0.2:
+        return 3
+    elif o[4] < 0 and o[5] <= 0.2:
+        return 1
+    else:
+        return 2 
+
+# def recovery_control(o):
+#     if o[4] > 0 and o[5] > 0: return 3
+#     elif o[4] < 0 and o[5] < 0: return 1
+#     else: return 2
+
+# def recovery_control(o):
+#     if o[4] > 0.05:
+#         return 3 if o[5] >= -0.2 else 2
+#     elif o[4] < -0.05:
+#         return 1 if o[5] <= 0.2 else 2
+#     else:
+#         return 2
+
+def recovery_control(o):
+    if o[4] > 0.05:
+        return 3 if o[5] >= -0.3 else 2
+    elif o[4] < -0.05:
+        return 1 if o[5] <= 0.3 else 2
+    else:
+        return 2
+
 HEURISTICS = {
     "EXTREME_RIGHT_DRIFT_CORRECTION": {
         "phrase": "extreme right drift",
@@ -52,7 +81,6 @@ HEURISTICS = {
         "trigger_rule": lambda o: o[2] < -0.5 and o[1] > 1.0 and o[0] < -0.1,
         "termination_rule": lambda o: o[4] < 0.05
     },
-
     "EXTREME_SPIN_PREVENTION": {
         "phrase": "extreme spin",
         "action": spin_correction, 
@@ -73,6 +101,15 @@ HEURISTICS = {
         "feature_mask": [3, 6, 7],
         "trigger_rule": lambda o: o[3] < -0.7,
         "termination_rule": lambda o: o[3] > -0.1 or o[6] or o[7]
+    },
+
+    "SPIN_AND_FALL_RECOVERY": {
+        "phrase": "counter spin burn",
+        "action_fn": recovery_control,
+        "action": None,
+        "feature_mask": [1, 3, 4, 5, 6, 7],
+        "trigger_rule": lambda o: abs(o[5]) >= 0.5 and o[3] <= -0.2,
+        "termination_rule": lambda o: o[1] < 0.05 or o[6] or o[7] or o[3] >= -0.05
     }
 }
 
