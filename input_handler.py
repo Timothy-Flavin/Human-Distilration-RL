@@ -82,15 +82,27 @@ def process_events(events, current_mode, text_buffer):
 
     return new_mode, text_buffer, submitted_note, step_dir, reset, branch_timeline, decision
 
-def get_realtime_action(keys):
+def get_realtime_action(keys, env_name="LunarLander-v3"):
     """
     Maps continuous key presses to environment actions.
-    Standard mapping: 0: NOOP, 1: LEFT, 2: MAIN ENGINE, 3: RIGHT
     """
-    if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-        return 1
-    elif keys[pygame.K_UP] or keys[pygame.K_w]:
-        return 2
-    elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-        return 3
-    return 0  # NOOP
+    if "LunarLander" in env_name:
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            return 1
+        elif keys[pygame.K_UP] or keys[pygame.K_w]:
+            return 2
+        elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            return 3
+        return 0  # NOOP
+    elif "highway" in env_name:
+        # 0: LANE_LEFT, 1: IDLE, 2: LANE_RIGHT, 3: FASTER, 4: SLOWER
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            return 0
+        elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            return 2
+        elif keys[pygame.K_UP] or keys[pygame.K_w]:
+            return 3
+        elif keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            return 4
+        return 1 # IDLE
+    return 0

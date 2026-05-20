@@ -4,8 +4,9 @@ import gymnasium as gym
 from input_handler import process_events, get_realtime_action
 
 class InteractiveGymWrapper:
-    def __init__(self, env: gym.Env, agent=None, fps=30, buffers=None, metrics=None, initial_trajectory=None, initial_seed=None):
+    def __init__(self, env: gym.Env, agent=None, fps=30, buffers=None, metrics=None, initial_trajectory=None, initial_seed=None, env_name="LunarLander-v3"):
         self.env = env
+        self.env_name = env_name
         self.agent = agent
         self.fps = fps
         self.buffers = buffers # Expected: dict with 'example', 'anti_example', 'llm'
@@ -54,8 +55,8 @@ class InteractiveGymWrapper:
         self._restore_state(0)
 
     def _format_obs(self, obs):
-        """Formats observations for human readability (LunarLander specific)."""
-        if isinstance(obs, np.ndarray) and len(obs) == 8:
+        """Formats observations for human readability."""
+        if "LunarLander" in self.env_name and isinstance(obs, np.ndarray) and len(obs) == 8:
             return {
                 "x_pos": float(obs[0]),
                 "y_pos": float(obs[1]),
@@ -67,6 +68,23 @@ class InteractiveGymWrapper:
                 "leg2_contact": bool(obs[7] > 0.5),
                 "readable_summary": f"Pos:({obs[0]:.2f}, {obs[1]:.2f}), Vel:({obs[2]:.2f}, {obs[3]:.2f}), Angle:{obs[4]:.2f}"
             }
+        elif "highway" in self.env_name:
+            # Kinematics observation: V x F matrix
+            # Default is 5 vehicles x 5 features: [presence, x, y, vx, vy]
+            if isinstance(obs, np.ndarray):
+                ego = obs[0]
+                summary = f"Ego - Pos:({ego[1]:.2f}, {ego[2]:.2f}), Vel:({ego[3]:.2f}, {ego[4]:.2f})"
+                formatted = {"readable_summary": summary}
+                for i in range(len(obs)):
+                    v = obs[i]
+                    formatted[f"vehicle_{i}"] = {
+                        "presence": bool(v[0] > 0.5),
+                        "x": float(v[1]),
+                        "y": float(v[2]),
+                        "vx": float(v[3]),
+                        "vy": float(v[4])
+                    }
+                return formatted
         return str(obs)
 
     def reset_env(self):
@@ -457,7 +475,7 @@ class InteractiveGymWrapper:
 
             elif self.mode == "realtime":
                 keys = pygame.key.get_pressed()
-                action = get_realtime_action(keys)
+                action = get_realtime_action(keys, env_name=self.env_name)
                 self.step_forward(action, source="human")
                 if self.metrics: 
                     self.metrics.log_frames(1, source="human")
