@@ -20,6 +20,8 @@ These experiments use the `expert_demonstrations_LunarLander-v3.pkl` dataset to 
 *   **Command**:
     ```bash
     python main.py --env LunarLander-v3 --algo cql --rl --num_rl_frames 0 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_cql" --seed 42
+    python main.py --env LunarLander-v3 --algo cql --rl --num_rl_frames 0 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_cql" --seed 43
+    python main.py --env LunarLander-v3 --algo cql --rl --num_rl_frames 0 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_cql" --seed 44
     ```
 
 ### Exp 3: Advantage-Weighted CQL (AW-CQL)
@@ -27,6 +29,17 @@ These experiments use the `expert_demonstrations_LunarLander-v3.pkl` dataset to 
 *   **Command**:
     ```bash
     python main.py --env LunarLander-v3 --algo cql --bc --rl --awbc --num_rl_frames 0 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
+    python main.py --env LunarLander-v3 --algo cql --bc --rl --awbc --num_rl_frames 0 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 43
+    python main.py --env LunarLander-v3 --algo cql --bc --rl --awbc --num_rl_frames 0 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 44
+    ```
+
+### Exp 4: Advantage-Weighted CQL + Online (AW-CQL)
+*   **Description**: Combines BC and CQL, weighting the supervised loss by the estimated advantage.
+*   **Command**:
+    ```bash
+    python main.py --env LunarLander-v3 --algo cql --bc --rl --awbc --num_rl_frames 2000 --num_unified_epochs 100 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
+    python main.py --env LunarLander-v3 --algo cql --bc --rl --awbc --num_rl_frames 2000 --num_unified_epochs 100 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 43
+    python main.py --env LunarLander-v3 --algo cql --bc --rl --awbc --num_rl_frames 2000 --num_unified_epochs 100 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 44
     ```
 
 ---
@@ -34,28 +47,28 @@ These experiments use the `expert_demonstrations_LunarLander-v3.pkl` dataset to 
 ## 2. Interactive Pipeline Ablations
 These experiments measure the impact of each interactive component on sample efficiency and human effort.
 
-### Exp 4: Interactive BC (Correction Only)
+### Exp 5: Interactive BC (Correction Only)
 *   **Description**: Only uses human overrides (Spacebar) to push data to the `example_buffer`. No LLM involvement.
 *   **Command**:
     ```bash
     python main.py --env LunarLander-v3 --algo cql --bc --rl --num_rl_frames 2000 --experiment_name "interactive_bc" --seed 42
     ```
 
-### Exp 5: BC + Anti-BC (Penalty for Failure)
+### Exp 6: BC + Anti-BC (Penalty for Failure)
 *   **Description**: Adds the Anti-BC penalty for trajectories the human discarded during overrides.
 *   **Command**:
     ```bash
     python main.py --env LunarLander-v3 --algo cql --bc --anti_bc --rl --num_rl_frames 2000 --experiment_name "interactive_bc_anti" --seed 42
     ```
 
-### Exp 6: Heuristic Heuristics (Legacy SSL - Negative Result)
+### Exp 7: Heuristic Heuristics (Legacy SSL - Negative Result)
 *   **Description**: Tests the "Expert System" style heuristic controllers. This is the baseline negative result.
 *   **Command**:
     ```bash
     python main.py --env LunarLander-v3 --algo cql --rl --ssl --num_rl_frames 2000 --experiment_name "legacy_heuristics" --seed 42
     ```
 
-### Exp 7: LLM Curriculum Method Comparison
+### Exp 8: LLM Curriculum Method Comparison
 *   **Description**: Compares the three different ways to incorporate auxiliary LLM rewards. Run all three to select the "Greedy Best" for the final pipeline.
 *   **Commands**:
     ```bash
@@ -109,24 +122,7 @@ These experiments prove that HIL is required for policies that have strict but "
 
 ---
 
-## 5. Post-hoc Compliance Evaluation
-These scripts measure how well an agent (or a human dataset) adheres to "hidden" behavioral requirements.
-
-### Eval 1: Analyze Expert Dataset Compliance
-*   **Description**: Calculates the Arbitrary Behavior Score for a recorded `.pkl` dataset.
-*   **Command**:
-    ```bash
-    python analyze_expert_data.py --env LunarLander-v3
-    ```
-
-### Eval 2: Evaluate Model Checkpoint Compliance
-*   **Description**: Loads a trained model and runs evaluation episodes to measure its compliance score.
-*   **Command**:
-    ```bash
-    python eval_compliance.py --env LunarLander-v3 --algo cql --model_path "results/LunarLander-v3/baseline_cql/cql_rl1_bc0_anti0_ssl0_cur0_seed42/CQL_latest.pt"
-    ```
-
-## 6. Project Directories & Metrics
+## 5. Analysis & Evaluation
 
 After running the experiments, use the following to generate statistics and aggregated plots:
 

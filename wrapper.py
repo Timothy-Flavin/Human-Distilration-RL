@@ -198,18 +198,17 @@ class InteractiveGymWrapper:
             if self.buffers:
                 # 1. Push up to 100 steps of the rejected segment to anti-example buffer.
                 max_anti_frames = 100
-                prev_obs = self.trajectory[self.override_start_frame]['obs']
+                # Correct BC Pairing: obs_t -> action_t
                 for step in self.discarded_trajectory[:max_anti_frames]:
-                    self.buffers['anti_example'].push(prev_obs, step['action'])
-                    prev_obs = step['obs']
+                    # The discarded step contains the observation and the action that was taken IN that observation
+                    self.buffers['anti_example'].push(step['obs'], step['action'])
 
                 # 2. Push human segment to example buffer (ONLY if source was realtime)
                 if self.override_source == "realtime":
-                    prev_obs = self.trajectory[self.override_start_frame]['obs']
                     new_part = self.trajectory[self.override_start_frame + 1:]
                     for step in new_part:
-                        self.buffers['example'].push(prev_obs, step['action'])
-                        prev_obs = step['obs']
+                        # The step already correctly contains the state it was in and the action chosen
+                        self.buffers['example'].push(step['obs'], step['action'])
 
             self.discarded_trajectory = []
 

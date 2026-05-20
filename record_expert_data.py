@@ -99,14 +99,17 @@ def main():
             if not running:
                 break
             
+            # Get Action
             keys = pygame.key.get_pressed()
             action = get_action(keys, env_name=env_name)
             
+            # Step Environment
             next_obs, reward, terminated, truncated, info = env.step(action)
             
+            # Save Transition: Pair CURRENT state with the action taken in it
             episode_transitions.append({
-                'obs': obs,
-                'action': action,
+                'obs': obs, # Correct: current state
+                'action': action, # Correct: action taken in current state
                 'reward': reward,
                 'next_obs': next_obs,
                 'terminated': terminated,

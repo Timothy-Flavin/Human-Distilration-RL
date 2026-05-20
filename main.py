@@ -14,6 +14,7 @@ from metrics import MetricsLogger
 from llm_router import LLMRouter
 from eval_agent import evaluate_return, calculate_cross_entropy
 from verification_manager import VerificationManager
+import torch.nn.functional as F
 
 torch.set_num_threads(4)
 
@@ -46,6 +47,7 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
             frame = env.render()
             
             # Store for standard RL
+            # Pair CURRENT observation with the action taken IN that observation
             agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
             
             # Perform standard RL update
@@ -53,9 +55,10 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
                 agent.rl_update()
             
             trajectory.append({
-                "obs": next_obs,
-                "action": action,
+                "obs": obs, # Current state
+                "action": action, # Action taken in current state
                 "reward": reward,
+                "next_obs": next_obs, # Resulting state
                 "frame_image": frame,
                 "terminated": terminated,
                 "truncated": truncated,
@@ -136,10 +139,14 @@ def main():
                     )
                     loaded_count += 1
             print(f"[Preload] Successfully loaded {loaded_count} transitions into example_buffer AND agent.replay_buffer.")
+            # Ensure loaded data is reflected in telemetry
+            metrics = MetricsLogger() # Ensure metrics is initialized before logging
+            metrics.log_frames(loaded_count, source="human")
         else:
             print(f"[Preload] Warning: Expert data file not found at {args.preload_expert_data}")
-    
-    metrics = MetricsLogger()
+            metrics = MetricsLogger()
+    else:
+        metrics = MetricsLogger()
     # R4.2: Router needs access to global buffers for mining
     global_buffer_proxy = MagicReplayProxy(agent) 
     router = LLMRouter(
@@ -229,7 +236,9 @@ def main():
             # Standard RL update (global buffer)
             # In offline mode, this trains on the preloaded data in agent.replay_buffer
             if args.rl:
+                metrics.start_timer("agent_updating_rl")
                 agent.rl_update()
+                metrics.stop_timer("agent_updating_rl")
 
             # Targeted KL penalty (only on curriculum observations)
             if args.curriculum and args.curriculum_method == 'kl' and len(buffers['kl_target']) >= 32:
@@ -299,13 +308,13 @@ def main():
                         agent.ssl_update(mining_batch[:16])
                     metrics.stop_timer("agent_updating_ssl")
 
-            # Save buffers and annotations
-            buffers['example'].save(os.path.join(results_base_dir, f"example_buffer_{iteration}.pt"))
-            buffers['anti_example'].save(os.path.join(results_base_dir, f"anti_example_buffer_{iteration}.pt"))
-            
-            # Save raw annotations for traceability
-            with open(os.path.join(results_base_dir, f"annotations_{iteration}.json"), "w") as f:
-                json.dump(annotations, f, indent=4)
+        # Save buffers and annotations after all epochs in this iteration
+        buffers['example'].save(os.path.join(results_base_dir, f"example_buffer_{iteration}.pt"))
+        buffers['anti_example'].save(os.path.join(results_base_dir, f"anti_example_buffer_{iteration}.pt"))
+        
+        # Save raw annotations for traceability
+        with open(os.path.join(results_base_dir, f"annotations_{iteration}.json"), "w") as f:
+            json.dump(annotations, f, indent=4)
                 
         agent.checkpoint_model(specific_name=f"agent_update_{iteration}")
         
