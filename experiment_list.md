@@ -115,8 +115,10 @@ These experiments measure the impact of each form of override loss component on 
 *   **Description**: Compares the three different ways to incorporate auxiliary LLM rewards. Run all three which will share the same plot to find out which curriculum method is most effective.
 *   **Commands**:
     ```bash
-    # Method 1: Main (Direct update to primary Q-net)
+    # Method 1: Main (Noise added to human trajectories that have a noise map during offline-rl update)
     python main.py --env LunarLander-v3 --online_rl --offline_rl --ssl --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 100  
+    # Method 1: Main (Noise added to human trajectories that have a noise map during awbc update)
+    python main.py --env LunarLander-v3 --online_rl --awbc --ssl --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 100 
     ```
 ---
 

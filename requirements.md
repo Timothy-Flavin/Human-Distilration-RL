@@ -33,3 +33,11 @@ This document defines the absolute requirements for the Freshman project, derive
 ## 5. Unified Update & Telemetry
 - **R5.1**: Multi-Faceted Update: Incorporate curriculum, supervised, and SSL data sequentially for multiple epochs.
 - **R5.2**: Telemetry Tracker: Record detailed human vs compute time, including `reviewing` and `annotating` time.
+
+## 7. Experimental Rigor & Decoupling (Stage 4)
+- **R7.1**: Loss Independence: Decouple TD (CQL) and Supervised (BC) loss flags from data sources.
+- **R7.2**: Integrated SSL: Implement a standalone `ssl_augment(batch, masks)` utility to inject feature invariance (Gaussian or user-defined Uniform ranges) into any loss signal (TD or Supervised).
+- **R7.3**: Six-Chart Plotting: Implement 6 distinct graph types as defined in `Usage.md` (Efficiency, Wall-clock, Human Likeness, Effort, Mode Frames, Mode Time).
+- **R7.4**: Batch Consistency: Ensure all buffers pair `obs_t` with `action_t` to avoid causal misalignment.
+- **R7.5**: Modular CLI: Map `--offline_rl`, `--online_rl`, `--bc`, and `--awbc` to specific buffer-source targets in the unified update.
+- **R7.6**: Compliance Post-Hoc: Quantitatively measure "Hidden Behaviors" (following distance, vertical descent) using non-RL reward functions.

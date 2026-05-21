@@ -48,17 +48,35 @@ The `InteractiveGymWrapper` uses a string-based `self.mode` with logic scattered
 
 ---
 
-## 4. Agents (`CQL.py`, `PPO.py`)
+## 5. Final Refactoring Plan: Loss Signal & Data Source Decoupling
 
-### Duplicated SSL/BC Logic
-`CQLAgent` and `PPOAgent` have very similar `ssl_update` and `supervised_update` methods, with only the network call changing.
-- **Status**: Partially improved. Shared logic still exists but has been stabilized.
-- **Recommendation**: Pull shared training logic into the `Agent` base class or a specialized `Trainer` utility.
+To support the rigorous comparative analysis in `Usage.md`, the codebase must decouple **Loss Signals** (the mathematical objective) from **Data Sources** (where transitions come from).
 
-### Previous Issue: Destructive SSL Noise
-The previous hardcoded `noise_scale=0.5` was too aggressive for normalized state features, leading to performance destruction.
-- **Fix**: Reduced to `0.05`.
+### A. Modular Loss Signals (Agent class)
+The standalone `ssl_update()` will be removed. Invariance training (feature noise) will be integrated directly into the core loss functions via a shared **`Agent.ssl_augment(batch, masks)`** utility.
+- **`Agent.ssl_augment(batch, masks)`**: 
+    - Handles complex noise logic: 
+        - **Gaussian**: Default centered on $s_t$ with $\sigma=0.1$ (or user-specified).
+        - **Uniform**: Samples from user-defined ranges (e.g., "above height" $\rightarrow [y_t, y_{max}]$).
+    - Performs batch-wise augmentation using Torch for efficiency.
+- **`Agent.update_td(batch, ssl=False, masks=None)`**: 
+    - If `ssl=True`, calls `ssl_augment()` before calculating CQL/DQN loss.
+- **`Agent.update_supervised(batch, ssl=False, masks=None, advantages=None)`**:
+    - If `ssl=True`, calls `ssl_augment()` before calculating Cross-Entropy.
+    - If `advantages` is provided, applies AWBC.
 
-### Previous Issue: Per-Item Optimizer Steps
-`ssl_update` was previously calling `optimizer.step()` for every item in the batch.
-- **Fix**: Refactored to accumulate loss across the entire batch for stable gradient updates.
+
+### B. Explicit Data Source Mapping
+CLI arguments will map directly to specific buffer-source pairs during the `unified_train_step`:
+- **`--online_rl`**: Samples from `agent.replay_buffer` (data collected via autonomous exploration) $\rightarrow$ `update_td()`.
+- **`--offline_rl`**: Samples from `buffers['example']` (data from pre-load or human intervention) $\rightarrow$ `update_td()`.
+- **`--bc`**: Samples from `buffers['example']` $\rightarrow$ `update_supervised(advantages=None)`.
+- **`--awbc`**: Samples from `buffers['example']` $\rightarrow$ `update_supervised(advantages=calculated_adv)`.
+- **`--ssl`**: When active, sets `ssl=True` in the above update calls for transitions that have an associated `feature_mask`.
+
+### C. Orchestration (`main.py`)
+`main()` will be refactored into a high-level manager:
+1. **Acquisition**: `run_rl_collection` (if `--num_rl_frames > 0`).
+2. **Human Interface**: `InteractiveGymWrapper` (if `--intervention` active and episodes collected).
+3. **Training**: `unified_train_step` sampling from the correct buffers based on the flags above.
+4. **Plotting**: Updated to support the 6 required graph types, including "Human Likeness" (entropy/divergence metrics).
