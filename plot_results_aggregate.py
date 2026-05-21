@@ -7,157 +7,177 @@ import glob
 
 def aggregate_and_plot(experiment_dir, output_dir):
     """
-    Finds all metrics_latest.json files in subdirectories of experiment_dir,
-    aggregates them, and plots mean + individual runs.
+    Produces 6 paper-ready graphs by aggregating across multiple seeds.
     """
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Find all metrics_latest.json files recursively
     metrics_files = glob.glob(os.path.join(experiment_dir, "**", "metrics_latest.json"), recursive=True)
     
     if not metrics_files:
         print(f"No metrics files found in {experiment_dir}")
         return
 
-    all_returns = []
-    all_iterations = []
-    
-    for f_path in metrics_files:
-        try:
-            with open(f_path, "r") as f:
-                data = json.load(f)
-                iters = [e["iteration"] for e in data["evaluations"]]
-                rets = [e["return_mean"] for e in data["evaluations"]]
-                all_returns.append(rets)
-                all_iterations = iters # Assume same iteration count for all seeds
-        except Exception as e:
-            print(f"Error reading {f_path}: {e}")
-
-    if not all_returns:
-        return
-
-    # Convert to numpy for easier aggregation
-    # Note: May need to truncate if iterations differ
-    min_len = min(len(r) for r in all_returns)
-    all_returns = [r[:min_len] for r in all_returns]
-    all_returns = np.array(all_returns)
-    all_iterations = all_iterations[:min_len]
-
-    # 1. Plot Returns with Transparency
-    plt.figure(figsize=(12, 6))
-    
-    # Plot individual seeds
-    for i in range(len(all_returns)):
-        plt.plot(all_iterations, all_returns[i], color='blue', alpha=0.3, label=f"Seed {i+1}" if i==0 else "")
-    
-    # Plot Mean
-    mean_return = np.mean(all_returns, axis=0)
-    plt.plot(all_iterations, mean_return, color='blue', linewidth=3, label="Mean")
-    
-    # Add Shaded Area (Std Dev)
-    std_return = np.std(all_returns, axis=0)
-    plt.fill_between(all_iterations, mean_return - std_return, mean_return + std_return, color='blue', alpha=0.1)
-
-    plt.title(f"Aggregated Performance: {os.path.basename(experiment_dir)}")
-    plt.xlabel("Iteration")
-    plt.ylabel("Mean Return")
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.savefig(os.path.join(output_dir, "aggregated_returns.png"))
-    plt.close()
-
-    # 2. Plot Human Effort (Aggregate across seeds)
-    plt.figure(figsize=(12, 7))
-    all_human_times = []
-    all_compute_times = []
-    all_preload_times = []
-    all_env_times = []
-    
-    # Track frames for the new chart
-    mode_frames = {
-        "Online RL": [],
-        "Expert Intervention": [],
-        "SSL Mining": [],
-        "Expert Pre-recording": []
-    }
-
+    all_data = []
     for f_path in metrics_files:
         with open(f_path, "r") as f:
-            data = json.load(f)
-            timers = data.get("timers", {})
-            f_counts = data.get("frames", {})
-            
-            # 1. Expert Pre-recording (Backwards compatible: use timer or estimate from frames at 30 FPS)
-            preload_time = timers.get("expert_preload_effort", 0)
-            if preload_time == 0:
-                # If timer is missing, check if frames were logged to 'human' (legacy) or 'expert_preload'
-                preload_frames = f_counts.get("expert_preload", 0)
-                if preload_frames == 0 and f_counts.get("human", 0) > 0 and timers.get("human_overriding", 0) == 0:
-                    # Legacy fallback: if HUMAN frames exist but no override time, they are preloaded
-                    preload_frames = f_counts.get("human", 0)
-                preload_time = preload_frames / 30.0
-            
-            # 2. Live Intervention Time
-            human_live = timers.get("human_overriding", 0) + timers.get("human_annotating", 0) + timers.get("human_reviewing", 0)
-            
-            # 3. Agent Training Time (The actual compute cost)
-            compute = sum(v for k, v in timers.items() if k.startswith("agent_updating") or k == "llm_processing")
-            
-            # 4. Environment Time (Experience gathering)
-            env_time = timers.get("rl_experience", 0)
-            
-            all_preload_times.append(preload_time)
-            all_human_times.append(human_live)
-            all_compute_times.append(compute)
-            all_env_times.append(env_time)
+            all_data.append(json.load(f))
 
-            # Collect frames for the mode chart
-            mode_frames["Online RL"].append(f_counts.get("rl", 0))
-            mode_frames["Expert Intervention"].append(f_counts.get("human", 0) if timers.get("human_overriding", 0) > 0 else 0)
-            mode_frames["SSL Mining"].append(f_counts.get("ssl", 0) + f_counts.get("curriculum", 0))
-            # Expert Pre-recording frames (Backwards compatible logic)
-            ep_frames = f_counts.get("expert_preload", 0)
-            if ep_frames == 0 and f_counts.get("human", 0) > 0 and timers.get("human_overriding", 0) == 0:
-                ep_frames = f_counts.get("human", 0)
-            mode_frames["Expert Pre-recording"].append(ep_frames)
-            
-    # Plot Time Summary
-    plt.figure(figsize=(14, 8))
-    labels = ["Expert Pre-recording", "Live Intervention", "Agent Training (Compute)", "RL Experience (Env)"]
-    means = [np.mean(all_preload_times), np.mean(all_human_times), np.mean(all_compute_times), np.mean(all_env_times)]
-    stds = [np.std(all_preload_times), np.std(all_human_times), np.std(all_compute_times), np.std(all_env_times)]
+    num_seeds = len(all_data)
+    iters = [e["iteration"] for e in all_data[0]["evaluations"]]
+    num_iters = len(iters)
+
+    # Helper to extract and aggregate a metric over iterations
+    def get_iter_metric(data_list, key_path):
+        # key_path: list of keys to traverse, or "evaluations:key"
+        results = []
+        for d in data_list:
+            if ":" in key_path:
+                root, key = key_path.split(":")
+                vals = [e.get(key, 0) for e in d[root]]
+                results.append(vals[:num_iters])
+            else:
+                # Timers/Frames are cumulative? No, they are usually snapshot at end of iter
+                # Actually, our metrics_latest.json has the totals.
+                # We need iteration-by-iteration totals if we want X-axis to be cumulative.
+                # Since we only have 'latest', we assume uniform distribution or just final result.
+                # TO BE RIGOROUS: We should use iteration-specific metrics files.
+                pass
+        return np.array(results)
+
+    # For X-axes (Interactions, Time, Human Effort), we need iteration-by-iteration cumulative counts.
+    # We find all metrics_{i}.json files for each seed.
+    seed_dirs = [os.path.dirname(f) for f in metrics_files]
     
-    plt.bar(labels, means, yerr=stds, color=['darkorange', 'orange', 'blue', 'lightblue'], capsize=10)
-    plt.title("Aggregated Time Effort Across Seeds")
-    plt.ylabel("Seconds")
-    plt.xticks(rotation=15)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "aggregated_time_spent.png"))
-    plt.close()
+    all_seeds_interactions = []
+    all_seeds_wallclock = []
+    all_seeds_human_time = []
+    all_seeds_scores = []
+    all_seeds_likeness = [] # BC Loss (Cross Entropy)
 
-    # 3. Plot Total Frames (New Chart)
+    for s_dir in seed_dirs:
+        seed_interactions = []
+        seed_wallclock = []
+        seed_human_time = []
+        seed_scores = []
+        seed_likeness = []
+        
+        for i in iters:
+            m_path = os.path.join(s_dir, f"metrics_{i}.json")
+            if not os.path.exists(m_path): continue
+            with open(m_path, "r") as f:
+                d = json.load(f)
+                # Total Frames
+                f_counts = d["frames"]
+                total_f = sum(f_counts.values())
+                seed_interactions.append(total_f)
+                
+                # Total Wallclock
+                timers = d["timers"]
+                total_t = sum(timers.values())
+                seed_wallclock.append(total_t)
+                
+                # Human Effort
+                h_t = timers.get("human_overriding", 0) + timers.get("human_annotating", 0) + timers.get("human_reviewing", 0) + timers.get("expert_preload_effort", 0)
+                seed_human_time.append(h_t)
+                
+                # Score
+                eval_last = d["evaluations"][-1]
+                seed_scores.append(eval_last["return_mean"])
+                seed_likeness.append(eval_last.get("bc_loss", 0))
+        
+        all_seeds_interactions.append(seed_interactions)
+        all_seeds_wallclock.append(seed_wallclock)
+        all_seeds_human_time.append(seed_human_time)
+        all_seeds_scores.append(seed_scores)
+        all_seeds_likeness.append(seed_likeness)
+
+    # Convert to arrays [Seed, Iteration]
+    all_seeds_interactions = np.array(all_seeds_interactions)
+    all_seeds_wallclock = np.array(all_seeds_wallclock)
+    all_seeds_human_time = np.array(all_seeds_human_time)
+    all_seeds_scores = np.array(all_seeds_scores)
+    all_seeds_likeness = np.array(all_seeds_likeness)
+
+    # --- Plot 1: Interactions vs Eval Score ---
+    plt.figure(figsize=(10, 6))
+    for s in range(num_seeds):
+        plt.plot(all_seeds_interactions[s], all_seeds_scores[s], alpha=0.3, color='blue')
+    mean_scores = np.mean(all_seeds_scores, axis=0)
+    mean_ints = np.mean(all_seeds_interactions, axis=0)
+    plt.plot(mean_ints, mean_scores, color='blue', linewidth=3, label="Mean")
+    plt.title("Sample Efficiency")
+    plt.xlabel("Total Environment Interactions")
+    plt.ylabel("Eval Return")
+    plt.grid(True); plt.legend()
+    plt.savefig(os.path.join(output_dir, "1_sample_efficiency.png"))
+
+    # --- Plot 2: Wall-clock Time vs Eval Score ---
+    plt.figure(figsize=(10, 6))
+    for s in range(num_seeds):
+        plt.plot(all_seeds_wallclock[s], all_seeds_scores[s], alpha=0.3, color='red')
+    mean_t = np.mean(all_seeds_wallclock, axis=0)
+    plt.plot(mean_t, mean_scores, color='red', linewidth=3, label="Mean")
+    plt.title("Real-Time Performance")
+    plt.xlabel("Total Wall-clock Time (s)")
+    plt.ylabel("Eval Return")
+    plt.grid(True); plt.legend()
+    plt.savefig(os.path.join(output_dir, "2_realtime_performance.png"))
+
+    # --- Plot 3: Human Likeness (Cross Entropy) ---
+    plt.figure(figsize=(10, 6))
+    for s in range(num_seeds):
+        plt.plot(iters, all_seeds_likeness[s], alpha=0.3, color='green')
+    mean_likeness = np.mean(all_seeds_likeness, axis=0)
+    plt.plot(iters, mean_likeness, color='green', linewidth=3, label="Mean")
+    plt.title("Human Likeness (Policy Divergence)")
+    plt.xlabel("Iteration")
+    plt.ylabel("Cross-Entropy Loss (Expert Data)")
+    plt.grid(True); plt.legend()
+    plt.savefig(os.path.join(output_dir, "3_human_likeness.png"))
+
+    # --- Plot 4: Active Human Time vs Eval Score ---
+    plt.figure(figsize=(10, 6))
+    active_mask = np.mean(all_seeds_human_time, axis=0) > 0
+    if active_mask.any():
+        for s in range(num_seeds):
+            plt.plot(all_seeds_human_time[s], all_seeds_scores[s], alpha=0.3, color='orange')
+        mean_h = np.mean(all_seeds_human_time, axis=0)
+        plt.plot(mean_h, mean_scores, color='orange', linewidth=3, label="Mean")
+    plt.title("Human Effort Efficiency")
+    plt.xlabel("Total Human Effort (Seconds)")
+    plt.ylabel("Eval Return")
+    plt.grid(True); plt.legend()
+    plt.savefig(os.path.join(output_dir, "4_human_effort_efficiency.png"))
+
+    # --- Plot 5: Bar-graph of Frames by Category ---
     plt.figure(figsize=(12, 7))
-    f_labels = list(mode_frames.keys())
-    f_means = [np.mean(mode_frames[m]) for m in f_labels]
-    f_stds = [np.std(mode_frames[m]) for m in f_labels]
-    
-    plt.bar(f_labels, f_means, yerr=f_stds, color='green', capsize=10)
-    plt.title("Total Environment Samples by Mode (Mean across Seeds)")
-    plt.ylabel("Frames")
-    plt.xticks(rotation=15)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "aggregated_frames.png"))
-    plt.close()
+    latest = all_data[0] # Use first seed as template for labels
+    f_labels = list(latest["frames"].keys())
+    f_means = [np.mean([d["frames"].get(l, 0) for d in all_data]) for l in f_labels]
+    f_stds = [np.std([d["frames"].get(l, 0) for d in all_data]) for l in f_labels]
+    plt.bar(f_labels, f_means, yerr=f_stds, color='green', alpha=0.7, capsize=10)
+    plt.title("Distribution of Environment Samples")
+    plt.ylabel("Total Frames")
+    plt.savefig(os.path.join(output_dir, "5_frame_distribution.png"))
 
-    print(f"Aggregated plots saved to {output_dir}")
+    # --- Plot 6: Bar-graph of Time by Category ---
+    plt.figure(figsize=(12, 7))
+    t_labels = list(latest["timers"].keys())
+    t_means = [np.mean([d["timers"].get(l, 0) for d in all_data]) for l in t_labels]
+    t_stds = [np.std([d["timers"].get(l, 0) for d in all_data]) for l in t_labels]
+    plt.barh(t_labels, t_means, xerr=t_stds, color='blue', alpha=0.7, capsize=10)
+    plt.title("Time Allocation Breakdown")
+    plt.xlabel("Seconds")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "6_time_breakdown.png"))
+
+    print(f"Paper-ready graphs saved to {output_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="LunarLander-v3")
-    parser.add_argument("--experiment_name", type=str, default="default_experiment")
+    parser.add_argument("--experiment_name", type=str, required=True)
     args = parser.parse_args()
     
-    # Correct path mapping: ./results/{env}/{experiment_name}/
     experiment_dir = os.path.join("results", args.env, args.experiment_name)
     output_dir = os.path.join(experiment_dir, "plots")
     

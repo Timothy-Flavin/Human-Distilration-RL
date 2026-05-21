@@ -4,205 +4,160 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import copy
+import collections
 import random
 import os
 from Agent import Agent
 
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim=256):
+    def __init__(self, obs_dim, action_dim):
         super(QNetwork, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
+        self.fc1 = nn.Linear(obs_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, action_dim)
 
     def forward(self, x):
-        return self.net(x)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
 
 class CQLAgent(Agent):
-    def __init__(self, obs_dim=8, action_dim=4, name="CQL", save_dir="./default_environment", device_name="cpu", lr=1e-3, gamma=0.99, tau=0.005, cql_weight=1.0):
+    def __init__(self, obs_dim, action_dim, name="CQL", save_dir="results", device_name="cpu"):
         super().__init__(obs_dim, action_dim, name, save_dir, device_name)
-        self.gamma = gamma
-        self.tau = tau
-        self.cql_weight = cql_weight
-
+        
         self.q_net = QNetwork(obs_dim, action_dim).to(self.device_name)
-        self.q_target = copy.deepcopy(self.q_net).to(self.device_name)
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        self.q_target = copy.deepcopy(self.q_net)
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=3e-4)
         
-        self.criterion = nn.CrossEntropyLoss()
+        self.gamma = 0.99
+        self.tau = 0.005
+        self.cql_alpha = 1.0 # CQL regularization weight
         
-        # Internal replay buffer for standard RL
-        self.replay_buffer = [] 
-        self.local_replay_buffer = []
-        self.max_buffer_size = 50000
+        # Standard Replay Buffer for Offline/Online transitions
+        self.replay_buffer = collections.deque(maxlen=100000)
 
-    def act(self, observations: torch.Tensor, deterministic: bool = False, epsilon=0.1):
-        if not deterministic and np.random.random() < epsilon:
-            return torch.randint(0, self.action_dim, (observations.shape[0],), device=self.device_name)
-        
+    def act(self, observations: torch.Tensor, deterministic: bool = False):
         with torch.no_grad():
             q_values = self.q_net(observations)
-            return torch.argmax(q_values, dim=-1)
+            if deterministic:
+                return q_values.argmax(dim=1)
+            else:
+                # Simple epsilon-greedy for online exploration
+                if random.random() < 0.05:
+                    return torch.tensor([random.randint(0, self.action_dim-1)] * observations.shape[0]).to(self.device_name)
+                return q_values.argmax(dim=1)
 
     def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         self.replay_buffer.append((obs, action, reward, next_obs, terminated, truncated))
-        if len(self.replay_buffer) > self.max_buffer_size:
-            self.replay_buffer.pop(0)
 
-    def store_local_transition(self, obs, action, reward, next_obs, terminated, truncated):
-        """Stores transition in a separate buffer for localized curriculum training."""
-        self.local_replay_buffer.append((obs, action, reward, next_obs, terminated, truncated))
-        if len(self.local_replay_buffer) > self.max_buffer_size:
-            self.local_replay_buffer.pop(0)
-
-    def rl_update(self, batch_size=64, local: bool = False) -> dict:
-        target_buffer = self.local_replay_buffer if local else self.replay_buffer
-        if len(target_buffer) < batch_size:
-            return {}
-
-        batch = random.sample(target_buffer, batch_size)
-        obs, action, reward, next_obs, terminated, truncated = zip(*batch)
+    def update_td(self, batch, ssl: bool = False, masks: list = None) -> dict:
+        """
+        Conservative Q-Learning TD Update.
+        batch: List of tuples (obs, action, reward, next_obs, terminated, truncated)
+        """
+        obs, actions, rewards, next_obs, terminated, truncated = zip(*batch)
         
         obs = torch.tensor(np.array(obs), dtype=torch.float32).to(self.device_name)
-        action = torch.tensor(action, dtype=torch.long).to(self.device_name).unsqueeze(1)
-        reward = torch.tensor(reward, dtype=torch.float32).to(self.device_name).unsqueeze(1)
+        actions = torch.tensor(actions, dtype=torch.long).to(self.device_name)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device_name)
         next_obs = torch.tensor(np.array(next_obs), dtype=torch.float32).to(self.device_name)
-        terminated = torch.tensor(terminated, dtype=torch.float32).to(self.device_name).unsqueeze(1)
-        truncated = torch.tensor(truncated, dtype=torch.float32).to(self.device_name).unsqueeze(1)
+        dones = torch.tensor(np.array(terminated) | np.array(truncated), dtype=torch.float32).to(self.device_name)
 
-        # Standard DQN Update
+        if ssl and masks:
+            obs = self.ssl_augment(obs, masks)
+
+        # 1. Standard Q-Learning Loss
+        current_q = self.q_net(obs).gather(1, actions.unsqueeze(1)).squeeze()
         with torch.no_grad():
-            next_q = self.q_target(next_obs).max(1, keepdim=True)[0]
-            target_q = reward + (1 - terminated) * self.gamma * next_q
+            next_q = self.q_target(next_obs).max(1)[0]
+            # Boostrap on truncated, zero on terminated (handled by main.py but double checked here)
+            target_q = rewards + (1 - dones) * self.gamma * next_q
 
-        current_q = self.q_net(obs).gather(1, action)
-        td_loss = F.mse_loss(current_q, target_q)
+        q_loss = F.mse_loss(current_q, target_q)
 
-        # CQL Penalty
+        # 2. CQL Regularization (Push down Q-values of all actions, push up Q-values of dataset actions)
         q_logits = self.q_net(obs)
-        cql_loss = (torch.logsumexp(q_logits, dim=1) - current_q.squeeze()).mean()
+        dataset_q = q_logits.gather(1, actions.unsqueeze(1)).squeeze()
+        
+        # logsumexp(Q(s, a)) - Q(s, a_dataset)
+        cql_loss = torch.logsumexp(q_logits, dim=1).mean() - dataset_q.mean()
 
-        loss = td_loss + self.cql_weight * cql_loss
+        total_loss = q_loss + self.cql_alpha * cql_loss
 
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         self.optimizer.step()
 
         # Soft update target network
         for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        return {"td_loss": td_loss.item(), "cql_loss": cql_loss.item(), "total_loss": loss.item()}
+        return {
+            "loss_td": total_loss.item(),
+            "q_loss": q_loss.item(),
+            "cql_loss": cql_loss.item(),
+            "q_mean": dataset_q.mean().item()
+        }
+
+    def update_supervised(self, batch, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
+        """
+        Behavior Cloning (Cross-Entropy) Loss.
+        batch: List of tuples (obs, action)
+        """
+        obs, labels = zip(*batch)
+        obs = torch.tensor(np.array(obs), dtype=torch.float32).to(self.device_name)
+        labels = torch.tensor(labels, dtype=torch.long).to(self.device_name)
+
+        if ssl and masks:
+            obs = self.ssl_augment(obs, masks)
+
+        logits = self.q_net(obs)
+        
+        if anti:
+            # For anti-BC, we want to MINIMIZE the probability of the discarded action
+            # Loss = - log(1 - prob(bad_action)) = - log(sum(probs_of_other_actions))
+            probs = F.softmax(logits, dim=1)
+            bad_action_probs = probs.gather(1, labels.unsqueeze(1)).squeeze()
+            loss = -torch.log(1 - bad_action_probs + 1e-8).mean()
+        else:
+            if advantages is not None:
+                # AWBC: weight cross entropy by advantages
+                adv = advantages.to(self.device_name)
+                # Ensure labels are indices
+                log_probs = F.log_softmax(logits, dim=1)
+                selected_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze()
+                loss = -(adv * selected_log_probs).mean()
+            else:
+                loss = F.cross_entropy(logits, labels)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {"loss_supervised": loss.item()}
+
+    def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.q_net(obs)
 
     def kl_update(self, obs: torch.Tensor, target_agent) -> dict:
-        self.q_net.train()
-        obs = obs.to(self.device_name)
-        q_logits = self.q_net(obs)
-        
+        """Pulls this agent's policy towards the target_agent's policy using KL."""
+        current_logits = self.q_net(obs)
         with torch.no_grad():
             target_logits = target_agent.get_logits(obs)
-            target_probs = F.softmax(target_logits, dim=-1)
+            target_probs = F.softmax(target_logits, dim=1)
         
-        current_log_probs = F.log_softmax(q_logits, dim=-1)
+        current_log_probs = F.log_softmax(current_logits, dim=1)
+        # KL(Target || Current)
         kl_loss = F.kl_div(current_log_probs, target_probs, reduction='batchmean')
         
         self.optimizer.zero_grad()
         kl_loss.backward()
         self.optimizer.step()
         
-        return {"kl_loss": kl_loss.item()}
-
-    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False, advantages: torch.Tensor = None) -> dict:
-        self.q_net.train()
-        logits = self.q_net(obs.to(self.device_name))
-        labels = labels.to(self.device_name)
-
-        if not anti:
-            if advantages is not None:
-                advantages = advantages.to(self.device_name)
-                # Weighted cross entropy
-                log_probs = F.log_softmax(logits, dim=-1)
-                loss = -(log_probs.gather(1, labels.unsqueeze(1)).squeeze() * advantages).mean()
-            else:
-                loss = self.criterion(logits, labels)
-        else:
-            probs = F.softmax(logits, dim=-1)
-            prob_rejected = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
-            loss = -torch.log(1.0 - prob_rejected + 1e-6).mean()
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return {"bc_loss" if not anti else "anti_bc_loss": loss.item()}
-
-    def ssl_update(self, batch) -> dict:
-        self.q_net.train()
-        total_loss = 0
-        samples_used = 0
-        
-        # Accumulate loss for the whole batch
-        batch_loss = []
-        
-        for item in batch:
-            obs = item['obs']
-            if not isinstance(obs, torch.Tensor):
-                obs = torch.tensor(obs, dtype=torch.float32)
-            obs = obs.to(self.device_name)
-            
-            action = item['action']
-            if not isinstance(action, torch.Tensor):
-                action = torch.tensor(action)
-            action = action.to(self.device_name)
-            mask = item['feature_mask']
-            term_rule = item.get('termination_rule')
-            noise_scale = 0.05 # Reduced from 0.5 for stability
-            N = 5
-            
-            aug_losses = []
-            for _ in range(N):
-                noisy_obs = obs.clone()
-                unimportant_indices = [i for i in range(self.obs_dim) if i not in mask]
-                noisy_obs[unimportant_indices] += torch.randn(len(unimportant_indices), device=self.device_name) * noise_scale
-                
-                # R4.3: Ensure noise doesn't push state past termination condition
-                if term_rule is not None:
-                    if term_rule(noisy_obs.cpu().numpy()):
-                        continue # Skip this augmentation
-                
-                aug_logits = self.q_net(noisy_obs.unsqueeze(0))
-                aug_losses.append(self.criterion(aug_logits, action.unsqueeze(0)))
-            
-            if aug_losses:
-                item_loss = torch.stack(aug_losses).mean()
-                batch_loss.append(item_loss)
-                samples_used += 1
-        
-        if batch_loss:
-            loss = torch.stack(batch_loss).mean()
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            total_loss = loss.item() * samples_used
-        
-        return {"ssl_loss": total_loss / samples_used if samples_used > 0 else 0.0}
-
-    def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.q_net(obs)
+        return {"loss_kl": kl_loss.item()}
 
     def _save_checkpoint(self, path):
         torch.save(self.q_net.state_dict(), path)
-
-    def checkpoint_model(self, specific_name=None):
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir, exist_ok=True)
-        filename = f"{self.name}_{specific_name if specific_name else 'latest'}.pt"
-        path = os.path.join(self.save_dir, filename)
-        self._save_checkpoint(path)
-        print(f"[Checkpoint] Saved CQL model to {path}")
 
     def load_model(self, path):
         self.q_net.load_state_dict(torch.load(path, map_location=self.device_name))

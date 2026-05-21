@@ -31,18 +31,13 @@ class Agent(ABC):
         pass
 
     @abstractmethod
-    def rl_update(self, batch_size=64, local: bool = False, target_agent=None) -> dict:
-        """Performs a Reinforcement Learning update."""
+    def update_td(self, batch, ssl: bool = False, masks: list = None) -> dict:
+        """Strictly applies Temporal Difference (e.g. CQL/DQN) loss."""
         pass
 
     @abstractmethod
-    def supervised_update(self, obs: torch.Tensor, labels: torch.Tensor, anti: bool = False, advantages: torch.Tensor = None) -> dict:
-        """Performs a Supervised Learning (Behavior Cloning) update."""
-        pass
-
-    @abstractmethod
-    def ssl_update(self, batch) -> dict:
-        """Performs a Semi-Supervised Learning update."""
+    def update_supervised(self, batch, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
+        """Strictly applies Supervised Learning (Behavior Cloning) loss."""
         pass
 
     @abstractmethod
@@ -54,6 +49,31 @@ class Agent(ABC):
     def kl_update(self, obs: torch.Tensor, target_agent) -> dict:
         """Performs a KL-Divergence update towards a target agent's policy."""
         pass
+
+    def ssl_augment(self, obs_batch: torch.Tensor, masks: list) -> torch.Tensor:
+        """
+        Augments observations with feature-specific noise.
+        masks: A list of dicts, one per batch item. 
+               Each dict: {feature_idx: {'dist': 'gaussian'|'uniform', 'scale': 0.1, 'low': x, 'high': y}}
+        """
+        augmented_obs = obs_batch.clone()
+        for i, mask in enumerate(masks):
+            if not mask:
+                continue
+            
+            for feat_idx, spec in mask.items():
+                if spec['dist'] == 'gaussian':
+                    scale = spec.get('scale', 0.1)
+                    # Use size=() for scalar noise
+                    noise = torch.normal(0, scale, size=()).to(self.device_name)
+                    augmented_obs[i, feat_idx] += noise
+                elif spec['dist'] == 'uniform':
+                    low = spec.get('low', -1.0)
+                    high = spec.get('high', 1.0)
+                    # Sample uniformly in the range [low, high]
+                    val = (high - low) * torch.rand(size=()).to(self.device_name) + low
+                    augmented_obs[i, feat_idx] = val
+        return augmented_obs
 
     def checkpoint_model(self, specific_name=None):
         """Saves the model weights."""

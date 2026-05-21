@@ -4,30 +4,39 @@ import random
 import numpy as np
 
 class ReplayBuffer:
-    """Standard FIFO replay buffer for (obs, action) pairs."""
+    """Unified replay buffer for (obs, action, reward, next_obs, done, mask) transitions."""
     def __init__(self, capacity):
         self.buffer = collections.deque(maxlen=capacity)
 
-    def push(self, obs, action):
-        # Ensure they are tensors or convert them
+    def push(self, obs, action, reward=0.0, next_obs=None, terminated=False, truncated=False, mask=None):
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32)
         if not isinstance(action, torch.Tensor):
             action = torch.tensor(action)
-        self.buffer.append((obs, action))
+        if next_obs is None:
+            next_obs = obs # Fallback for pure BC data
+        if not isinstance(next_obs, torch.Tensor):
+            next_obs = torch.tensor(next_obs, dtype=torch.float32)
+            
+        self.buffer.append({
+            "obs": obs,
+            "action": action,
+            "reward": float(reward),
+            "next_obs": next_obs,
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "mask": mask # Optional dict of feature noise specs
+        })
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
-        obs, action = zip(*batch)
-        return torch.stack(obs), torch.stack(action)
+        return batch
 
     def save(self, path):
-        """Serializes the buffer to a file."""
         torch.save(list(self.buffer), path)
         print(f"[Buffer] Saved to {path}")
 
     def load(self, path):
-        """Loads a serialized buffer from a file."""
         data = torch.load(path)
         self.buffer = collections.deque(data, maxlen=self.buffer.maxlen)
         print(f"[Buffer] Loaded {len(self.buffer)} items from {path}")
@@ -36,7 +45,6 @@ class ReplayBuffer:
         return len(self.buffer)
 
 class LLMBuffer:
-    """Queue for human notes and context to be processed by LLM."""
     def __init__(self):
         self.buffer = collections.deque()
 
@@ -52,14 +60,10 @@ class LLMBuffer:
     def pop(self):
         return self.buffer.popleft() if self.buffer else None
 
-    def __len__(self):
-        return len(self.buffer)
-
     def is_empty(self):
         return len(self.buffer) == 0
 
 class CurriculumBuffer:
-    """Buffer for localized RL tasks with custom rewards."""
     def __init__(self):
         self.tasks = collections.deque()
 
@@ -69,7 +73,7 @@ class CurriculumBuffer:
             "start_frame": start_frame,
             "trajectory_length": trajectory_length,
             "reward_fn": reward_function_callable,
-            "historical_actions": historical_actions # Actions taken to reach start_frame
+            "historical_actions": historical_actions
         })
 
     def pop(self):
@@ -78,18 +82,13 @@ class CurriculumBuffer:
     def is_empty(self):
         return len(self.tasks) == 0
 
-    def __iter__(self):
-        return iter(self.tasks)
-
-    def __len__(self):
-        return len(self.tasks)
-
 class SemiSupervisedBuffer:
     """Buffer for SSL with feature masks and termination conditions."""
     def __init__(self, capacity):
         self.buffer = collections.deque(maxlen=capacity)
 
     def push(self, obs, action, feature_mask, termination_rule=None):
+        # We store as a full transition for integrated SSL
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32)
         if not isinstance(action, torch.Tensor):
@@ -97,7 +96,11 @@ class SemiSupervisedBuffer:
         self.buffer.append({
             "obs": obs,
             "action": action,
-            "feature_mask": feature_mask,
+            "mask": feature_mask, # Unified name 'mask'
+            "reward": 0.0,
+            "next_obs": obs,
+            "terminated": False,
+            "truncated": False,
             "termination_rule": termination_rule
         })
 
@@ -109,7 +112,6 @@ class SemiSupervisedBuffer:
         return len(self.buffer)
 
 class ObservationBuffer:
-    """Buffer for storing observations (e.g., for KL-divergence targets)."""
     def __init__(self, capacity=10000):
         self.buffer = collections.deque(maxlen=capacity)
 

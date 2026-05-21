@@ -33,12 +33,15 @@ def calculate_cross_entropy(agent, buffer, anti=False):
     
     # Use the whole buffer or a large sample for evaluation
     batch_size = min(len(buffer), 1024)
-    obs, labels = buffer.sample(batch_size)
+    batch_items = buffer.sample(batch_size)
+    
+    # Extract and stack
+    obs = torch.stack([item['obs'] for item in batch_items]).to(agent.device_name)
+    labels = torch.stack([item['action'] for item in batch_items]).to(agent.device_name)
     
     # We assume the agent has a way to set eval mode or it doesn't matter for get_logits
     with torch.no_grad():
-        logits = agent.get_logits(obs.to(agent.device_name))
-        labels = labels.to(agent.device_name)
+        logits = agent.get_logits(obs)
         
         if not anti:
             # Standard CrossEntropy
