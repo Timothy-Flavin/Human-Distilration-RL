@@ -3,6 +3,7 @@ import pygame
 import pickle
 import os
 import numpy as np
+import time
 
 def get_action(keys, env_name="LunarLander-v3"):
     """Map WASD or Arrow Keys to environment actions."""
@@ -15,7 +16,6 @@ def get_action(keys, env_name="LunarLander-v3"):
             return 3
         return 0
     elif "highway" in env_name:
-        # 0: LANE_LEFT, 1: IDLE, 2: LANE_RIGHT, 3: FASTER, 4: SLOWER
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
             return 0
         elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
@@ -24,7 +24,7 @@ def get_action(keys, env_name="LunarLander-v3"):
             return 3
         elif keys[pygame.K_DOWN] or keys[pygame.K_s]:
             return 4
-        return 1 # IDLE
+        return 1
     return 0
 
 def main():
@@ -40,7 +40,6 @@ def main():
     print(f"Environment: {env_name}")
     print(f"Saving data to: {dataset_path}")
     
-    # 1. Load existing dataset if it exists
     if os.path.exists(dataset_path):
         with open(dataset_path, 'rb') as f:
             dataset = pickle.load(f)
@@ -57,7 +56,6 @@ def main():
     print(" - Press 'Q' or close the window to safely save and quit.")
     print("--------------------------------------------------")
 
-    # 2. Setup environment and Pygame
     env = gym.make(env_name, render_mode="rgb_array")
     if "highway" in env_name:
         import highway_env
@@ -76,9 +74,10 @@ def main():
         terminated = False
         truncated = False
         
+        start_time = time.time()
+        
         while not (terminated or truncated):
             frame = env.render()
-            
             if screen is None and frame is not None:
                 height, width, _ = frame.shape
                 screen = pygame.display.set_mode((width, height))
@@ -90,41 +89,33 @@ def main():
                 pygame.display.flip()
             
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
+                if event.type == pygame.QUIT: running = False
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_q:
-                        running = False
+                    if event.key == pygame.K_q: running = False
             
-            if not running:
-                break
+            if not running: break
             
-            # Get Action
             keys = pygame.key.get_pressed()
             action = get_action(keys, env_name=env_name)
             
-            # Step Environment
             next_obs, reward, terminated, truncated, info = env.step(action)
-            
-            # Save Transition: Pair CURRENT state with the action taken in it
             episode_transitions.append({
-                'obs': obs, # Correct: current state
-                'action': action, # Correct: action taken in current state
-                'reward': reward,
-                'next_obs': next_obs,
-                'terminated': terminated,
-                'truncated': truncated,
-                'info': info
+                'obs': obs, 'action': action, 'reward': reward,
+                'next_obs': next_obs, 'terminated': terminated,
+                'truncated': truncated, 'info': info
             })
-            
             obs = next_obs
             clock.tick(fps)
             
         if episode_transitions:
-            dataset.append(episode_transitions)
+            duration = time.time() - start_time
+            dataset.append({
+                "transitions": episode_transitions,
+                "duration": duration
+            })
             with open(dataset_path, 'wb') as f:
                 pickle.dump(dataset, f)
-            print(f"[+] Episode finished. Total Episodes: {len(dataset)}")
+            print(f"[+] Episode finished ({duration:.1f}s). Total Episodes: {len(dataset)}")
             
     env.close()
     pygame.quit()

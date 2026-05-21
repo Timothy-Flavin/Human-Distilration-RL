@@ -44,46 +44,84 @@ def plot_metrics(metrics_path, output_dir):
     plt.close()
     
     # 3. Bar chart: Time Spent (Detailed Breakdown)
-    plt.figure(figsize=(12, 7))
-    timers = data["timers"]
+    plt.figure(figsize=(14, 8))
+    timers = data.get("timers", {})
+    f_counts = data.get("frames", {})
+
+    # 1. Expert Pre-recording (Backwards compatible)
+    preload_time = timers.get("expert_preload_effort", 0)
+    if preload_time == 0:
+        preload_frames = f_counts.get("expert_preload", 0)
+        if preload_frames == 0 and f_counts.get("human", 0) > 0 and timers.get("human_overriding", 0) == 0:
+            preload_frames = f_counts.get("human", 0)
+        preload_time = preload_frames / 30.0
+
+    # 2. Live Intervention
+    human_live = timers.get("human_overriding", 0) + timers.get("human_annotating", 0) + timers.get("human_reviewing", 0)
+
+    # 3. Agent Training (Actual Compute)
+    compute = sum(v for k, v in timers.items() if k.startswith("agent_updating") or k == "llm_processing")
+
+    # 4. Environment Time
+    env_time = timers.get("rl_experience", 0)
+
+    labels = ["Expert Pre-recording", "Live Intervention", "Agent Training (Compute)", "RL Experience (Env)"]
+    values = [preload_time, human_live, compute, env_time]
+    colors = ['darkorange', 'orange', 'blue', 'lightblue']
+
+    plt.bar(labels, values, color=colors)
+    plt.title("Time Allocation Summary")
+    plt.ylabel("Seconds")
+    plt.xticks(rotation=15)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "time_spent_summary.png"))
+    plt.close()
+
+    # Detailed Breakdown (Horizontal)
+    plt.figure(figsize=(12, 10))
+    # Filter out keys with 0 to keep it clean
+    display_timers = {k: v for k, v in timers.items() if v > 0}
+    # Add the estimated preload if it was calculated manually
+    if "expert_preload_effort" not in display_timers and preload_time > 0:
+        display_timers["expert_preload_effort"] = preload_time
+
+    keys = sorted(display_timers.keys())
+    values = [display_timers[k] for k in keys]
+    labels = [k.replace('_', ' ').title() for k in keys]
     
-    # Sort timers for better visualization
-    # Separate Human vs Compute for different colors
-    human_keys = ["human_overriding", "human_annotating"]
-    compute_keys = [k for k in timers.keys() if k not in human_keys]
-    
-    keys = human_keys + compute_keys
-    values = [timers[k] for k in keys]
-    colors = ['orange'] * len(human_keys) + ['blue'] * len(compute_keys)
-    
-    # Clean up labels for display
-    display_labels = [k.replace('_', ' ').title() for k in keys]
-    
-    plt.barh(display_labels, values, color=colors)
-    plt.title("Detailed Time Allocation (Seconds)")
-    plt.xlabel("Time (s)")
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.barh(labels, values, color='gray')
+    plt.title("All Timers (Raw Allocation)")
+    plt.xlabel("Seconds")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "time_spent_detailed.png"))
     plt.close()
-
-    # Also keep the summary bar chart but make it more robust
-    plt.figure(figsize=(8, 6))
-    human_total = sum(timers[k] for k in human_keys)
-    compute_total = sum(timers[k] for k in compute_keys)
-    
-    plt.bar(["Human", "Compute"], [human_total, compute_total], color=['orange', 'blue'])
-    plt.title("Human vs. Compute Time")
-    plt.ylabel("Total Time (s)")
-    plt.savefig(os.path.join(output_dir, "time_spent_summary.png"))
-    plt.close()
     
     # 4. Bar chart: Env Samples
-    plt.figure(figsize=(10, 6))
-    frames = data["frames"]
-    plt.bar(frames.keys(), frames.values(), color='green')
-    plt.title("Environment Samples")
+    plt.figure(figsize=(12, 7))
+    # Map sources to more readable names
+    source_map = {
+        "rl": "Online RL",
+        "human": "Expert Intervention",
+        "curriculum": "Curriculum/SSL",
+        "ssl": "SSL Mining",
+        "expert_preload": "Expert Pre-recording"
+    }
+    
+    labels = []
+    values = []
+    for k, v in f_counts.items():
+        # Backwards compatible check: if human frames exist but it was a preload run
+        if k == "human" and timers.get("human_overriding", 0) == 0:
+            labels.append("Expert Pre-recording (Legacy)")
+        else:
+            labels.append(source_map.get(k, k.upper()))
+        values.append(v)
+        
+    plt.bar(labels, values, color='green')
+    plt.title("Total Environment Samples by Mode")
     plt.ylabel("Frames")
+    plt.xticks(rotation=15)
+    plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "env_samples.png"))
     plt.close()
     

@@ -67,27 +67,86 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.close()
 
     # 2. Plot Human Effort (Aggregate across seeds)
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 7))
     all_human_times = []
     all_compute_times = []
+    all_preload_times = []
+    all_env_times = []
     
+    # Track frames for the new chart
+    mode_frames = {
+        "Online RL": [],
+        "Expert Intervention": [],
+        "SSL Mining": [],
+        "Expert Pre-recording": []
+    }
+
     for f_path in metrics_files:
         with open(f_path, "r") as f:
             data = json.load(f)
-            timers = data["timers"]
-            human = timers.get("human_overriding", 0) + timers.get("human_annotating", 0) + timers.get("human_reviewing", 0)
-            compute = sum(v for k, v in timers.items() if "human" not in k)
-            all_human_times.append(human)
-            all_compute_times.append(compute)
+            timers = data.get("timers", {})
+            f_counts = data.get("frames", {})
             
-    plt.bar(["Human Effort (Mean)", "Compute Time (Mean)"], 
-            [np.mean(all_human_times), np.mean(all_compute_times)], 
-            yerr=[np.std(all_human_times), np.std(all_compute_times)],
-            color=['orange', 'blue'], capsize=10)
+            # 1. Expert Pre-recording (Backwards compatible: use timer or estimate from frames at 30 FPS)
+            preload_time = timers.get("expert_preload_effort", 0)
+            if preload_time == 0:
+                # If timer is missing, check if frames were logged to 'human' (legacy) or 'expert_preload'
+                preload_frames = f_counts.get("expert_preload", 0)
+                if preload_frames == 0 and f_counts.get("human", 0) > 0 and timers.get("human_overriding", 0) == 0:
+                    # Legacy fallback: if HUMAN frames exist but no override time, they are preloaded
+                    preload_frames = f_counts.get("human", 0)
+                preload_time = preload_frames / 30.0
+            
+            # 2. Live Intervention Time
+            human_live = timers.get("human_overriding", 0) + timers.get("human_annotating", 0) + timers.get("human_reviewing", 0)
+            
+            # 3. Agent Training Time (The actual compute cost)
+            compute = sum(v for k, v in timers.items() if k.startswith("agent_updating") or k == "llm_processing")
+            
+            # 4. Environment Time (Experience gathering)
+            env_time = timers.get("rl_experience", 0)
+            
+            all_preload_times.append(preload_time)
+            all_human_times.append(human_live)
+            all_compute_times.append(compute)
+            all_env_times.append(env_time)
+
+            # Collect frames for the mode chart
+            mode_frames["Online RL"].append(f_counts.get("rl", 0))
+            mode_frames["Expert Intervention"].append(f_counts.get("human", 0) if timers.get("human_overriding", 0) > 0 else 0)
+            mode_frames["SSL Mining"].append(f_counts.get("ssl", 0) + f_counts.get("curriculum", 0))
+            # Expert Pre-recording frames (Backwards compatible logic)
+            ep_frames = f_counts.get("expert_preload", 0)
+            if ep_frames == 0 and f_counts.get("human", 0) > 0 and timers.get("human_overriding", 0) == 0:
+                ep_frames = f_counts.get("human", 0)
+            mode_frames["Expert Pre-recording"].append(ep_frames)
+            
+    # Plot Time Summary
+    plt.figure(figsize=(14, 8))
+    labels = ["Expert Pre-recording", "Live Intervention", "Agent Training (Compute)", "RL Experience (Env)"]
+    means = [np.mean(all_preload_times), np.mean(all_human_times), np.mean(all_compute_times), np.mean(all_env_times)]
+    stds = [np.std(all_preload_times), np.std(all_human_times), np.std(all_compute_times), np.std(all_env_times)]
     
-    plt.title("Mean Effort Across Seeds")
+    plt.bar(labels, means, yerr=stds, color=['darkorange', 'orange', 'blue', 'lightblue'], capsize=10)
+    plt.title("Aggregated Time Effort Across Seeds")
     plt.ylabel("Seconds")
+    plt.xticks(rotation=15)
+    plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "aggregated_time_spent.png"))
+    plt.close()
+
+    # 3. Plot Total Frames (New Chart)
+    plt.figure(figsize=(12, 7))
+    f_labels = list(mode_frames.keys())
+    f_means = [np.mean(mode_frames[m]) for m in f_labels]
+    f_stds = [np.std(mode_frames[m]) for m in f_labels]
+    
+    plt.bar(f_labels, f_means, yerr=f_stds, color='green', capsize=10)
+    plt.title("Total Environment Samples by Mode (Mean across Seeds)")
+    plt.ylabel("Frames")
+    plt.xticks(rotation=15)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "aggregated_frames.png"))
     plt.close()
 
     print(f"Aggregated plots saved to {output_dir}")

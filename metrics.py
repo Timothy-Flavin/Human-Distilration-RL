@@ -16,6 +16,7 @@ class MetricsLogger:
             "agent_updating_local_rl": 0.0,
             "agent_updating_ssl": 0.0,
             "agent_updating_rl": 0.0,
+            "expert_preload_effort": 0.0,
         }
         
         # Frame counters
@@ -23,7 +24,8 @@ class MetricsLogger:
             "rl": 0,
             "human": 0,
             "curriculum": 0,
-            "ssl": 0
+            "ssl": 0,
+            "expert_preload": 0
         }
         
         # Evaluation results
@@ -68,6 +70,7 @@ class MetricsLogger:
     def log_iteration(self):
         summary = self.get_summary()
         print("\n--- Iteration Metrics ---")
+        # Ensure expert_preload is at the top or visible
         for key, val in summary["timers"].items():
             print(f"{key.replace('_', ' ').capitalize()}: {val:.2f}s")
         for key, val in summary["frames"].items():
