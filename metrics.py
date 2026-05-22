@@ -34,7 +34,7 @@ class MetricsLogger:
         self._start_times = {}
 
     def start_timer(self, key):
-        if key in self.timers:
+        if key in self.timers and key not in self._start_times:
             self._start_times[key] = time.time()
 
     def stop_timer(self, key):

@@ -43,14 +43,14 @@ These experiments use the `expert_demonstrations_LunarLander-v3.pkl` dataset to 
 *   **Description**: Learns from CQL loss on both the offline expert data and the online collected rl data
 *   **Command**:
     ```bash
-    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --num_rl_frames 2000 --num_unified_epochs 100 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
+    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --num_rl_frames 2000 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
     ```
 
 ### Exp 6: Online CQL + Offline CQL + AWBC
 *   **Description**: Learns from CQL loss on both the offline expert data and the online collected rl data and advantage weighted cross entropy loss from the human expert data
 *   **Command**:
     ```bash
-    python main.py --env LunarLander-v3 --algo cql --awbc --offline_rl --online_rl --num_rl_frames 2000 --num_unified_epochs 100 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
+    python main.py --env LunarLander-v3 --algo cql --awbc --offline_rl --online_rl --num_rl_frames 2000 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
     ```
 
 ---
@@ -62,53 +62,52 @@ These experiments measure the impact of each form of override loss component on 
 *   **Description**: Only uses human overrides (Spacebar) to push data to the `example_buffer`. No LLM involvement.
 *   **Command**:
     ```bash
-    python main.py --env LunarLander-v3 --algo cql --awbc --online_rl --num_rl_frames 2000 --experiment_name "interactive_bc" --seed 42 --num_unified_epochs 100 
+    python main.py --env LunarLander-v3 --algo cql --awbc --online_rl --intervention --num_rl_frames 2000 --experiment_name "interactive_bc" --seed 42 --num_unified_epochs 200 
     ```
 ### Exp 8: Interactive OfflineRL (Correction Only)
 *   **Description**: Only uses human overrides (Spacebar) to push data to the `example_buffer`. No LLM involvement.
 *   **Command**:
     ```bash
-    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --num_rl_frames 2000 --experiment_name "interactive_bc" --seed 42 --num_unified_epochs 100 
+    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --intervention --num_rl_frames 2000 --experiment_name "interactive_rl" --seed 42 --num_unified_epochs 200 
     ```
   
 ### Exp 9: Hot Start + Interactive AWBC (Expert dataset + online corrections)
-*   **Description**: Only uses human overrides (Spacebar) to push data to the `example_buffer`. No LLM involvement.
+*   **Description**: Combines pre-loaded expert data with live interactive overrides.
 *   **Command**:
     ```bash
-    python main.py --env LunarLander-v3 --algo cql --awbc --online_rl --num_rl_frames 2000 --experiment_name "interactive_bc" --seed 42 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --num_unified_epochs 100 
+    python main.py --env LunarLander-v3 --algo cql --awbc --online_rl --intervention --num_rl_frames 2000 --experiment_name "hotstart_bc" --seed 42 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --num_unified_epochs 200 
     ```
 
 ### Exp 10: Hot Start + Interactive OfflineRL (Expert dataset + online corrections)
-*   **Description**: Only uses human overrides (Spacebar) to push data to the `example_buffer`. No LLM involvement.
+*   **Description**: Combines pre-loaded expert data with live interactive overrides, learning via Offline RL.
 *   **Command**:
     ```bash
-    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --num_rl_frames 2000 --experiment_name "interactive_bc" --seed 42 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --num_unified_epochs 100 
+    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --intervention --num_rl_frames 2000 --experiment_name "hotstart_rl" --seed 42 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --num_unified_epochs 200 
     ```
   
 ### Exp 11: Hot Start + Interactive OfflineRL + AWBC (Expert dataset + online corrections)
-*   **Description**: Only uses human overrides (Spacebar) to push data to the `example_buffer`. No LLM involvement.
+*   **Description**: Full override-based learning using both Supervised and TD signals.
 *   **Command**:
     ```bash
-    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --awbc --num_rl_frames 2000 --experiment_name "interactive_bc" --seed 42 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --num_unified_epochs 100 
+    python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --awbc --intervention --num_rl_frames 2000 --experiment_name "hotstart_combined" --seed 42 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --num_unified_epochs 200 
     ```
 
 ---
 
 ## 3. Interactive Annotation Pipeline Ablations
 
-
 ### Exp 12: LLM Curriculum Method Comparison
-*   **Description**: Compares the three different ways to incorporate auxiliary LLM rewards. Run all three which will share the same plot to find out which curriculum method is most effective.
+*   **Description**: Compares the three different ways to incorporate auxiliary LLM rewards.
 *   **Commands**:
     ```bash
     # Method 1: Main (Direct update to primary Q-net)
-    python main.py --env LunarLander-v3 --online_rl --curriculum --curriculum_method main --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 100 
+    python main.py --env LunarLander-v3 --online_rl --intervention --curriculum --curriculum_method main --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 200 
 
-    # Method 2: Separate (Train aux agent, then main learns from its transitions)
-    python main.py --env LunarLander-v3 --online_rl --curriculum --curriculum_method separate --num_rl_frames 2000 --experiment_name "curriculum_separate" --num_unified_epochs 100 
+    # Method 2: Separate
+    python main.py --env LunarLander-v3 --online_rl --intervention --curriculum --curriculum_method separate --num_rl_frames 2000 --experiment_name "curriculum_separate" --num_unified_epochs 200 
 
-    # Method 3: KL (Train aux agent, then main agent pulled via KL-Divergence)
-    python main.py --env LunarLander-v3 --online_rl --curriculum --curriculum_method kl --num_rl_frames 2000 --experiment_name "curriculum_kl" --num_unified_epochs 100 
+    # Method 3: KL
+    python main.py --env LunarLander-v3 --online_rl --intervention --curriculum --curriculum_method kl --num_rl_frames 2000 --experiment_name "curriculum_kl" --num_unified_epochs 200 
     ```
 
 ### Exp 13: LLM SSL User gives example behavior with feature noise constraints
@@ -116,9 +115,9 @@ These experiments measure the impact of each form of override loss component on 
 *   **Commands**:
     ```bash
     # Method 1: Main (Noise added to human trajectories that have a noise map during offline-rl update)
-    python main.py --env LunarLander-v3 --online_rl --offline_rl --ssl --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 100  
+    python main.py --env LunarLander-v3 --online_rl --offline_rl --ssl --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 200  
     # Method 1: Main (Noise added to human trajectories that have a noise map during awbc update)
-    python main.py --env LunarLander-v3 --online_rl --awbc --ssl --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 100 
+    python main.py --env LunarLander-v3 --online_rl --awbc --ssl --num_rl_frames 2000 --experiment_name "curriculum_main" --num_unified_epochs 200 
     ```
 ---
 

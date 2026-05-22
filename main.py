@@ -66,7 +66,6 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
         trajectory_lite = []
         total_reward = 0
         
-        # Initial step
         trajectory_lite.append({
             "obs": obs, "action": 0, "reward": 0, "next_obs": obs,
             "frame_image": None, "terminated": False, "truncated": False, 
@@ -112,17 +111,31 @@ def hydrate_trajectory(env, seed, trajectory_lite):
     return trajectory_lite
 
 def unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristics, global_buffer_proxy):
-    """Core training loop: Decouples Loss Signals from Data Sources."""
+    """Refactored core training loop: Decouples Loss Signals from Data Sources."""
     print(f"Updating Agent (Unified Pipeline, {args.num_unified_epochs} epochs)...")
     
     for epoch in range(args.num_unified_epochs):
+        # --- 0. VALUE FUNCTION UPDATE (Independent Signal) ---
+        # Train V on both buffers to get a representative baseline
+        all_batch = []
+        if len(agent.replay_buffer) >= 16:
+            all_batch.extend(random.sample(agent.replay_buffer, 16))
+        if len(buffers['example']) >= 16:
+            # We sample transitions from the expert buffer too
+            batch_items = buffers['example'].sample(16)
+            all_batch.extend([(item['obs'], item['action'], item['reward'], item['next_obs'], item['terminated'], item['truncated']) for item in batch_items])
+            
+        if len(all_batch) >= 16:
+            metrics.start_timer("agent_updating_rl")
+            agent.update_value(all_batch)
+            metrics.stop_timer("agent_updating_rl")
+
         # --- 1. LOSS SIGNAL: TEMPORAL DIFFERENCE (RL) ---
         
         # Source: Online RL (Exploration Data)
         if args.online_rl and len(agent.replay_buffer) >= 32:
             metrics.start_timer("agent_updating_rl")
             batch = random.sample(agent.replay_buffer, 32)
-            # online_rl never uses human masks, so ssl=False
             agent.update_td(batch, ssl=False) 
             metrics.stop_timer("agent_updating_rl")
 
@@ -132,13 +145,11 @@ def unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristi
             batch_items = buffers['example'].sample(32)
             batch = [(item['obs'], item['action'], item['reward'], item['next_obs'], item['terminated'], item['truncated']) for item in batch_items]
             masks = [item.get('mask') for item in batch_items] if args.ssl else None
-            # Inject invariance if --ssl is on and masks exist
             agent.update_td(batch, ssl=args.ssl, masks=masks)
             metrics.stop_timer("agent_updating_rl")
 
         # --- 2. LOSS SIGNAL: SUPERVISED (BC) ---
 
-        # Source: Human/Expert Data
         if (args.bc or args.awbc) and len(buffers['example']) >= 32:
             metrics.start_timer("agent_updating_bc")
             batch_items = buffers['example'].sample(32)
@@ -147,13 +158,18 @@ def unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristi
             
             advantages = None
             if args.awbc:
+                # Calculate Advantage using TD Error: A = r + gamma*V(s') - V(s)
                 obs_t = torch.stack([item['obs'] for item in batch_items]).to(agent.device_name)
-                labels_t = torch.stack([item['action'] for item in batch_items]).to(agent.device_name)
+                next_obs_t = torch.stack([item['next_obs'] for item in batch_items]).to(agent.device_name)
+                rewards_t = torch.tensor([item['reward'] for item in batch_items], dtype=torch.float32).to(agent.device_name)
+                dones_t = torch.tensor([item['terminated'] or item['truncated'] for item in batch_items], dtype=torch.float32).to(agent.device_name)
+                
                 with torch.no_grad():
-                    q_values = agent.get_logits(obs_t)
-                    v_values = q_values.max(1)[0]
-                    q_selected = q_values.gather(1, labels_t.unsqueeze(1)).squeeze()
-                    advantages = F.relu(q_selected - v_values + 1.0)
+                    v_s = agent.get_value(obs_t)
+                    v_ns = agent.get_value(next_obs_t)
+                    td_error = rewards_t + (1 - dones_t) * agent.gamma * v_ns - v_s
+                    # Weight w = exp(Adv / temp). Using relu as a stable proxy.
+                    advantages = F.relu(td_error + 1.0)
             
             agent.update_supervised(batch, ssl=args.ssl, masks=masks, advantages=advantages)
             metrics.stop_timer("agent_updating_bc")
@@ -218,13 +234,13 @@ def main():
         print(f"\n=== Starting Iteration {iteration} ===")
         active_heuristics = []
         
-        # --- PHASE 1: ACQUISITION ---
+        # PHASE 1: ACQUISITION
         episodes = []
         if args.num_rl_frames > 0:
             print(f"Collecting {args.num_rl_frames} RL frames...")
             episodes = run_rl_collection(agent, env, num_frames=args.num_rl_frames, metrics=metrics, update=args.online_rl)
         
-        # --- PHASE 2: INTERACTION ---
+        # PHASE 2: INTERACTION
         annotations = []
         if args.intervention and len(episodes) > 0:
             print("Starting Human Interactive Review...")
@@ -240,7 +256,6 @@ def main():
             # Commit human frames to example buffer (Source for offline RL and BC)
             for i in range(len(corrected_trajectory) - 1):
                 s, ns = corrected_trajectory[i], corrected_trajectory[i+1]
-                # During intervention, we treat these as part of the 'human' dataset
                 buffers['example'].push(
                     s['obs'], ns['action'], reward=ns['reward'], 
                     next_obs=ns['obs'], terminated=ns['terminated'], 
@@ -261,7 +276,7 @@ def main():
                     router.commit(item, classification)
             metrics.stop_timer("llm_processing")
             
-        # --- PHASE 3: CURRICULUM ---
+        # PHASE 3: CURRICULUM
         if len(buffers['curriculum']) > 0 and args.curriculum:
             metrics.start_timer("agent_updating_local_rl")
             print(f"[Curriculum] Replaying tasks (Method: {args.curriculum_method})...")
@@ -296,10 +311,10 @@ def main():
                     metrics.log_frames(n_frames, source="curriculum")
             metrics.stop_timer("agent_updating_local_rl")
 
-        # --- PHASE 4: UNIFIED UPDATE ---
+        # PHASE 4: UNIFIED UPDATE
         unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristics, global_buffer_proxy)
 
-        # --- PHASE 5: EVALUATION ---
+        # PHASE 5: EVALUATION
         print("Evaluating Agent...")
         mean_ret, std_ret = evaluate_return(agent, env_name, num_episodes=5)
         bc_loss = calculate_cross_entropy(agent, buffers['example'], anti=False) if (args.bc or args.awbc) else None

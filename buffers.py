@@ -63,6 +63,9 @@ class LLMBuffer:
     def is_empty(self):
         return len(self.buffer) == 0
 
+    def __len__(self):
+        return len(self.buffer)
+
 class CurriculumBuffer:
     def __init__(self):
         self.tasks = collections.deque()
@@ -81,6 +84,9 @@ class CurriculumBuffer:
 
     def is_empty(self):
         return len(self.tasks) == 0
+
+    def __len__(self):
+        return len(self.tasks)
 
 class SemiSupervisedBuffer:
     """Buffer for SSL with feature masks and termination conditions."""

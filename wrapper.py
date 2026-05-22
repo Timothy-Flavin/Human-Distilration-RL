@@ -326,6 +326,8 @@ class InteractiveGymWrapper:
         self._restore_state(start_frame)
         self.mode = "verification"
         self.running = True
+
+        self._switch_timer("human_reviewing")
         
         # We need a fresh trajectory for verification to avoid polluting history
         # but we want to keep the image frames for display
@@ -341,6 +343,15 @@ class InteractiveGymWrapper:
             new_mode, self.text_buffer, submitted_note, step_dir, reset, branch_timeline, decision = process_events(
                 events, self.mode, self.text_buffer
             )
+
+            # --- Precise Timer Management ---
+            t = "human_reviewing"
+            if new_mode == "note":
+                t = "human_annotating"
+            elif new_mode in ["quit", "finish"]:
+                t = None
+            
+            self._switch_timer(t)
 
             if submitted_note:
                 rephrased_text = submitted_note
@@ -396,12 +407,27 @@ class InteractiveGymWrapper:
             self.screen = pygame.display.set_mode((width, height))
             pygame.display.set_caption("Interactive Replay Review")
 
+    def _switch_timer(self, target_timer):
+        """Source of truth for switching interaction timers."""
+        if not self.metrics: return
+        
+        current = getattr(self, "_active_timer", None)
+        if target_timer != current:
+            if current:
+                self.metrics.stop_timer(current)
+            self._active_timer = target_timer
+            if target_timer:
+                self.metrics.start_timer(target_timer)
+
     def run(self):
         self.running = True
         if not self.trajectory:
             self.reset_env()
         else:
             self.ensure_screen()
+
+        # Start with reviewing
+        self._switch_timer("human_reviewing")
 
         step_counter = 0
 
@@ -412,25 +438,17 @@ class InteractiveGymWrapper:
                 events, self.mode, self.text_buffer
             )
 
-            # Timer management
-            if self.mode in ["realtime", "agent"] and new_mode not in ["realtime", "agent"]:
-                if self.metrics: self.metrics.stop_timer("human_overriding")
-
-            if new_mode in ["realtime", "agent"] and self.mode not in ["realtime", "agent"]:
-                # Only start if we are in an override state or just branched
-                if self.override_source is not None or branch_timeline:
-                    if self.metrics: self.metrics.start_timer("human_overriding")
-
-            if new_mode == "note" and self.mode != "note" and self.metrics:
-                self.metrics.start_timer("human_annotating")
-            elif self.mode == "note" and new_mode != "note" and self.metrics:
-                self.metrics.stop_timer("human_annotating")
-
-            if new_mode == "step" and self.mode != "step" and self.metrics:
-                self.metrics.start_timer("human_reviewing")
-            elif self.mode == "step" and new_mode != "step" and self.metrics:
-                self.metrics.stop_timer("human_reviewing")
-
+            # --- Precise Timer Management ---
+            t = "human_reviewing"
+            if new_mode == "realtime":
+                t = "human_overriding"
+            elif new_mode == "note":
+                t = "human_annotating"
+            elif new_mode in ["quit", "finish"]:
+                t = None
+            
+            self._switch_timer(t)
+            
             self.mode = new_mode
             if self.mode in ["quit", "finish"]:
                 self.running = False
