@@ -27,7 +27,7 @@ class InteractiveGymWrapper:
 
         # Data Buffers & Seed State
         self.trajectory = initial_trajectory if initial_trajectory is not None else []
-        # Ensure initial trajectory has sources
+        # Ensure initial trajectory has sources and correct keys
         for step in self.trajectory:
             if "source" not in step: step["source"] = "rl"
 
@@ -69,26 +69,21 @@ class InteractiveGymWrapper:
                 "readable_summary": f"Pos:({obs[0]:.2f}, {obs[1]:.2f}), Vel:({obs[2]:.2f}, {obs[3]:.2f}), Angle:{obs[4]:.2f}"
             }
         elif "highway" in self.env_name:
-            # Kinematics observation: V x F matrix
-            # Default is 5 vehicles x 5 features: [presence, x, y, vx, vy]
             if isinstance(obs, np.ndarray):
-                ego = obs[0]
+                ego = obs[0] if len(obs.shape) > 1 else obs[:5]
                 summary = f"Ego - Pos:({ego[1]:.2f}, {ego[2]:.2f}), Vel:({ego[3]:.2f}, {ego[4]:.2f})"
                 formatted = {"readable_summary": summary}
-                for i in range(len(obs)):
-                    v = obs[i]
-                    formatted[f"vehicle_{i}"] = {
-                        "presence": bool(v[0] > 0.5),
-                        "x": float(v[1]),
-                        "y": float(v[2]),
-                        "vx": float(v[3]),
-                        "vy": float(v[4])
-                    }
+                if len(obs.shape) > 1:
+                    for i in range(len(obs)):
+                        v = obs[i]
+                        formatted[f"vehicle_{i}"] = {
+                            "presence": bool(v[0] > 0.5), "x": float(v[1]), "y": float(v[2]),
+                            "vx": float(v[3]), "vy": float(v[4])
+                        }
                 return formatted
         return str(obs)
 
     def reset_env(self):
-        # 1. Generate and save a deterministic seed for this episode
         if self.current_seed is None:
             self.current_seed = np.random.randint(0, 1000000)
 
@@ -96,418 +91,224 @@ class InteractiveGymWrapper:
 
         self.trajectory = []
         self.notes = []
-        self.current_frame_idx = -1
+        self.current_frame_idx = 0
         self.current_obs = obs
-        self._record_step(obs, 0, 0, False, False, info, source="rl")
-
-    def _record_step(self, obs, action, reward, terminated, truncated, info, source="rl"):
+        
+        # Initial step
         frame = self.env.render()
-        if frame is None and self.trajectory:
-            # Try to inherit frame if render fails (e.g. during fast stepping)
-            frame = self.trajectory[-1].get("frame_image")
-
-        # Attempt to capture internal state for O(1) branching
-        try:
-            env_state = self.env.unwrapped.get_state()
-        except AttributeError:
-            env_state = None  
-
-        # Initialize Pygame surface on the first render
-        if self.screen is None and frame is not None:
-            height, width, _ = frame.shape
-            self.screen = pygame.display.set_mode((width, height))
-            pygame.display.set_caption("Interactive Replay Review")
-
-        step_data = {
-            "obs": obs,
-            "action": action,
-            "reward": reward,
-            "frame_image": frame,
-            "env_state": env_state,
-            "terminated": terminated,
-            "truncated": truncated,
-            "source": source
-        }
-        self.trajectory.append(step_data)
-        self.current_frame_idx += 1
+        self.trajectory.append({
+            "obs": obs, "action": 0, "reward": 0.0, "next_obs": obs,
+            "frame_image": frame, 
+            "env_state": self.env.unwrapped.get_state() if hasattr(self.env.unwrapped, 'get_state') else None,
+            "terminated": False, "truncated": False, "source": "rl"
+        })
 
     def _verify_observations(self, obs1, obs2, atol=1e-5):
-        """Recursively checks if two observations match."""
         try:
             if isinstance(obs1, dict):
-                if obs1.keys() != obs2.keys():
-                    return False
+                if obs1.keys() != obs2.keys(): return False
                 return all(self._verify_observations(obs1[k], obs2[k], atol) for k in obs1)
             elif isinstance(obs1, (tuple, list)):
-                if len(obs1) != len(obs2):
-                    return False
+                if len(obs1) != len(obs2): return False
                 return all(self._verify_observations(o1, o2, atol) for o1, o2 in zip(obs1, obs2))
             elif isinstance(obs1, np.ndarray) or isinstance(obs2, np.ndarray):
                 return np.allclose(obs1, obs2, atol=atol)
-            else:
-                return obs1 == obs2
-        except Exception:
-            return False
+            else: return obs1 == obs2
+        except Exception: return False
 
     def _restore_state(self, target_frame_idx):
-        """Restores environment state to target_frame_idx."""
         if target_frame_idx < 0: return
-
-        # 1. Try O(1) state restoration first
         saved_state = self.trajectory[target_frame_idx].get("env_state")
         state_restored = False
-
         if saved_state is not None:
             try:
                 self.env.unwrapped.set_state(saved_state)
                 state_restored = True
-                print("[Timeline] O(1) State restoration successful.")
-            except AttributeError:
-                pass 
+            except AttributeError: pass 
 
-        # 2. Fallback to O(N) Deterministic Replay
         if not state_restored:
-            print(f"[Timeline] Triggering O(N) Deterministic Replay to frame {target_frame_idx}...")
             self.env.reset(seed=self.current_seed)
-            for i in range(1, target_frame_idx + 1):
-                past_action = self.trajectory[i]["action"]
-                self.env.step(past_action)
-            print("✅ [Timeline] Fast-forward complete.")
+            # Replay actions. Note: trajectory[i] has action taken in obs_i.
+            # So to get to state at target_frame_idx, we take actions from 0 up to target-1
+            for i in range(0, target_frame_idx):
+                self.env.step(self.trajectory[i]["action"])
 
     def _branch_timeline(self, source):
-        """Prepares for branching by saving the future trajectory."""
-        print(f"\n[Timeline] Preparing to branch at frame {self.current_frame_idx} (Source: {source})...")
-
+        print(f"\n[Timeline] Branching at frame {self.current_frame_idx} (Source: {source})...")
         self.override_start_frame = self.current_frame_idx
         self.override_source = source
-
-        # Save the future as discarded
         self.discarded_trajectory = self.trajectory[self.current_frame_idx + 1:]
-
-        # Truncate trajectory
         self.trajectory = self.trajectory[:self.current_frame_idx + 1]
         self.notes = [n for n in self.notes if n["frame"] <= self.current_frame_idx]
-
-        # Ensure env matches current_frame_idx
         self._restore_state(self.current_frame_idx)
 
     def _handle_decision(self, decision):
-        """Processes Accept/Reject decision for an override."""
         if decision == "accept":
             print(f"✅ [Override] Accepted {self.override_source} segment.")
             if self.buffers:
-                # 1. Push up to 100 steps of the rejected segment to anti-example buffer.
-                max_anti_frames = 100
-                # Correct BC Pairing: obs_t -> action_t
-                for step in self.discarded_trajectory[:max_anti_frames]:
-                    # The discarded step contains the observation and the action that was taken IN that observation
-                    self.buffers['anti_example'].push(step['obs'], step['action'])
+                for step in self.discarded_trajectory[:100]:
+                    if step.get('next_obs') is not None:
+                        self.buffers['anti_example'].push(step['obs'], step['action'])
 
-                # 2. Push human segment to example buffer (ONLY if source was realtime)
                 if self.override_source == "realtime":
-                    new_part = self.trajectory[self.override_start_frame + 1:]
+                    # Correct Causal pairing: obs_t -> action_t
+                    # The frames from override_start_frame to end are the new behavior.
+                    new_part = self.trajectory[self.override_start_frame:]
                     for step in new_part:
-                        # The step already correctly contains the state it was in and the action chosen
-                        self.buffers['example'].push(step['obs'], step['action'])
-
+                        if step.get('next_obs') is not None:
+                            self.buffers['example'].push(
+                                step['obs'], step['action'], reward=step['reward'],
+                                next_obs=step['next_obs'], terminated=step['terminated'],
+                                truncated=step['truncated']
+                            )
             self.discarded_trajectory = []
-
         elif decision == "reject":
-            print("❌ [Override] Rejected. Rolling back to branching point...")
-            # Restore trajectory to original state before override
+            print("❌ [Override] Rejected.")
             self.trajectory = self.trajectory[:self.override_start_frame + 1] + self.discarded_trajectory
             self.discarded_trajectory = []
-
-            # Reset current frame to the branching point
             self.current_frame_idx = self.override_start_frame
             self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
-
-            # Restore env state to the branching point
             self._restore_state(self.current_frame_idx)
-
         self.override_source = None
 
     def step_forward(self, action, source="rl"):
-        """Advances the environment if at the end of the buffer, or steps forward in history."""
         if self.current_frame_idx < len(self.trajectory) - 1:
             self.current_frame_idx += 1
             self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
             return
 
-        # Prevent stepping the environment if the episode is already over
-        if self.trajectory and (self.trajectory[-1]["terminated"] or self.trajectory[-1]["truncated"]):
+        if self.trajectory[-1]["terminated"] or self.trajectory[-1]["truncated"]:
             return
 
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        print(f"action {action} obs: {obs}")
+        # Current state before action
+        s_t = self.current_obs
+        
+        # Update the action in the current step (which was previously 0/NOOP or agent chosen)
+        self.trajectory[self.current_frame_idx]["action"] = action
+        self.trajectory[self.current_frame_idx]["source"] = source
+        
+        next_obs, reward, terminated, truncated, info = self.env.step(action)
+        frame = self.env.render()
+        
+        # Update current step's next_obs
+        self.trajectory[self.current_frame_idx]["next_obs"] = next_obs
+        self.trajectory[self.current_frame_idx]["reward"] = reward
+        self.trajectory[self.current_frame_idx]["terminated"] = terminated
+        self.trajectory[self.current_frame_idx]["truncated"] = truncated
 
-        self._record_step(obs, action, reward, terminated, truncated, info, source=source)
-        self.current_obs = obs
+        # Create NEW step for next_obs
+        step_data = {
+            "obs": next_obs, "action": 0, "reward": 0.0, "next_obs": None,
+            "frame_image": frame, 
+            "env_state": self.env.unwrapped.get_state() if hasattr(self.env.unwrapped, 'get_state') else None,
+            "terminated": False, "truncated": False, "source": source
+        }
+        self.trajectory.append(step_data)
+        self.current_frame_idx += 1
+        self.current_obs = next_obs
 
         if terminated or truncated:
-            # Only trigger a decision if we actively branched the timeline
-            if self.override_source is not None:
-                self.mode = "decision"
+            self.trajectory[-1]["terminated"] = terminated
+            self.trajectory[-1]["truncated"] = truncated
+            if self.override_source is not None: self.mode = "decision"
 
     def step_backward(self):
-        """Steps backward through the saved trajectory history."""
         if self.current_frame_idx > 0:
             self.current_frame_idx -= 1
             self.current_obs = self.trajectory[self.current_frame_idx]["obs"]
 
-    def draw_overlay(self, verification_phrase=None):
-        """Draws UI elements (mode, frame index, text buffer, existing notes)."""
-        if self.screen is None or not self.trajectory:
-            return
+    def _switch_timer(self, target_timer):
+        if not self.metrics: return
+        current = getattr(self, "_active_timer", None)
+        if target_timer != current:
+            if current: self.metrics.stop_timer(current)
+            self._active_timer = target_timer
+            if target_timer: self.metrics.start_timer(target_timer)
 
+    def draw_overlay(self, verification_phrase=None):
+        if self.screen is None or not self.trajectory: return
         frame = self.trajectory[self.current_frame_idx].get("frame_image")
         if frame is not None:
             surf = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
             self.screen.blit(surf, (0, 0))
         else:
             self.screen.fill((50, 50, 50))
-            msg = self.font.render("No Image Frame Saved", True, (255, 255, 255))
-            self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2))
-
-        # Mode display
         color = (255, 255, 0)
         if self.mode == "decision": color = (255, 0, 0)
         elif self.mode == "realtime": color = (0, 255, 0)
-        elif self.mode == "agent": color = (0, 255, 255)
-        elif self.mode == "verification": color = (255, 100, 255)
-
         mode_surf = self.font.render(f"MODE: {self.mode.upper()}", True, color)
         self.screen.blit(mode_surf, (10, 10))
-
-        frame_surf = self.small_font.render(
-            f"Frame: {self.current_frame_idx}/{len(self.trajectory)-1}", 
-            True, (200, 200, 200)
-        )
-        self.screen.blit(frame_surf, (10, 40))
-
-        source = self.trajectory[self.current_frame_idx].get("source", "rl")
-        source_surf = self.small_font.render(f"SOURCE: {source.upper()}", True, (200, 200, 200))
-        self.screen.blit(source_surf, (10, 60))
-
-        if verification_phrase:
-            msg = self.small_font.render(f"HEURISTIC: {verification_phrase}", True, (255, 255, 255))
-            self.screen.blit(msg, (10, 90))
-
-        if self.mode == "note":
-            bg_rect = pygame.Rect(0, self.screen.get_height() - 50, self.screen.get_width(), 50)
-            pygame.draw.rect(self.screen, (0, 0, 0), bg_rect)
-            note_surf = self.font.render(f"> {self.text_buffer}_", True, (0, 255, 0))
-            self.screen.blit(note_surf, (10, self.screen.get_height() - 40))
-
-        if self.mode == "decision" or (self.mode == "step" and verification_phrase and self.current_frame_idx == len(self.trajectory) - 1):
-            overlay = pygame.Surface((self.screen.get_width(), 120))
-            overlay.set_alpha(180)
-            overlay.fill((0, 0, 0))
-            self.screen.blit(overlay, (0, self.screen.get_height() // 2 - 60))
-            
-            if verification_phrase:
-                msg = self.font.render(f"[A]ccept Heuristic, [R]eject, or [P]rephrase?", True, (255, 255, 255))
-            else:
-                source_name = self.override_source.title() if self.override_source else "Changes"
-                msg = self.font.render(f"[A]ccept {source_name} or [R]eject?", True, (255, 255, 255))
-
-            self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2 - 20))
-        
-        current_note = next((n["text"] for n in self.notes if n["frame"] == self.current_frame_idx), None)
-        if current_note:
-            note_display = self.small_font.render(f"NOTE: {current_note}", True, (255, 100, 100))
-            self.screen.blit(note_display, (10, 80))
-
         pygame.display.flip()
 
     def run_verification(self, start_frame, action, termination_rule, phrase):
-        """Plays back a heuristic and waits for user decision."""
-        print(f"\n[Verification] Starting playback for: '{phrase}'")
+        print(f"\n[Verification] Playback: '{phrase}'")
         self._restore_state(start_frame)
-        self.mode = "verification"
-        self.running = True
-
+        self.mode = "verification"; self.running = True
         self._switch_timer("human_reviewing")
-        
-        # We need a fresh trajectory for verification to avoid polluting history
-        # but we want to keep the image frames for display
         verification_obs = self.trajectory[start_frame]["obs"]
-        
-        timeout_frames = 100
-        frames_run = 0
-        final_decision = None
-        rephrased_text = None
+        timeout_frames = 100; frames_run = 0; final_decision = None; rephrased_text = None
 
         while self.running:
             events = pygame.event.get()
-            new_mode, self.text_buffer, submitted_note, step_dir, reset, branch_timeline, decision = process_events(
-                events, self.mode, self.text_buffer
-            )
-
-            # --- Precise Timer Management ---
-            t = "human_reviewing"
-            if new_mode == "note":
-                t = "human_annotating"
-            elif new_mode in ["quit", "finish"]:
-                t = None
-            
-            self._switch_timer(t)
-
-            if submitted_note:
-                rephrased_text = submitted_note
-                final_decision = "rephrase"
-                self.running = False
-                break
-
-            if decision:
-                final_decision = decision
-                self.running = False
-                break
-
-            self.mode = new_mode
-            if self.mode == "quit":
-                self.running = False
-                break
-
+            new_mode, self.text_buffer, submitted_note, step_dir, reset, branch_timeline, decision = process_events(events, self.mode, self.text_buffer)
+            self._switch_timer("human_annotating" if new_mode == "note" else "human_reviewing")
+            if submitted_note: rephrased_text = submitted_note; final_decision = "rephrase"; break
+            if decision: final_decision = decision; break
+            if new_mode == "quit": break
             if self.mode == "verification":
-                # Check termination or timeout
                 if not termination_rule(verification_obs) and frames_run < timeout_frames:
                     obs, reward, term, trunc, info = self.env.step(action)
-                    verification_obs = obs
-                    frame = self.env.render()
-                    
-                    # Add to trajectory for drawing
-                    self.trajectory.append({
-                        "obs": obs,
-                        "frame_image": frame,
-                        "source": "heuristic"
-                    })
-                    self.current_frame_idx = len(self.trajectory) - 1
-                    frames_run += 1
-                else:
-                    print(f"[Verification] Termination condition met or timeout reached at frame {frames_run}.")
-                    self.mode = "decision"
-
-            self.draw_overlay(verification_phrase=phrase)
-            self.clock.tick(self.fps)
-
+                    verification_obs = obs; frame = self.env.render()
+                    self.trajectory.append({"obs": obs, "frame_image": frame, "source": "heuristic"})
+                    self.current_frame_idx = len(self.trajectory) - 1; frames_run += 1
+                else: self.mode = "decision"
+            self.draw_overlay(verification_phrase=phrase); self.clock.tick(self.fps)
         return final_decision, rephrased_text
 
     def ensure_screen(self):
-        """Ensures the Pygame screen is initialized."""
-        if self.screen is not None:
-            return
-
+        if self.screen is not None: return
         frame = self.env.render()
-        if frame is None and self.trajectory:
-            frame = self.trajectory[0].get("frame_image")
-
+        if frame is None and self.trajectory: frame = self.trajectory[0].get("frame_image")
         if frame is not None:
-            height, width, _ = frame.shape
-            self.screen = pygame.display.set_mode((width, height))
-            pygame.display.set_caption("Interactive Replay Review")
-
-    def _switch_timer(self, target_timer):
-        """Source of truth for switching interaction timers."""
-        if not self.metrics: return
-        
-        current = getattr(self, "_active_timer", None)
-        if target_timer != current:
-            if current:
-                self.metrics.stop_timer(current)
-            self._active_timer = target_timer
-            if target_timer:
-                self.metrics.start_timer(target_timer)
+            h, w, _ = frame.shape
+            self.screen = pygame.display.set_mode((w, h))
 
     def run(self):
         self.running = True
-        if not self.trajectory:
-            self.reset_env()
-        else:
-            self.ensure_screen()
-
-        # Start with reviewing
+        if not self.trajectory: self.reset_env()
+        else: self.ensure_screen()
         self._switch_timer("human_reviewing")
-
         step_counter = 0
-
         while self.running:
             events = pygame.event.get()
-
-            new_mode, self.text_buffer, submitted_note, step_dir, reset, branch_timeline, decision = process_events(
-                events, self.mode, self.text_buffer
-            )
-
-            # --- Precise Timer Management ---
+            new_mode, self.text_buffer, submitted_note, step_dir, reset, branch_timeline, decision = process_events(events, self.mode, self.text_buffer)
             t = "human_reviewing"
-            if new_mode == "realtime":
-                t = "human_overriding"
-            elif new_mode == "note":
-                t = "human_annotating"
-            elif new_mode in ["quit", "finish"]:
-                t = None
-            
+            if new_mode == "realtime": t = "human_overriding"
+            elif new_mode == "note": t = "human_annotating"
+            elif new_mode in ["quit", "finish"]: t = None
             self._switch_timer(t)
-            
             self.mode = new_mode
-            if self.mode in ["quit", "finish"]:
-                self.running = False
-                break
-
-            # Timeline Branch Check
-            if branch_timeline:
-                self._branch_timeline(source=self.mode)
-
-            if decision:
-                self._handle_decision(decision)
-
-            if reset:
-                self.reset_env()
-
+            if self.mode in ["quit", "finish"]: break
+            if branch_timeline: self._branch_timeline(source=self.mode)
+            if decision: self._handle_decision(decision)
+            if reset: self.reset_env()
             if submitted_note:
-                note_data = {
-                    "frame": self.current_frame_idx,
-                    "text": submitted_note,
-                    "obs_context": self._format_obs(self.trajectory[self.current_frame_idx]["obs"])
-                }
+                note_data = {"frame": self.current_frame_idx, "text": submitted_note, "obs_context": self._format_obs(self.trajectory[self.current_frame_idx]["obs"])}
                 self.notes.append(note_data)
-                if self.buffers:
-                    self.buffers['llm'].push(
-                        episode_trajectory=self.trajectory,
-                        seed=self.current_seed,
-                        note_text=submitted_note,
-                        note_frame_idx=self.current_frame_idx,
-                        current_obs_dict=note_data["obs_context"]
-                    )
-
+                if self.buffers: self.buffers['llm'].push(self.trajectory, self.current_seed, submitted_note, self.current_frame_idx, note_data["obs_context"])
             if self.mode == "step":
                 if step_dir != 0:
                     step_counter += 1
-                    if step_dir == 1:
-                        self.step_forward(action=0, source="rl")
-                    elif step_dir == -1:
-                        self.step_backward()
-                else:
-                    step_counter = 0
-
+                    if step_dir == 1: self.step_forward(action=0, source="rl")
+                    elif step_dir == -1: self.step_backward()
+                else: step_counter = 0
             elif self.mode == "realtime":
-                keys = pygame.key.get_pressed()
-                action = get_realtime_action(keys, env_name=self.env_name)
+                action = get_realtime_action(pygame.key.get_pressed(), env_name=self.env_name)
                 self.step_forward(action, source="human")
-                if self.metrics: 
-                    self.metrics.log_frames(1, source="human")
-
+                if self.metrics: self.metrics.log_frames(1, source="human")
             elif self.mode == "agent":
-                if self.agent is not None:
-                    # Note: We must use the current_obs from history or live env
-                    action = self.agent.predict(self.current_obs) 
-                else:
-                    action = self.env.action_space.sample()
+                action = self.agent.predict(self.current_obs) if self.agent else self.env.action_space.sample()
                 self.step_forward(action, source="rl")
-                if self.metrics: 
-                    self.metrics.log_frames(1, source="rl")
-            #print(self.current_obs)
-            self.draw_overlay()
-            self.clock.tick(self.fps)
-
+                if self.metrics: self.metrics.log_frames(1, source="rl")
+            self.draw_overlay(); self.clock.tick(self.fps)
         return self.trajectory, self.notes, self.current_seed

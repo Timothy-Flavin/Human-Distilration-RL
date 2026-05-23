@@ -16,6 +16,7 @@ class MetricsLogger:
             "agent_updating_local_rl": 0.0,
             "agent_updating_ssl": 0.0,
             "agent_updating_rl": 0.0,
+            "agent_updating_value": 0.0,
             "expert_preload_effort": 0.0,
         }
         

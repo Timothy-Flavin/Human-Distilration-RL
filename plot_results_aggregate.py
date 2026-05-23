@@ -82,7 +82,9 @@ def aggregate_and_plot(experiment_dir, output_dir):
                 # Score
                 eval_last = d["evaluations"][-1]
                 seed_scores.append(eval_last["return_mean"])
-                seed_likeness.append(eval_last.get("bc_loss", 0))
+                # Handle None in bc_loss
+                bcl = eval_last.get("bc_loss", 0.0)
+                seed_likeness.append(bcl if bcl is not None else 0.0)
         
         all_seeds_interactions.append(seed_interactions)
         all_seeds_wallclock.append(seed_wallclock)

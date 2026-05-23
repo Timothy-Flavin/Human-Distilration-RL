@@ -79,11 +79,6 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
             # Store in agent's internal buffer for Online RL (exploration source)
             agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
             
-            if update:
-                metrics.start_timer("agent_updating_rl")
-                agent.update_td([(obs, action, reward, next_obs, terminated, truncated)])
-                metrics.stop_timer("agent_updating_rl")
-            
             trajectory_lite.append({
                 "obs": obs, "action": action, "reward": reward, "next_obs": next_obs,
                 "frame_image": None, "terminated": terminated, "truncated": truncated, 
@@ -115,20 +110,19 @@ def unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristi
     print(f"Updating Agent (Unified Pipeline, {args.num_unified_epochs} epochs)...")
     
     for epoch in range(args.num_unified_epochs):
-        # --- 0. VALUE FUNCTION UPDATE (Independent Signal) ---
-        # Train V on both buffers to get a representative baseline
-        all_batch = []
-        if len(agent.replay_buffer) >= 16:
-            all_batch.extend(random.sample(agent.replay_buffer, 16))
-        if len(buffers['example']) >= 16:
-            # We sample transitions from the expert buffer too
-            batch_items = buffers['example'].sample(16)
-            all_batch.extend([(item['obs'], item['action'], item['reward'], item['next_obs'], item['terminated'], item['truncated']) for item in batch_items])
-            
-        if len(all_batch) >= 16:
-            metrics.start_timer("agent_updating_rl")
-            agent.update_value(all_batch)
-            metrics.stop_timer("agent_updating_rl")
+        # --- 0. VALUE FUNCTION UPDATE (Independent Signal for AWBC) ---
+        if args.awbc:
+            all_batch = []
+            if len(agent.replay_buffer) >= 16:
+                all_batch.extend(random.sample(agent.replay_buffer, 16))
+            if len(buffers['example']) >= 16:
+                batch_items = buffers['example'].sample(16)
+                all_batch.extend([(item['obs'], item['action'], item['reward'], item['next_obs'], item['terminated'], item['truncated']) for item in batch_items])
+                
+            if len(all_batch) >= 16:
+                metrics.start_timer("agent_updating_value")
+                agent.update_value(all_batch)
+                metrics.stop_timer("agent_updating_value")
 
         # --- 1. LOSS SIGNAL: TEMPORAL DIFFERENCE (RL) ---
         
@@ -314,11 +308,13 @@ def main():
         # PHASE 4: UNIFIED UPDATE
         unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristics, global_buffer_proxy)
 
-        # PHASE 5: EVALUATION
+        # --- PHASE 5: EVALUATION ---
         print("Evaluating Agent...")
         mean_ret, std_ret = evaluate_return(agent, env_name, num_episodes=5)
-        bc_loss = calculate_cross_entropy(agent, buffers['example'], anti=False) if (args.bc or args.awbc) else None
+        # Always calculate BC loss for Human Likeness tracking if buffer is not empty
+        bc_loss = calculate_cross_entropy(agent, buffers['example'], anti=False) if len(buffers['example']) > 0 else 0.0
         metrics.log_evaluation(iteration, mean_ret, std_ret, bc_loss)
+
         metrics.log_iteration()
         metrics.save_to_json(os.path.join(results_base_dir, "metrics_latest.json"))
         metrics.save_to_json(os.path.join(results_base_dir, f"metrics_{iteration}.json"))
