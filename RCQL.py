@@ -160,17 +160,27 @@ class RCQLAgent(Agent):
         pass
 
     def _prepare_batch(self, batch_episodes, seq_len=32):
-        """Prepares sequences ensuring s_{t} and s_{t+1} are conditioned on identical history."""
+        """Samples sequences of length seq_len from anywhere in the episode."""
         obs_seqs, action_seqs, reward_seqs, done_seqs = [], [], [], []
         
         for ep in batch_episodes:
             transitions = ep['transitions']
-            actual_len = min(len(transitions), seq_len)
-            sub_seq = transitions[:actual_len]
+            L = len(transitions)
             
-            # Recurrence needs s_0, s_1, ..., s_T, AND s_{T+1} for target
+            if L <= seq_len:
+                start_idx = 0
+                actual_len = L
+            else:
+                # Random window sampling
+                start_idx = random.randint(0, L - seq_len)
+                actual_len = seq_len
+                
+            sub_seq = transitions[start_idx : start_idx + actual_len]
+            
+            # obs includes s_t ... s_{t+actual_len}
             obs = [t['obs'] for t in sub_seq]
-            obs.append(sub_seq[-1]['next_obs']) # The 'next' observation of the last transition
+            # s_{t+actual_len+1} is the next_obs of the last transition in window
+            obs.append(sub_seq[-1]['next_obs'])
             
             actions = [t['action'] for t in sub_seq]
             rewards = [t['reward'] for t in sub_seq]
@@ -181,7 +191,7 @@ class RCQLAgent(Agent):
                 obs += [np.zeros_like(obs[0])] * pad_len
                 actions += [0] * pad_len
                 rewards += [0.0] * pad_len
-                dones += [1.0] * pad_len # Pad with done=1 to avoid garbage propagation
+                dones += [1.0] * pad_len
                 
             obs_seqs.append(obs)
             action_seqs.append(actions)
@@ -194,6 +204,7 @@ class RCQLAgent(Agent):
         done_tensor = torch.tensor(np.array(done_seqs), dtype=torch.float32).to(self.device_name)
         
         return obs_tensor, action_tensor, reward_tensor, done_tensor
+
 
     def update_value(self, batch_episodes) -> dict:
         joint_obs, _, rewards, dones = self._prepare_batch(batch_episodes)

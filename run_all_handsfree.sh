@@ -5,9 +5,9 @@
 
 VENV_PATH="/opt/pytorch-build/venv/bin/activate"
 source $VENV_PATH
-
-ENV="LunarLander-v3"
-EXPERT_DATA="expert_demonstrations_LunarLander-v3.pkl"
+#"LunarLander-v3"
+ENV="highway-v0"
+EXPERT_DATA="expert_demonstrations_highway-v0.pkl"
 SEEDS=(42 43 44 45 46)
 
 # 1. Static Baselines (Offline-only)
