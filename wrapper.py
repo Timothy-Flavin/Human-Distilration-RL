@@ -6,6 +6,8 @@ from input_handler import process_events, get_realtime_action
 class InteractiveGymWrapper:
     def __init__(self, env: gym.Env, agent=None, fps=30, buffers=None, metrics=None, initial_trajectory=None, initial_seed=None, env_name="LunarLander-v3"):
         self.env = env
+        if env_name == "highway":
+            env_name = "highway-v0"
         self.env_name = env_name
         self.agent = agent
         self.fps = fps
@@ -81,13 +83,23 @@ class InteractiveGymWrapper:
                             "vx": float(v[3]), "vy": float(v[4])
                         }
                 return formatted
+        elif "football" in self.env_name or "gfootball" in self.env_name:
+            if isinstance(obs, np.ndarray):
+                return {
+                    "readable_summary": f"Football State (dim: {obs.shape})",
+                    "raw_vector": obs.tolist()
+                }
         return str(obs)
 
     def reset_env(self):
         if self.current_seed is None:
             self.current_seed = np.random.randint(0, 1000000)
 
-        obs, info = self.env.reset(seed=self.current_seed)
+        res = self.env.reset(seed=self.current_seed)
+        if isinstance(res, tuple):
+            obs, info = res
+        else:
+            obs, info = res, {}
 
         self.trajectory = []
         self.notes = []
@@ -96,10 +108,16 @@ class InteractiveGymWrapper:
         
         # Initial step
         frame = self.env.render()
+        
+        # Check for get_state
+        env_state = None
+        if hasattr(self.env, 'get_state'): env_state = self.env.get_state()
+        elif hasattr(self.env.unwrapped, 'get_state'): env_state = self.env.unwrapped.get_state()
+
         self.trajectory.append({
             "obs": obs, "action": 0, "reward": 0.0, "next_obs": obs,
             "frame_image": frame, 
-            "env_state": self.env.unwrapped.get_state() if hasattr(self.env.unwrapped, 'get_state') else None,
+            "env_state": env_state,
             "terminated": False, "truncated": False, "source": "rl"
         })
 
@@ -112,6 +130,8 @@ class InteractiveGymWrapper:
                 if len(obs1) != len(obs2): return False
                 return all(self._verify_observations(o1, o2, atol) for o1, o2 in zip(obs1, obs2))
             elif isinstance(obs1, np.ndarray) or isinstance(obs2, np.ndarray):
+                # Ensure they have same shape before np.allclose
+                if np.array(obs1).shape != np.array(obs2).shape: return False
                 return np.allclose(obs1, obs2, atol=atol)
             else: return obs1 == obs2
         except Exception: return False
@@ -122,9 +142,13 @@ class InteractiveGymWrapper:
         state_restored = False
         if saved_state is not None:
             try:
-                self.env.unwrapped.set_state(saved_state)
-                state_restored = True
-            except AttributeError: pass 
+                if hasattr(self.env, 'set_state'):
+                    self.env.set_state(saved_state)
+                    state_restored = True
+                elif hasattr(self.env.unwrapped, 'set_state'):
+                    self.env.unwrapped.set_state(saved_state)
+                    state_restored = True
+            except Exception: pass 
 
         if not state_restored:
             self.env.reset(seed=self.current_seed)
@@ -187,7 +211,13 @@ class InteractiveGymWrapper:
         self.trajectory[self.current_frame_idx]["action"] = action
         self.trajectory[self.current_frame_idx]["source"] = source
         
-        next_obs, reward, terminated, truncated, info = self.env.step(action)
+        res = self.env.step(action)
+        if len(res) == 5:
+            next_obs, reward, terminated, truncated, info = res
+        else:
+            next_obs, reward, terminated, info = res
+            truncated = False
+
         frame = self.env.render()
         
         # Update current step's next_obs
@@ -196,11 +226,16 @@ class InteractiveGymWrapper:
         self.trajectory[self.current_frame_idx]["terminated"] = terminated
         self.trajectory[self.current_frame_idx]["truncated"] = truncated
 
+        # Check for get_state
+        env_state = None
+        if hasattr(self.env, 'get_state'): env_state = self.env.get_state()
+        elif hasattr(self.env.unwrapped, 'get_state'): env_state = self.env.unwrapped.get_state()
+
         # Create NEW step for next_obs
         step_data = {
             "obs": next_obs, "action": 0, "reward": 0.0, "next_obs": None,
             "frame_image": frame, 
-            "env_state": self.env.unwrapped.get_state() if hasattr(self.env.unwrapped, 'get_state') else None,
+            "env_state": env_state,
             "terminated": False, "truncated": False, "source": source
         }
         self.trajectory.append(step_data)

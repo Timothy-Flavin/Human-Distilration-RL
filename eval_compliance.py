@@ -8,9 +8,13 @@ from PPO import PPOAgent
 from compliance_metrics import get_compliance_score
 
 def evaluate_model_compliance(agent, env_name, num_episodes=10):
-    env = gym.make(env_name)
+    if env_name == "highway":
+        env_name = "highway-v0"
     if "highway" in env_name:
         import highway_env
+
+    env = gym.make(env_name)
+    if "highway" in env_name:
         env = gym.wrappers.FlattenObservation(env)
     
     compliance_scores = []
@@ -44,9 +48,14 @@ def main():
     args = parser.parse_args()
 
     # Initialize Agent
-    env = gym.make(args.env)
-    if "highway" in args.env:
+    env_name = args.env
+    if env_name == "highway":
+        env_name = "highway-v0"
+    if "highway" in env_name:
         import highway_env
+        
+    env = gym.make(env_name)
+    if "highway" in env_name:
         env = gym.wrappers.FlattenObservation(env)
         
     obs_dim = env.observation_space.shape[0]

@@ -105,4 +105,28 @@ def get_realtime_action(keys, env_name="LunarLander-v3"):
         elif keys[pygame.K_DOWN] or keys[pygame.K_s]:
             return 4
         return 1 # IDLE
+    elif "football" in env_name or "gfootball" in env_name:
+        # Movement (0: idle, 1: left, 2: TL, 3: T, 4: TR, 5: R, 6: BR, 7: B, 8: BL)
+        left = keys[pygame.K_LEFT] or keys[pygame.K_a]
+        right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
+        up = keys[pygame.K_UP] or keys[pygame.K_w]
+        down = keys[pygame.K_DOWN] or keys[pygame.K_s]
+
+        if left and up: return 2
+        if left and down: return 8
+        if right and up: return 4
+        if right and down: return 6
+        if left: return 1
+        if right: return 5
+        if up: return 3
+        if down: return 7
+
+        # Action Set (Standard)
+        if keys[pygame.K_k]: return 11 # Short Pass
+        if keys[pygame.K_j]: return 9  # Long Pass
+        if keys[pygame.K_l]: return 12 # Shot
+        if keys[pygame.K_i]: return 10 # High Pass
+        if keys[pygame.K_LSHIFT]: return 13 # Sprint
+        if keys[pygame.K_SPACE]: return 17 # Dribble
+        return 0
     return 0

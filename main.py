@@ -185,17 +185,95 @@ def main():
     global args
     # 1. Setup Environment
     env_name = args.env
+    if env_name == "highway":
+        env_name = "highway-v0"
+    elif env_name == "football":
+        env_name = "gfootball"
+
     hparam_str = f"{args.algo}_on{int(args.online_rl)}_off{int(args.offline_rl)}_bc{int(args.bc)}_aw{int(args.awbc)}_ssl{int(args.ssl)}_seed{args.seed}"
     results_base_dir = os.path.join("results", env_name, args.experiment_name, hparam_str)
     os.makedirs(results_base_dir, exist_ok=True)
 
-    env = gym.make(env_name, render_mode="rgb_array")
     if "highway" in env_name:
         import highway_env
-        env = gym.wrappers.FlattenObservation(env)
+    elif "football" in env_name or "gfootball" in env_name:
+        import gfootball
 
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+    if "football" in env_name or "gfootball" in env_name:
+        from dizoo.gfootball.envs.gfootball_env import GfootballEnv
+        from easydict import EasyDict
+        import gfootball.env as football_env
+
+        class CustomGfootballEnv(GfootballEnv):
+            def _launch_env(self, gui=False):
+                self._env = football_env.create_environment(
+                    env_name=self._cfg.env_name,
+                    stacked=False,
+                    representation='raw',
+                    number_of_left_players_agent_controls=0,
+                    number_of_right_players_agent_controls=1,
+                    logdir='./tmp/football',
+                    write_goal_dumps=False,
+                    write_full_episode_dumps=self.save_replay,
+                    write_video=self.save_replay,
+                    render=False
+                )
+                self._launch_env_flag = True
+
+            def step(self, action):
+                timestep = super().step(action)
+                obs = timestep.obs['processed_obs']
+                if isinstance(obs, list): obs = np.array(obs)
+                if len(obs.shape) > 1: obs = obs[0]
+                return obs, timestep.reward, timestep.done, False, timestep.info
+
+            def reset(self, seed=None):
+                if seed is not None: self.seed(seed)
+                obs_dict = super().reset()
+                obs = obs_dict['processed_obs']
+                if isinstance(obs, list): obs = np.array(obs)
+                if len(obs.shape) > 1: obs = obs[0]
+                return obs, {}
+            
+            def render(self):
+                return self._env.render(mode='rgb_array')
+
+            def get_state(self):
+                return self._env.get_state()
+            
+            def set_state(self, state):
+                self._env.set_state(state)
+
+        cfg = EasyDict({
+            'env_name': '11_vs_11_stochastic',
+            'save_replay': False,
+            'save_replay_gif': False,
+        })
+        env = CustomGfootballEnv(cfg)
+                self._env.set_state(state)
+
+        cfg = EasyDict({
+            'env_name': '11_vs_11_stochastic',
+            'save_replay': False,
+            'save_replay_gif': False,
+        })
+        env = CustomGfootballEnv(cfg)
+        obs_dim = 115 # Standard for simple115 or raw-processed
+        # We try to detect it if possible
+        try:
+            test_obs, _ = env.reset()
+            obs_dim = test_obs.shape[0]
+        except: pass
+    else:
+        env = gym.make(env_name, render_mode="rgb_array")
+        if "highway" in env_name:
+            env = gym.wrappers.FlattenObservation(env)
+        obs_dim = env.observation_space.shape[0]
+
+    action_dim = env.action_space.n if hasattr(env.action_space, 'n') else env.action_space.nvec[0]
+    if "football" in env_name or "gfootball" in env_name:
+        action_dim = 19 # Standard gfootball action set
+    
     agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL", save_dir=results_base_dir, device_name="cpu")
 
     aux_agent = None

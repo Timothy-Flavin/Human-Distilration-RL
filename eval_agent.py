@@ -10,7 +10,14 @@ from PPO import PPOAgent
 from buffers import ReplayBuffer
 
 def evaluate_return(agent, env_name, num_episodes=25):
+    if env_name == "highway":
+        env_name = "highway-v0"
+    if "highway" in env_name:
+        import highway_env
     env = gym.make(env_name)
+    if "highway" in env_name:
+        from gymnasium.wrappers import FlattenObservation
+        env = FlattenObservation(env)
     total_returns = []
     
     for _ in range(num_episodes):
@@ -66,7 +73,16 @@ def main():
     # 1. Initialize Agent
     # We need to know obs/action dim. For LunarLander-v3 it's 8/4.
     # In a real script, we'd detect this from the env.
-    temp_env = gym.make(args.env_name)
+    env_name = args.env_name
+    if env_name == "highway":
+        env_name = "highway-v0"
+    if "highway" in env_name:
+        import highway_env
+    
+    temp_env = gym.make(env_name)
+    if "highway" in env_name:
+        from gymnasium.wrappers import FlattenObservation
+        temp_env = FlattenObservation(temp_env)
     obs_dim = temp_env.observation_space.shape[0]
     action_dim = temp_env.action_space.n
     temp_env.close()
