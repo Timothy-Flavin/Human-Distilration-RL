@@ -129,4 +129,22 @@ def get_realtime_action(keys, env_name="LunarLander-v3"):
         if keys[pygame.K_LSHIFT]: return 13 # Sprint
         if keys[pygame.K_SPACE]: return 17 # Dribble
         return 0
+    elif "crafter" in env_name:
+        if keys[pygame.K_a]: return 1     # move_left
+        if keys[pygame.K_d]: return 2     # move_right
+        if keys[pygame.K_w]: return 3     # move_up
+        if keys[pygame.K_s]: return 4     # move_down
+        if keys[pygame.K_SPACE]: return 5 # do
+        if keys[pygame.K_TAB]: return 6   # sleep
+        if keys[pygame.K_r]: return 7     # place_stone
+        if keys[pygame.K_t]: return 8     # place_table
+        if keys[pygame.K_f]: return 9     # place_furnace
+        if keys[pygame.K_p]: return 10    # place_plant
+        if keys[pygame.K_1]: return 11    # make_wood_pickaxe
+        if keys[pygame.K_2]: return 12    # make_stone_pickaxe
+        if keys[pygame.K_3]: return 13    # make_iron_pickaxe
+        if keys[pygame.K_4]: return 14    # make_wood_sword
+        if keys[pygame.K_5]: return 15    # make_stone_sword
+        if keys[pygame.K_6]: return 16    # make_iron_sword
+        return 0
     return 0

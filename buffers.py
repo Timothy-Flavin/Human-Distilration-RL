@@ -44,6 +44,22 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+class EpisodicReplayBuffer:
+    """Buffer to store and sample full episodes (sequences of transitions)."""
+    def __init__(self, capacity):
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def push(self, episode):
+        """Episode should be a dict: {'transitions': [...], 'duration': ...}"""
+        self.buffer.append(episode)
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
+        return batch
+
+    def __len__(self):
+        return len(self.buffer)
+
 class LLMBuffer:
     def __init__(self):
         self.buffer = collections.deque()

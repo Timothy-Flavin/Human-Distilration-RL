@@ -66,9 +66,9 @@ class RecurrentQNetwork(nn.Module):
         
         if features is None:
             # Flatten Batch and Time dimensions for the CNN
-            x_flat = x.view(batch_size * seq_len, c, h, w)
+            x_flat = x.reshape(batch_size * seq_len, c, h, w)
             features = self.encoder(x_flat)
-            features = features.view(batch_size, seq_len, -1)
+            features = features.reshape(batch_size, seq_len, -1)
         
         lstm_out, hidden = self.lstm(features, hidden)
         q_values = self.fc(lstm_out)
@@ -84,13 +84,14 @@ class RecurrentValueNetwork(nn.Module):
     def forward(self, x, hidden=None, features=None):
         batch_size, seq_len, c, h, w = x.size()
         if features is None:
-            x_flat = x.view(batch_size * seq_len, c, h, w)
+            x_flat = x.reshape(batch_size * seq_len, c, h, w)
             features = self.encoder(x_flat)
-            features = features.view(batch_size, seq_len, -1)
+            features = features.reshape(batch_size, seq_len, -1)
         
         lstm_out, hidden = self.lstm(features, hidden)
         values = self.fc(lstm_out)
         return values, hidden
+
 
 
 class RCQLAgent(Agent):
@@ -129,6 +130,17 @@ class RCQLAgent(Agent):
             return obs.float() / 255.0
         return obs.float()
 
+    def _ensure_channel_first(self, x):
+        """Detects and converts (..., H, W, C) to (..., C, H, W) if needed."""
+        # If last dim is 1 or 3 and it's not the channel dim already, permute.
+        # We assume H, W are larger than 3 (usually 16, 64, etc.)
+        if x.shape[-1] in [1, 3] and x.shape[-3] not in [1, 3]:
+            ndim = x.ndim
+            if ndim == 3: return x.permute(2, 0, 1)
+            if ndim == 4: return x.permute(0, 3, 1, 2)
+            if ndim == 5: return x.permute(0, 1, 4, 2, 3)
+        return x
+
     def act(self, observations: torch.Tensor, deterministic: bool = False):
         self.q_net.eval()
         with torch.no_grad():
@@ -139,8 +151,10 @@ class RCQLAgent(Agent):
                 obs = observations.unsqueeze(1)
                 batch_size = observations.shape[0]
             
+            obs = self._ensure_channel_first(obs)
             obs = self._normalize(obs)
             q_values, self.q_hidden = self.q_net(obs, self.q_hidden)
+
             q_values = q_values.squeeze(1) 
             
             if deterministic:
@@ -152,6 +166,15 @@ class RCQLAgent(Agent):
                     action = q_values.argmax(dim=1)
         self.q_net.train()
         return action
+
+    def predict(self, observations, deterministic: bool = True):
+        # observations might be numpy array or torch tensor
+        if not isinstance(observations, torch.Tensor):
+            observations = torch.tensor(observations, dtype=torch.float32).to(self.device_name)
+        
+        # Ensure it has at least (C, H, W)
+        action = self.act(observations, deterministic=deterministic)
+        return action.item() if action.numel() == 1 else action.cpu().numpy()
 
     def store_episode(self, episode):
         self.replay_buffer.append(episode)
@@ -198,7 +221,10 @@ class RCQLAgent(Agent):
             reward_seqs.append(rewards)
             done_seqs.append(dones)
 
-        obs_tensor = self._normalize(torch.tensor(np.array(obs_seqs), dtype=torch.float32).to(self.device_name))
+        obs_tensor = torch.tensor(np.array(obs_seqs), dtype=torch.float32).to(self.device_name)
+        obs_tensor = self._ensure_channel_first(obs_tensor)
+        obs_tensor = self._normalize(obs_tensor)
+        
         action_tensor = torch.tensor(np.array(action_seqs), dtype=torch.long).to(self.device_name)
         reward_tensor = torch.tensor(np.array(reward_seqs), dtype=torch.float32).to(self.device_name)
         done_tensor = torch.tensor(np.array(done_seqs), dtype=torch.float32).to(self.device_name)
@@ -206,16 +232,28 @@ class RCQLAgent(Agent):
         return obs_tensor, action_tensor, reward_tensor, done_tensor
 
 
-    def update_value(self, batch_episodes) -> dict:
-        joint_obs, _, rewards, dones = self._prepare_batch(batch_episodes)
+
+    def update_value(self, batch_episodes, burn_in=16) -> dict:
+        joint_obs, _, rewards, dones = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
         
-        # joint_obs has length seq_len + 1
-        v_full, _ = self.v_net(joint_obs)
+        # 1. Burn-in: Establish hidden state without grad
+        with torch.no_grad():
+            burn_obs = joint_obs[:, :burn_in, :]
+            _, h_v = self.v_net(burn_obs)
+            _, h_v_target = self.v_target(burn_obs)
+
+        # 2. Main Update: Calculate loss on the remaining sequence
+        obs_active = joint_obs[:, burn_in:, :] # Contains s_burn..s_end (len 33)
+        v_full, _ = self.v_net(obs_active, hidden=h_v)
         current_v = v_full[:, :-1, :].squeeze(-1)
         
         with torch.no_grad():
-            next_v = v_full[:, 1:, :].squeeze(-1)
-            target_v = rewards + (1.0 - dones) * self.gamma * next_v
+            v_target_full, _ = self.v_target(obs_active, hidden=h_v_target)
+            next_v = v_target_full[:, 1:, :].squeeze(-1)
+            # rewards/dones need to be sliced to match the loss-active window
+            r_active = rewards[:, burn_in:]
+            d_active = dones[:, burn_in:]
+            target_v = r_active + (1.0 - d_active) * self.gamma * next_v
 
         v_loss = F.mse_loss(current_v, target_v)
         self.v_optimizer.zero_grad()
@@ -226,17 +264,29 @@ class RCQLAgent(Agent):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
         return {"loss_v": v_loss.item(), "v_mean": current_v.mean().item()}
 
-    def update_td(self, batch_episodes, ssl: bool = False, masks: list = None) -> dict:
-        joint_obs, actions, rewards, dones = self._prepare_batch(batch_episodes)
+    def update_td(self, batch_episodes, burn_in=16, ssl: bool = False, masks: list = None) -> dict:
+        joint_obs, actions, rewards, dones = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
         
-        q_logits_full, _ = self.q_net(joint_obs)
+        # 1. Burn-in
+        with torch.no_grad():
+            burn_obs = joint_obs[:, :burn_in, :]
+            _, h_q = self.q_net(burn_obs)
+            _, h_q_target = self.q_target(burn_obs)
+
+        # 2. Main Update
+        obs_active = joint_obs[:, burn_in:, :]
+        q_logits_full, _ = self.q_net(obs_active, hidden=h_q)
         q_logits = q_logits_full[:, :-1, :]
-        current_q = q_logits.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+        
+        a_active = actions[:, burn_in:]
+        current_q = q_logits.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
         
         with torch.no_grad():
-            q_target_full, _ = self.q_target(joint_obs)
+            q_target_full, _ = self.q_target(obs_active, hidden=h_q_target)
             next_q = q_target_full[:, 1:, :].max(2)[0]
-            target_q = rewards + (1.0 - dones) * self.gamma * next_q
+            r_active = rewards[:, burn_in:]
+            d_active = dones[:, burn_in:]
+            target_q = r_active + (1.0 - d_active) * self.gamma * next_q
 
         q_loss = F.mse_loss(current_q, target_q)
         cql_loss = torch.logsumexp(q_logits, dim=2).mean() - current_q.mean()
@@ -251,13 +301,61 @@ class RCQLAgent(Agent):
 
         return {"loss_td": total_loss.item(), "q_loss": q_loss.item(), "cql_loss": cql_loss.item(), "q_mean": current_q.mean().item()}
 
-    def update_supervised(self, batch_episodes, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
-        obs, actions, _, _ = self._prepare_batch(batch_episodes)
-        obs_trimmed = obs[:, :-1, :] # BC only needs s0..sT
+    def update_supervised(self, batch_episodes, burn_in=16, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
+        joint_obs, actions, _, _ = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
         
-        logits, _ = self.q_net(obs_trimmed)
-        logits = logits.view(-1, self.action_dim)
-        labels = actions.view(-1)
+        # 1. Burn-in
+        with torch.no_grad():
+            burn_obs = joint_obs[:, :burn_in, :]
+            _, h_q = self.q_net(burn_obs)
+
+        # 2. Main Update
+        obs_active = joint_obs[:, burn_in:-1, :] # s_burn..s_T (len 32)
+        a_active = actions[:, burn_in:]
+        
+        logits, _ = self.q_net(obs_active, hidden=h_q)
+        logits = logits.reshape(-1, self.action_dim)
+        labels = a_active.reshape(-1)
+
+        if anti:
+            probs = F.softmax(logits, dim=1)
+            bad_action_probs = probs.gather(1, labels.unsqueeze(1)).squeeze()
+            loss = -torch.log(1 - bad_action_probs + 1e-8).mean()
+        else:
+            if advantages is not None:
+                # Adv needs careful slicing if passed, but usually AWBC doesn't use burn-in
+                # for the adv tensor calculation itself.
+                adv = advantages.to(self.device_name).reshape(-1)
+                log_probs = F.log_softmax(logits, dim=1)
+                selected_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze()
+                loss = -(adv * selected_log_probs).mean()
+            else:
+                loss = F.cross_entropy(logits, labels)
+
+        self.q_optimizer.zero_grad()
+        loss.backward()
+        self.q_optimizer.step()
+        return {"loss_supervised": loss.item()}
+
+    def get_bc_loss(self, batch_episodes, burn_in=16) -> float:
+        """Calculates supervised loss with burn-in Settlement."""
+        self.q_net.eval()
+        with torch.no_grad():
+            joint_obs, actions, _, _ = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
+            # Burn-in pass
+            burn_obs = joint_obs[:, :burn_in, :]
+            _, h_q = self.q_net(burn_obs)
+            
+            # Loss pass
+            obs_active = joint_obs[:, burn_in:-1, :]
+            a_active = actions[:, burn_in:]
+            logits, _ = self.q_net(obs_active, hidden=h_q)
+            logits = logits.reshape(-1, self.action_dim)
+            labels = a_active.reshape(-1)
+            loss = F.cross_entropy(logits, labels)
+        self.q_net.train()
+        return loss.item()
+
 
         if anti:
             probs = F.softmax(logits, dim=1)

@@ -12,16 +12,40 @@ from buffers import ReplayBuffer
 def evaluate_return(agent, env_name, num_episodes=25):
     if env_name == "highway":
         env_name = "highway-v0"
-    if "highway" in env_name:
-        import highway_env
-    env = gym.make(env_name)
-    if "highway" in env_name:
-        from gymnasium.wrappers import FlattenObservation
-        env = FlattenObservation(env)
+    
+    if env_name == "crafter":
+        try:
+            import crafter
+            class CrafterEvalWrapper:
+                def __init__(self):
+                    self._env = crafter.Env()
+                    self.observation_space = self._env.observation_space
+                    self.action_space = self._env.action_space
+                def reset(self, seed=None):
+                    if seed is not None: self._env.seed(seed)
+                    return self._env.reset(), {}
+                def step(self, action):
+                    obs, reward, done, info = self._env.step(action)
+                    return obs, reward, done, False, info
+                def close(self): pass
+            env = CrafterEvalWrapper()
+        except ImportError:
+            print("[!] Crafter not found for evaluation.")
+            return 0, 0
+    else:
+        if "highway" in env_name:
+            import highway_env
+        env = gym.make(env_name)
+        if "highway" in env_name:
+            from gymnasium.wrappers import FlattenObservation
+            env = FlattenObservation(env)
+            
     total_returns = []
     
     for _ in range(num_episodes):
         obs, info = env.reset()
+        if hasattr(agent, 'reset_hidden'):
+            agent.reset_hidden()
         terminated = False
         truncated = False
         episode_return = 0
@@ -33,6 +57,7 @@ def evaluate_return(agent, env_name, num_episodes=25):
     
     env.close()
     return np.mean(total_returns), np.std(total_returns)
+
 
 def calculate_cross_entropy(agent, buffer, anti=False):
     if len(buffer) == 0:

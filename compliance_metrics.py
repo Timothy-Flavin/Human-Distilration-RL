@@ -52,6 +52,13 @@ def highway_safety_score(obs_sequence):
     return np.mean(scores)
 
 def get_compliance_score(env_name, obs_sequence):
+    if not obs_sequence or not isinstance(obs_sequence[0], np.ndarray):
+        return 0.0
+        
+    # Check for image data (3D or more) and skip
+    if obs_sequence[0].ndim >= 3:
+        return 0.0
+
     if "LunarLander" in env_name:
         return lander_precision_score(obs_sequence)
     elif "highway" in env_name:
