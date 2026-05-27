@@ -229,11 +229,7 @@ class InteractiveGymWrapper:
 
         # Route to buffers if source is RL
         if source == "rl":
-            if self.is_curriculum and self.buffers and 'curriculum' in self.buffers:
-                # For curriculum learning, we might need a specific task context, 
-                # but if simple, we push to curriculum buffer
-                self.buffers['curriculum'].push(obs, action, reward, next_obs, terminated, truncated)
-            elif self.agent:
+            if self.agent:
                 self.agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
 
         # Check for get_state
