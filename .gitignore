@@ -5,3 +5,5 @@ LunarLander-v3_1bc
 LunarLander-v3_cql
 results
 *.pkl
+results_sr
+venv
