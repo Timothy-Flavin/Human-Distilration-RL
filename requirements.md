@@ -41,3 +41,23 @@ This document defines the absolute requirements for the Freshman project, derive
 - **R7.4**: Batch Consistency: Ensure all buffers pair `obs_t` with `action_t` to avoid causal misalignment.
 - **R7.5**: Modular CLI: Map `--offline_rl`, `--online_rl`, `--bc`, and `--awbc` to specific buffer-source targets in the unified update.
 - **R7.6**: Compliance Post-Hoc: Quantitatively measure "Hidden Behaviors" (following distance, vertical descent) using non-RL reward functions.
+
+The InteractiveGymWrapper manages the following state transitions:
+
+   1. Review Mode (step): The default state. The human navigates the existing trajectory.
+       * Branch to Realtime: Pressing a movement key starts a human takeover. _branch_timeline(source="realtime") is called, discarding future frames.
+       * Branch to Agent: Pressing tab starts an agent takeover. _branch_timeline(source="agent") is called.
+       * Annotation: Pressing n enters note mode to leave feedback.
+   2. Takeover Modes (realtime / agent):
+       * Realtime: Human actions are captured. step_forward is called with source="human". These are stored in the temporary trajectory but not pushed to buffers yet.
+       * Agent: Agent actions are captured. step_forward is called with source="rl". These are immediately pushed to agent.store_transition and stored in the trajectory.
+       * Both modes transition to Decision when the episode ends or the user stops the takeover.
+   3. Decision Mode (decision): Triggered after an override or when a heuristic playback finishes.
+       * Accept: 
+           * Discarded (original) RL actions are sent to the anti_example buffer (for Anti-BC).
+           * If the override was realtime, the new human actions are pushed to the example buffer (Expert data for BC/AWBC).
+           * If the override was agent, the actions remain in the agent's replay buffer (already pushed during stepping).
+       * Reject: The trajectory is reverted to the branch point, restoring the original RL path.
+   4. Note Mode (note):
+       * Captures text input. Upon submission, it creates an entry in the LLMBuffer.
+       * main.py later processes this via the LLMRouter, which may push a task to the CurriculumBuffer if the note implies a sub-goal (e.g., "hover down").
