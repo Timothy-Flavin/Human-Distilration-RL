@@ -72,7 +72,8 @@ class LLMRouter:
 
     def commit(self, item, classification, verification_trajectory=None):
         classification = self._ensure_callable(classification)
-        historical_actions = [step['action'] for step in item['episode_trajectory'][1:item['note_frame_idx'] + 1]]
+        # Correctly capture all actions taken BEFORE the note frame to replay to that state
+        historical_actions = [step['action'] for step in item['episode_trajectory'][:item['note_frame_idx']]]
         
         if classification['type'] == 'GENERIC':
             self.curriculum_buffer.push(
@@ -89,10 +90,34 @@ class LLMRouter:
             term_rule = classification.get('termination_rule')
             if verification_trajectory:
                 start_idx = item['note_frame_idx']
+                # Invert mask: add noise to ALL features NOT in the important list
+                important_features = classification.get('feature_mask', {})
+                if isinstance(important_features, dict):
+                    important_indices = set(important_features.keys())
+                else:
+                    important_indices = set()
+                
+                obs_dim = len(verification_trajectory[0]['obs'])
+                unimportant_mask = {
+                    idx: {'dist': 'gaussian', 'scale': self.noise_scale} 
+                    for idx in range(obs_dim) if idx not in important_indices
+                }
+
                 for step in verification_trajectory[start_idx:]:
                     if step.get('source') == 'heuristic':
-                        self.ssl_buffer.push(step['obs'], step['action'], classification['feature_mask'], termination_rule=term_rule)
-                        if self.metrics: self.metrics.log_frames(1, source="ssl")
+                        # Push pristine transition
+                        self.ssl_buffer.push(step['obs'], step['action'], important_features, termination_rule=term_rule)
+                        
+                        # Augmentation: push noisy variations to example buffer for BC
+                        for _ in range(self.num_noisy_samples):
+                            # We use example_buffer for BC updates
+                            self.example_buffer.push(
+                                step['obs'], step['action'], reward=step.get('reward', 0.0),
+                                next_obs=step.get('next_obs'), terminated=step.get('terminated', False),
+                                truncated=step.get('truncated', False), mask=unimportant_mask
+                            )
+                        
+                        if self.metrics: self.metrics.log_frames(1 + self.num_noisy_samples, source="ssl")
 
         elif classification['type'] == 'NOISY_HUMAN':
             note_idx = item['note_frame_idx']
@@ -109,14 +134,23 @@ class LLMRouter:
             human_segment = trajectory[seg_start : seg_end + 1]
             noise_specs = classification.get('noise_specs', {})
             for step in human_segment:
-                # Push full transition with mask to example buffer
+                # 1. Push original human transition
                 self.example_buffer.push(
                     step['obs'], step['action'], reward=step.get('reward', 0.0),
                     next_obs=step.get('next_obs'), terminated=step.get('terminated', False),
-                    truncated=step.get('truncated', False), mask=noise_specs
+                    truncated=step.get('truncated', False), mask=None
                 )
-                if self.metrics: self.metrics.log_frames(1, source="human")
-            print(f"[Noisy Human] Committed {len(human_segment)} frames with noise spec.")
+                
+                # 2. Augmentation: Push N noisy variations
+                for _ in range(self.num_noisy_samples):
+                    self.example_buffer.push(
+                        step['obs'], step['action'], reward=step.get('reward', 0.0),
+                        next_obs=step.get('next_obs'), terminated=step.get('terminated', False),
+                        truncated=step.get('truncated', False), mask=noise_specs
+                    )
+                
+                if self.metrics: self.metrics.log_frames(1 + self.num_noisy_samples, source="human")
+            print(f"[Noisy Human] Committed human segment with {self.num_noisy_samples}x augmentation.")
         return classification
 
     def _mock_llm_classify(self, text, obs):
@@ -124,7 +158,14 @@ class LLMRouter:
         if any(kw in text for kw in ["ignore", "don't care", "unimportant", "doesn't matter"]):
             noise_specs = {}
             if "LunarLander" in self.env_name:
-                feat_map = {"x_pos": 0, "y_pos": 1, "height": 1, "x_vel": 2, "y_vel": 3, "angle": 4, "angular_vel": 5}
+                feat_map = {
+                    "x_pos": 0, "horizontal position": 0,
+                    "y_pos": 1, "height": 1, "altitude": 1,
+                    "x_vel": 2, "horizontal velocity": 2,
+                    "y_vel": 3, "vertical velocity": 3,
+                    "angle": 4, "tilt": 4,
+                    "angular_vel": 5, "spin": 5
+                }
                 bounds = {0: (-1.0, 1.0), 1: (0.0, 1.5), 2: (-1.0, 1.0), 3: (-1.0, 1.0), 4: (-1.0, 1.0), 5: (-1.0, 1.0)}
             elif "highway" in self.env_name:
                 feat_map = {"presence": 0, "x": 1, "y": 2, "vx": 3, "vy": 4}
@@ -146,6 +187,11 @@ class LLMRouter:
                         spec["dist"] = "gaussian"; spec["scale"] = float(g_match.group(1)) if g_match else self.noise_scale
                     else: spec["dist"] = "gaussian"; spec["scale"] = self.noise_scale
                     noise_specs[idx] = spec
+            
+            # If they just said "ignore unimportant" without naming them, default to x_pos and y_pos for LunarLander
+            if not noise_specs and "LunarLander" in self.env_name:
+                noise_specs = {0: {"dist": "gaussian", "scale": self.noise_scale}, 1: {"dist": "gaussian", "scale": self.noise_scale}}
+                
             if noise_specs: return {"type": "NOISY_HUMAN", "noise_specs": noise_specs}
         if self.heuristics_module:
             h_name, h_data = self.heuristics_module.get_heuristic_by_text(text)
@@ -158,7 +204,31 @@ class LLMRouter:
                 if isinstance(mask, list): mask = {idx: {'dist': 'gaussian', 'scale': self.noise_scale} for idx in mask}
                 return {"type": "HEURISTIC", "name": h_name, "action": action, "action_fn": h_data.get('action_fn'), "feature_mask": mask, "rule": h_data['trigger_rule'], "termination_rule": h_data['termination_rule'], "phrase": h_data['phrase']}
         if "LunarLander" in self.env_name:
-            if "gain stability" in text: return {"type": "GOAL", "code": "def custom_reward(obs, next_obs, base_r):\n    return base_r - 0.1 * (abs(next_obs[2]) + abs(next_obs[3]) + abs(next_obs[5]))"}
+            if "gain stability" in text or "straighten out" in text:
+                return {
+                    "type": "GOAL",
+                    "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize linear velocities (x, y), tilt angle, and rotation speed to kill drift\n    drift_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[3]))\n    tilt_penalty = 0.5 * abs(next_obs[4]) + 0.1 * abs(next_obs[5])\n    return base_r - (drift_penalty + tilt_penalty)"
+                }
+            elif "hover down" in text:
+                return {
+                    "type": "GOAL",
+                    "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vy is negative for downward movement\n    target_vy = -0.3\n    # Penalize horizontal velocity (2), angle (4), and angular velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[2]) + abs(next_obs[4]) + abs(next_obs[5]))\n    # Reward staying close to the slow downward target speed\n    speed_reward = -abs(next_obs[3] - target_vy)\n    return base_r + speed_reward - stability_penalty"
+                }
+            elif "hover left" in text:
+                return {
+                    "type": "GOAL",
+                    "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vx is negative for moving left\n    target_vx = -0.3\n    # Penalize vertical movement (3) and rotational velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    # Reward staying close to the slow leftward target speed\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
+                }
+            elif "hover right" in text:
+                return {
+                    "type": "GOAL",
+                    "code": "def custom_reward(obs, next_obs, base_r):\n    # target_vx is positive for moving right\n    target_vx = 0.3\n    # Penalize vertical movement (3) and rotational velocity (5)\n    stability_penalty = 0.5 * (abs(next_obs[3]) + abs(next_obs[5]))\n    # Reward staying close to the slow rightward target speed\n    speed_reward = -abs(next_obs[2] - target_vx)\n    return base_r + speed_reward - stability_penalty"
+                }
+            elif "soft landing" in text:
+                return {
+                    "type": "GOAL",
+                    "code": "def custom_reward(obs, next_obs, base_r):\n    # Penalize vertical velocity when close to ground\n    land_penalty = 0.0\n    if next_obs[1] < 0.2: land_penalty = 2.0 * abs(next_obs[3])\n    return base_r - land_penalty"
+                }
         elif "highway" in self.env_name:
             if "high speed" in text: return {"type": "GOAL", "code": "def custom_reward(obs, next_obs, base_r):\n    return base_r + next_obs[0, 3]"}
         return {"type": "GENERIC"}

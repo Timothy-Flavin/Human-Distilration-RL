@@ -1,0 +1,77 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{lipsum} % For filler text
+\title{Comprehensive Human Distillation, A Safety-First Shortcut for Hard RL Problems}
+\author{Author Name}
+\begin{document}
+\maketitle
+
+\section{Introduction}
+\lipsum[1] % Filler text
+
+\section{Related Work}
+\lipsum[2] % Filler text
+
+\section{Methodology}
+
+% Room for diagram and explanation of the full human training loop
+\subsection{The Freshman Human-In-The-Loop Pipeline}
+\begin{figure}[h]
+\centering
+  % \includegraphics[width=0.8\textwidth]{figures/training_loop_diagram.png}
+    \caption{Placeholder for a diagram illustrating the multi-stage interaction loop: Stage 1 (RL Collection), Stage 2 (Human Review \& Annotation), and Stage 3 (Unified Updating).}
+    \label{fig:pipeline}
+\end{figure}
+The proposed pipeline operates in a continuous multi-stage loop designed for sample and human-time efficiency. Agents gather initial experience via standard RL, followed by a human review phase where a coach can interactively override trajectories and provide natural language annotations, which are subsequently routed by an LLM into diverse training signals (Offline RL, BC, Anti-BC, SSL, and Curriculum) for a unified update phase.
+
+\subsection{Base Algorithms: CQL and Recurrent CNN CQL (RCQL)}
+To establish a robust offline and online learning foundation, our pipeline utilizes Conservative Q-Learning (CQL) to prevent overestimation on out-of-distribution human data. For complex, pixel-based environments requiring temporal memory, we extend this into Recurrent CNN CQL (RCQL), leveraging a 4-layer CNN encoder coupled with an LSTM, trained via Backpropagation Through Time (BPTT) with explicit burn-in periods to ensure stable hidden-state representations.
+
+\subsection{Human Interventions and Feedback Mechanisms}
+
+\subsubsection{Interactive Override (Positive Demonstrations)}
+During the human review stage, the coach can press a key to seamlessly branch the timeline and take control of the agent from a point of failure. This interaction generates optimal, state-matched demonstration data that is injected into the expert buffer for Behavior Cloning (BC) and Advantage-Weighted BC (AWBC).
+
+\subsubsection{Negative Feedback and Trajectory Rejection (Anti-BC)}
+When a human intervenes to correct the agent, the frames immediately following the intervention point in the original timeline are inherently classified as undesirable. These discarded frames are routed to an \textit{anti-example} buffer, applying a negative cross-entropy loss (Anti-BC) to actively push the policy distribution away from catastrophic mistakes.
+
+\subsubsection{Goal Annotation and LLM Curriculum Generation}
+Human coaches can leave text annotations defining specific situational subtasks (e.g., "Halt movement"). An LLM routes these "Goal" annotations into executable auxiliary reward functions, triggering short, localized curriculum rollouts that train the agent to recover from sparse-reward states without corrupting the global RL buffer.
+
+\subsubsection{Heuristic Annotation and Semi-Supervised Learning (SSL)}
+Coaches can provide rule-of-thumb feedback denoting which features are irrelevant (e.g., "Ignore x-position, focus on velocity"). The LLM translates these into feature masks, allowing the pipeline to apply Gaussian noise to the unspecified features, creating a semi-supervised dataset that forces the agent to learn generalized, noise-invariant heuristics.
+\subsection{Sanity Check Environments for Recurrent Architectures}
+To isolate and verify the mechanical soundness of the RCQL architecture before applying it to complex domains like Crafter, we utilize two lightweight diagnostic environments.
+
+\subsubsection{Memory Sanity Environment (MemorySanityEnv)}
+This environment tests the LSTM's capacity for long-horizon discrete memorization. The agent observes a definitive color signal at step zero, traverses a corridor of pure visual noise for several steps, and must output an action corresponding to the initial signal to receive a terminal reward.
+
+\subsubsection{Flickering Catch}
+This environment tests the agent's spatial-temporal reasoning and trajectory extrapolation capabilities. Operating as a standard pixel-based ``Catch'' game, the falling block becomes completely invisible for a sequence of middle frames, forcing the CNN-LSTM pipeline to maintain and project the block's momentum through the blackout.
+
+\subsection{Experimental Suite}
+We conduct 17 targeted experiments to ablate the pipeline components, measuring sample efficiency, human wall-clock effort, and performance against hidden constraints. 
+
+\subsubsection{Static Baselines (Experiments 1--6)}
+These hands-free experiments establish the baseline capabilities of offline and hybrid algorithms. They evaluate Pure BC, AWBC, Pure Offline CQL, AWBC-CQL, and combinations of Online/Offline CQL using only pre-recorded static datasets without active human feedback.
+
+\subsubsection{Interactive Override Ablations (Experiments 7--11)}
+These trials measure the efficiency gains of human timeline-branching interventions. They compare Interactive AWBC and Interactive Offline RL, both from scratch and via ``Hot Starts'' (combining a static expert dataset with active online corrections).
+
+\subsubsection{Interactive Annotation Ablations (Experiments 12--13)}
+These experiments validate the LLM routing and auxiliary loss mechanics. Experiment 12 compares three methods for integrating LLM-generated curriculum rewards (Main network injection, Separate auxiliary network, and KL-Divergence pulling), while Experiment 13 validates the efficacy of applying SSL noise maps to human trajectories.
+
+\subsubsection{The ``Greedy Best'' Full Pipeline (Experiments 14--15)}
+Combining the optimal configurations from the ablation studies, these experiments deploy the complete Freshman pipeline (RL + Override + Curriculum + SSL) end-to-end on both LunarLander and Highway environments to establish peaksample and time efficiency.
+\subsubsection{Demonstrating HIL Necessity: Hidden Constraints (Experiments 16--17)}
+These final experiments prove that Human-In-The-Loop is strictly required for tasks where the desired behavior contradicts the environment's base reward. Experiment 16 enforces a strict ``Safety First'' following distance in the Highway environment, while Experiment 17 enforces a precise ``Hover-then-Descend'' landing path in LunarLander.
+
+\section{Results}
+\lipsum[3-5] % Filler text
+
+\section{Discussion}
+\lipsum[6-7] % Filler text
+
+\section{Conclusion}
+\lipsum[8] % Filler text
+\end{document}

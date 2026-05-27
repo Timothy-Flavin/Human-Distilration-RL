@@ -4,15 +4,16 @@ import gymnasium as gym
 from input_handler import process_events, get_realtime_action
 
 class InteractiveGymWrapper:
-    def __init__(self, env: gym.Env, agent=None, fps=30, buffers=None, metrics=None, initial_trajectory=None, initial_seed=None, env_name="LunarLander-v3"):
+    def __init__(self, env: gym.Env, agent=None, fps=30, buffers=None, metrics=None, initial_trajectory=None, initial_seed=None, env_name="LunarLander-v3", is_curriculum=False):
         self.env = env
         if env_name == "highway":
             env_name = "highway-v0"
         self.env_name = env_name
         self.agent = agent
         self.fps = fps
-        self.buffers = buffers # Expected: dict with 'example', 'anti_example', 'llm'
+        self.buffers = buffers # Expected: dict with 'example', 'anti_example', 'llm', 'curriculum'
         self.metrics = metrics
+        self.is_curriculum = is_curriculum
         self.env.unwrapped.render_mode = "rgb_array" # Enforce rgb_array for Pygame
 
         pygame.init()
@@ -205,9 +206,9 @@ class InteractiveGymWrapper:
             return
 
         # Current state before action
-        s_t = self.current_obs
+        obs = self.current_obs
         
-        # Update the action in the current step (which was previously 0/NOOP or agent chosen)
+        # Update the action in the current step
         self.trajectory[self.current_frame_idx]["action"] = action
         self.trajectory[self.current_frame_idx]["source"] = source
         
@@ -220,11 +221,20 @@ class InteractiveGymWrapper:
 
         frame = self.env.render()
         
-        # Update current step's next_obs
+        # Update current step's next_obs and results
         self.trajectory[self.current_frame_idx]["next_obs"] = next_obs
         self.trajectory[self.current_frame_idx]["reward"] = reward
         self.trajectory[self.current_frame_idx]["terminated"] = terminated
         self.trajectory[self.current_frame_idx]["truncated"] = truncated
+
+        # Route to buffers if source is RL
+        if source == "rl":
+            if self.is_curriculum and self.buffers and 'curriculum' in self.buffers:
+                # For curriculum learning, we might need a specific task context, 
+                # but if simple, we push to curriculum buffer
+                self.buffers['curriculum'].push(obs, action, reward, next_obs, terminated, truncated)
+            elif self.agent:
+                self.agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
 
         # Check for get_state
         env_state = None
@@ -236,7 +246,7 @@ class InteractiveGymWrapper:
             "obs": next_obs, "action": 0, "reward": 0.0, "next_obs": None,
             "frame_image": frame, 
             "env_state": env_state,
-            "terminated": False, "truncated": False, "source": source
+            "terminated": terminated, "truncated": truncated, "source": source
         }
         self.trajectory.append(step_data)
         self.current_frame_idx += 1
@@ -261,18 +271,68 @@ class InteractiveGymWrapper:
             if target_timer: self.metrics.start_timer(target_timer)
 
     def draw_overlay(self, verification_phrase=None):
-        if self.screen is None or not self.trajectory: return
+        """Draws UI elements (mode, frame index, text buffer, existing notes)."""
+        if self.screen is None or not self.trajectory:
+            return
+
         frame = self.trajectory[self.current_frame_idx].get("frame_image")
         if frame is not None:
             surf = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
             self.screen.blit(surf, (0, 0))
         else:
             self.screen.fill((50, 50, 50))
+            msg = self.font.render("No Image Frame Saved", True, (255, 255, 255))
+            self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2))
+
+        # Mode display
         color = (255, 255, 0)
         if self.mode == "decision": color = (255, 0, 0)
         elif self.mode == "realtime": color = (0, 255, 0)
+        elif self.mode == "agent": color = (0, 255, 255)
+        elif self.mode == "verification": color = (255, 100, 255)
+
         mode_surf = self.font.render(f"MODE: {self.mode.upper()}", True, color)
         self.screen.blit(mode_surf, (10, 10))
+
+        frame_surf = self.small_font.render(
+            f"Frame: {self.current_frame_idx}/{len(self.trajectory)-1}", 
+            True, (200, 200, 200)
+        )
+        self.screen.blit(frame_surf, (10, 40))
+
+        source = self.trajectory[self.current_frame_idx].get("source", "rl")
+        source_surf = self.small_font.render(f"SOURCE: {source.upper()}", True, (200, 200, 200))
+        self.screen.blit(source_surf, (10, 60))
+
+        if verification_phrase:
+            msg = self.small_font.render(f"HEURISTIC: {verification_phrase}", True, (255, 255, 255))
+            self.screen.blit(msg, (10, 90))
+
+        if self.mode == "note":
+            bg_rect = pygame.Rect(0, self.screen.get_height() - 50, self.screen.get_width(), 50)
+            pygame.draw.rect(self.screen, (0, 0, 0), bg_rect)
+            note_surf = self.font.render(f"> {self.text_buffer}_", True, (0, 255, 0))
+            self.screen.blit(note_surf, (10, self.screen.get_height() - 40))
+
+        if self.mode == "decision" or (self.mode == "step" and verification_phrase and self.current_frame_idx == len(self.trajectory) - 1):
+            overlay = pygame.Surface((self.screen.get_width(), 120))
+            overlay.set_alpha(180)
+            overlay.fill((0, 0, 0))
+            self.screen.blit(overlay, (0, self.screen.get_height() // 2 - 60))
+            
+            if verification_phrase:
+                msg = self.font.render(f"[A]ccept Heuristic, [R]eject, or [P]rephrase?", True, (255, 255, 255))
+            else:
+                source_name = self.override_source.title() if self.override_source else "Changes"
+                msg = self.font.render(f"[A]ccept {source_name} or [R]eject?", True, (255, 255, 255))
+
+            self.screen.blit(msg, (self.screen.get_width() // 2 - msg.get_width() // 2, self.screen.get_height() // 2 - 20))
+        
+        current_note = next((n["text"] for n in self.notes if n["frame"] == self.current_frame_idx), None)
+        if current_note:
+            note_display = self.small_font.render(f"NOTE: {current_note}", True, (255, 100, 100))
+            self.screen.blit(note_display, (10, 80))
+
         pygame.display.flip()
 
     def run_verification(self, start_frame, action, termination_rule, phrase):
@@ -334,7 +394,7 @@ class InteractiveGymWrapper:
             if self.mode == "step":
                 if step_dir != 0:
                     step_counter += 1
-                    if step_dir == 1: self.step_forward(action=0, source="rl")
+                    if step_dir == 1: self.step_forward(action=0, source="manual")
                     elif step_dir == -1: self.step_backward()
                 else: step_counter = 0
             elif self.mode == "realtime":

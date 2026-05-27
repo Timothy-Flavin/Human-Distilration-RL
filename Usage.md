@@ -129,6 +129,7 @@ After selecting the best Curriculum method (e.g., KL) and verifying the Noisy Tr
     ```bash
     # Commands TBD from earlier experiment results
     # Choose best SSL, Annotation, Intervention, and Hands-Free combination for full pipeline
+    python main.py --algo cql --online_rl --offline_rl --awbc --intervention --curriculum --num_rl_frames 2000 --num_unified_epochs 500 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "online_offline_awbc_cql" --seed 1
     ```
 
 ### Exp 15: Full "Freshman" Pipeline (Highway)

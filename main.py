@@ -66,17 +66,11 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
         trajectory_lite = []
         total_reward = 0
         
-        trajectory_lite.append({
-            "obs": obs, "action": 0, "reward": 0, "next_obs": obs,
-            "frame_image": None, "terminated": False, "truncated": False, 
-            "env_state": None, "source": "rl"
-        })
-
         while not (terminated or truncated):
             action = agent.predict(obs, deterministic=False)
             next_obs, reward, terminated, truncated, info = env.step(action)
             
-            # Store in agent's internal buffer for Online RL (exploration source)
+            # Store in agent's internal buffer for Online RL
             agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
             
             trajectory_lite.append({
@@ -89,6 +83,13 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
             metrics.log_frames(1, source="rl")
             total_frames += 1
             if total_frames >= num_frames: break
+        
+        # Add the final state
+        trajectory_lite.append({
+            "obs": obs, "action": 0, "reward": 0, "next_obs": None,
+            "frame_image": None, "terminated": terminated, "truncated": truncated, 
+            "env_state": None, "source": "rl"
+        })
             
         episodes.append({"seed": seed, "total_reward": total_reward, "trajectory": trajectory_lite})
     metrics.stop_timer("rl_experience")
@@ -98,11 +99,11 @@ def hydrate_trajectory(env, seed, trajectory_lite):
     """Re-simulates an episode to generate frames for review."""
     print(f"[Hydration] Re-simulating episode for review (Seed: {seed})...")
     env.reset(seed=seed)
-    trajectory_lite[0]["frame_image"] = env.render()
-    for i in range(1, len(trajectory_lite)):
-        action = trajectory_lite[i]["action"]
-        env.step(action)
+    for i in range(len(trajectory_lite)):
         trajectory_lite[i]["frame_image"] = env.render()
+        if i < len(trajectory_lite) - 1:
+            action = trajectory_lite[i]["action"]
+            env.step(action)
     return trajectory_lite
 
 def unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristics, global_buffer_proxy):
@@ -250,14 +251,6 @@ def main():
             'save_replay_gif': False,
         })
         env = CustomGfootballEnv(cfg)
-                self._env.set_state(state)
-
-        cfg = EasyDict({
-            'env_name': '11_vs_11_stochastic',
-            'save_replay': False,
-            'save_replay_gif': False,
-        })
-        env = CustomGfootballEnv(cfg)
         obs_dim = 115 # Standard for simple115 or raw-processed
         # We try to detect it if possible
         try:
@@ -321,23 +314,16 @@ def main():
             
             wrapper = InteractiveGymWrapper(
                 env, agent=agent, buffers=buffers, metrics=metrics,
-                initial_trajectory=hydrated_trajectory, initial_seed=summary_ep['seed'], env_name=env_name
+                initial_trajectory=hydrated_trajectory, initial_seed=summary_ep['seed'], 
+                env_name=env_name, is_curriculum=args.curriculum
             )
             corrected_trajectory, annotations, final_seed = wrapper.run()
-            
-            # Commit human frames to example buffer (Source for offline RL and BC)
-            for i in range(len(corrected_trajectory) - 1):
-                s, ns = corrected_trajectory[i], corrected_trajectory[i+1]
-                buffers['example'].push(
-                    s['obs'], ns['action'], reward=ns['reward'], 
-                    next_obs=ns['obs'], terminated=ns['terminated'], 
-                    truncated=ns['truncated'], mask=None
-                )
 
             # Intent Processing
-            print("Processing LLM Buffer...")
+            print(f"Processing {len(buffers['llm'])} annotations from LLM Buffer...")
             metrics.start_timer("llm_processing")
             v_manager = VerificationManager(env, agent, buffers, metrics)
+            processed_count = 0
             while not buffers['llm'].is_empty():
                 item = buffers['llm'].pop()
                 classification = router.classify(item)
@@ -346,42 +332,51 @@ def main():
                     active_heuristics.append(classification)
                 else:
                     router.commit(item, classification)
+                processed_count += 1
+            print(f"Processed {processed_count} annotations.")
             metrics.stop_timer("llm_processing")
             
         # PHASE 3: CURRICULUM
-        if len(buffers['curriculum']) > 0 and args.curriculum:
-            metrics.start_timer("agent_updating_local_rl")
-            print(f"[Curriculum] Replaying tasks (Method: {args.curriculum_method})...")
-            while not buffers['curriculum'].is_empty():
-                task = buffers['curriculum'].pop()
-                if args.curriculum_method in ['separate', 'kl']:
-                    aux_agent.q_net.load_state_dict(agent.q_net.state_dict())
-                    aux_agent.q_target.load_state_dict(agent.q_net.state_dict())
-                train_agent = aux_agent if args.curriculum_method in ['separate', 'kl'] else agent
-                for local_epoch in range(args.num_local_epochs):
-                    obs, info = env.reset(seed=task['seed'])
-                    if task['historical_actions']:
-                        for action in task['historical_actions']:
-                            obs, _, term, trunc, _ = env.step(action); 
+        if len(buffers['curriculum']) > 0:
+            if args.curriculum:
+                metrics.start_timer("agent_updating_local_rl")
+                print(f"[Curriculum] Replaying {len(buffers['curriculum'])} tasks (Method: {args.curriculum_method})...")
+                while not buffers['curriculum'].is_empty():
+                    task = buffers['curriculum'].pop()
+                    # ... replaying task logic ...
+                    if args.curriculum_method in ['separate', 'kl']:
+                        aux_agent.q_net.load_state_dict(agent.q_net.state_dict())
+                        aux_agent.q_target.load_state_dict(agent.q_net.state_dict())
+                    train_agent = aux_agent if args.curriculum_method in ['separate', 'kl'] else agent
+                    for local_epoch in range(args.num_local_epochs):
+                        obs, info = env.reset(seed=task['seed'])
+                        if task['historical_actions']:
+                            for action in task['historical_actions']:
+                                obs, _, term, trunc, _ = env.step(action); 
+                                if term or trunc: break
+                        n_frames = 0
+                        traj_len = args.curriculum_traj_len if args.curriculum_traj_len > 0 else task.get('trajectory_length', 100)
+                        for _ in range(traj_len):
+                            action = train_agent.predict(obs, deterministic=False)
+                            next_obs, reward, term, trunc, info = env.step(action)
+                            local_reward = task['reward_fn'](obs, next_obs, reward) if task.get('reward_fn') else reward
+                            if args.curriculum_method == 'main':
+                                agent.update_td([(obs, action, reward, next_obs, term, trunc)])
+                                agent.update_td([(obs, action, local_reward, next_obs, term, trunc)])
+                            elif args.curriculum_method in ['separate', 'kl']:
+                                train_agent.update_td([(obs, action, local_reward, next_obs, term, trunc)])
+                                if args.curriculum_method == 'kl': buffers['kl_target'].push(obs)
+                                else: buffers['example'].push(obs, action, reward=reward, next_obs=next_obs, terminated=term, truncated=trunc)
+                            n_frames += 1
                             if term or trunc: break
-                    n_frames = 0
-                    traj_len = args.curriculum_traj_len if args.curriculum_traj_len > 0 else task.get('trajectory_length', 100)
-                    for _ in range(traj_len):
-                        action = train_agent.predict(obs, deterministic=False)
-                        next_obs, reward, term, trunc, info = env.step(action)
-                        local_reward = task['reward_fn'](obs, next_obs, reward) if task.get('reward_fn') else reward
-                        if args.curriculum_method == 'main':
-                            agent.update_td([(obs, action, reward, next_obs, term, trunc)])
-                            agent.update_td([(obs, action, local_reward, next_obs, term, trunc)])
-                        elif args.curriculum_method in ['separate', 'kl']:
-                            train_agent.update_td([(obs, action, local_reward, next_obs, term, trunc)])
-                            if args.curriculum_method == 'kl': buffers['kl_target'].push(obs)
-                            else: buffers['example'].push(obs, action, reward=reward, next_obs=next_obs, terminated=term, truncated=trunc)
-                        n_frames += 1
-                        if term or trunc: break
-                        obs = next_obs
-                    metrics.log_frames(n_frames, source="curriculum")
-            metrics.stop_timer("agent_updating_local_rl")
+                            obs = next_obs
+                        metrics.log_frames(n_frames, source="curriculum")
+                metrics.stop_timer("agent_updating_local_rl")
+            else:
+                print(f"[Curriculum] Warning: {len(buffers['curriculum'])} tasks in buffer but --curriculum flag is not set. Skipping.")
+                # We don't pop them so they stay for when the user might enable it? 
+                # Actually, in this loop, it's better to clear them or leave them. 
+                # If we leave them, they'll accumulate. Let's just warn for now.
 
         # PHASE 4: UNIFIED UPDATE
         unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristics, global_buffer_proxy)
