@@ -12,7 +12,7 @@ import pickle
 from Agent import Agent
 from RCQL import RCQLAgent
 from wrapper import InteractiveGymWrapper
-from buffers import ReplayBuffer, EpisodicReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuffer, ObservationBuffer
+from buffers import ReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuffer, ObservationBuffer, FastGPUEpisodicBuffer
 from metrics import MetricsLogger
 from llm_router import LLMRouter
 from eval_agent import evaluate_return, calculate_cross_entropy
@@ -21,7 +21,6 @@ from verification_manager import VerificationManager
 torch.set_num_threads(4)
 
 # --- Crafter Environment Wrapper ---
-
 class CrafterGymnasiumWrapper:
     def __init__(self):
         import crafter
@@ -31,29 +30,24 @@ class CrafterGymnasiumWrapper:
         self.render_mode = "rgb_array"
 
     def reset(self, seed=None, options=None):
-        if seed is not None:
-            self._env.seed(seed)
+        #if seed is not None:
+        #    self._env.seed(seed)
         obs = self._env.reset()
         return obs, {}
 
     def step(self, action):
         obs, reward, done, info = self._env.step(action)
-        # Gymnasium expects (obs, reward, terminated, truncated, info)
         return obs, reward, done, False, info
 
     def render(self):
-        # Upscale for better visibility if needed (e.g., in interactive mode)
-        # But for hydration/storage, standard 64x64 is fine.
-        # wrapper.py will call this.
         return self._env.render(size=(512, 512))
 
     def close(self):
         pass
 
 # --- Sub-functions ---
-
-def pre_load_episodic_data(args, agent, buffers, metrics):
-    """Loads expert episodic demonstrations."""
+def pre_load_episodic_data(args, buffers, metrics):
+    """Loads expert episodic demonstrations straight into VRAM."""
     if args.preload_expert_data and os.path.exists(args.preload_expert_data):
         with open(args.preload_expert_data, 'rb') as f:
             expert_dataset = pickle.load(f)
@@ -62,21 +56,39 @@ def pre_load_episodic_data(args, agent, buffers, metrics):
         total_duration = 0.0
         
         for item in expert_dataset:
-            # item is already a dict with 'transitions' and 'duration'
-            buffers['example'].push(item)
-            loaded_count += len(item['transitions'])
-            total_duration += item.get('duration', len(item['transitions']) / 30.0)
+            # Handle both [transitions, ...] and [{'transitions': transitions}, ...]
+            if isinstance(item, dict) and 'transitions' in item:
+                transitions = item['transitions']
+                duration = item.get('duration', len(transitions) / 30.0)
+            else:
+                transitions = item
+                duration = len(transitions) / 30.0
+                
+            buffers['expert'].add_episode(transitions)
+            loaded_count += len(transitions)
+            total_duration += duration
         
-        print(f"[Preload] Successfully loaded {len(expert_dataset)} episodes ({loaded_count} transitions) into example_buffer.")
+        print(f"[Preload] Successfully loaded {len(expert_dataset)} episodes ({loaded_count} transitions) into GPU buffer.")
         metrics.log_frames(loaded_count, source="expert_preload")
         metrics.timers["expert_preload_effort"] = total_duration
+    elif args.preload_expert_data:
+        print(f"[Preload] Warning: Expert data file not found at {args.preload_expert_data}")
 
-def run_rl_collection(agent, env, num_frames, metrics):
-    """Collects episodic experience using the RCQL agent."""
+def run_rl_collection(agent, env, buffers, num_frames, metrics, min_episodes=0):
+    """Collects episodic experience into the fast online buffer."""
     metrics.start_timer("rl_experience")
     episodes = []
     total_frames = 0
-    while total_frames < num_frames:
+    
+    current_episodes = buffers['online'].current_size
+    effective_min = min_episodes if current_episodes < min_episodes else 0
+    
+    if effective_min > 0:
+        print(f"Collecting RL experience (Target: {num_frames} frames OR {effective_min} new episodes)...")
+    else:
+        print(f"Collecting {num_frames} RL frames...")
+
+    while total_frames < num_frames or len(episodes) < effective_min:
         seed = np.random.randint(0, 1000000)
         obs, info = env.reset(seed=seed)
         agent.reset_hidden()
@@ -85,7 +97,7 @@ def run_rl_collection(agent, env, num_frames, metrics):
         trajectory_lite = []
         total_reward = 0
         
-        # Initial trajectory step
+        # Initial dummy state for trajectory tracking
         trajectory_lite.append({
             "obs": obs, "action": 0, "reward": 0, "next_obs": obs,
             "frame_image": None, "terminated": False, "truncated": False, 
@@ -93,18 +105,15 @@ def run_rl_collection(agent, env, num_frames, metrics):
         })
 
         while not (terminated or truncated):
-            # RCQL predict handles tensor conversion and hidden states
             action = agent.predict(obs, deterministic=False)
             next_obs, reward, terminated, truncated, info = env.step(action)
             
-            # Transition for RCQL Episodic Replay
             episode_transitions.append({
                 'obs': obs, 'action': action, 'reward': reward,
                 'next_obs': next_obs, 'terminated': terminated, 'truncated': truncated,
-                'info': info # Crucial for achievement tracking
+                'info': info 
             })
             
-            # For Interactive Review
             trajectory_lite.append({
                 "obs": obs, "action": action, "reward": reward, "next_obs": next_obs,
                 "frame_image": None, "terminated": terminated, "truncated": truncated, 
@@ -114,11 +123,16 @@ def run_rl_collection(agent, env, num_frames, metrics):
             obs = next_obs
             metrics.log_frames(1, source="rl")
             total_frames += 1
-            if total_frames >= num_frames: break
+            # We don't break early here to ensure full episodes are always recorded
+            # if total_frames >= num_frames: break 
             
-        # Store full episode in agent's buffer
-        agent.store_episode({'transitions': episode_transitions})
-        episodes.append({"seed": seed, "total_reward": total_reward, "trajectory": trajectory_lite})
+        # Push to the fast GPU buffer
+        if len(episode_transitions) > 0:
+            buffers['online'].add_episode(episode_transitions)
+            episodes.append({"seed": seed, "total_reward": total_reward, "trajectory": trajectory_lite})
+        
+        if total_frames >= num_frames and len(episodes) >= effective_min:
+            break
         
     metrics.stop_timer("rl_experience")
     return episodes
@@ -133,57 +147,66 @@ def hydrate_trajectory(env, seed, trajectory_lite):
         trajectory_lite[i]["frame_image"] = env.render()
     return trajectory_lite
 
-def unified_train_step(args, agent, aux_agent, buffers, metrics):
-    """Episodic RCQL training loop."""
-    # Use a dynamic batch size based on what's available
+def unified_train_step(args, agent, buffers, metrics):
     batch_size = 8
+    seq_len = 48
+    burn_in = 16
     
-    # Check if we have enough data to train at all
-    has_online = args.online_rl and len(agent.replay_buffer) >= batch_size
-    has_offline = (args.offline_rl or args.bc or args.awbc) and len(buffers['example']) >= batch_size
+    has_online = args.online_rl and buffers['online'].current_size >= batch_size
+    has_offline = (args.offline_rl or args.bc or args.awbc) and buffers['expert'].current_size >= batch_size
     
     if not (has_online or has_offline):
-        print(f"[Training] Skipping updates: Not enough episodes (Online: {len(agent.replay_buffer)}, Offline: {len(buffers['example'])})")
+        print(f"[Training] Skipping updates: Not enough episodes (Online: {buffers['online'].current_size}, Offline: {buffers['expert'].current_size})")
         return
 
     print(f"Updating Recurrent Agent ({args.num_unified_epochs} epochs)...")
     
     for epoch in range(args.num_unified_epochs):
-        # 0. Value Update (AWBC)
-        if args.awbc:
-            batch = []
-            if len(agent.replay_buffer) >= batch_size:
-                batch.extend(random.sample(list(agent.replay_buffer), batch_size))
-            if len(buffers['example']) >= batch_size:
-                batch.extend(buffers['example'].sample(batch_size))
-            if len(batch) >= batch_size:
-                metrics.start_timer("agent_updating_value")
-                agent.update_value(batch)
-                metrics.stop_timer("agent_updating_value")
-
-        # 1. TD Updates (RL)
-        if args.online_rl and len(agent.replay_buffer) >= batch_size:
-            metrics.start_timer("agent_updating_rl")
-            batch = random.sample(list(agent.replay_buffer), batch_size)
-            agent.update_td(batch)
-            metrics.stop_timer("agent_updating_rl")
-
-        if args.offline_rl and len(buffers['example']) >= batch_size:
-            metrics.start_timer("agent_updating_rl")
-            batch = buffers['example'].sample(batch_size)
-            agent.update_td(batch)
-            metrics.stop_timer("agent_updating_rl")
-
-        # 2. Supervised Updates (BC)
-        if (args.bc or args.awbc) and len(buffers['example']) >= batch_size:
-            metrics.start_timer("agent_updating_bc")
-            batch = buffers['example'].sample(batch_size)
-            agent.update_supervised(batch)
-            metrics.stop_timer("agent_updating_bc")
         
-        if (epoch + 1) % 10 == 0:
-            print(f"    Epoch {epoch+1}/{args.num_unified_epochs} complete...")
+        # --- OFFLINE / BEHAVIOR CLONING UPDATES ---
+        if has_offline:
+            exp_obs, exp_acts, exp_rews, exp_dones, exp_masks = buffers['expert'].sample_batch(batch_size, seq_len=seq_len)
+            
+            if args.awbc:
+                metrics.start_timer("agent_updating_value")
+                agent.update_value(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
+                metrics.stop_timer("agent_updating_value")
+                
+                metrics.start_timer("agent_updating_bc")
+                # Calculate Advantage using Value Network: A = r + gamma*V(s') - V(s)
+                with torch.no_grad():
+                    v_s_full, _ = agent.v_net(exp_obs[:, burn_in:, :])
+                    v_s = v_s_full[:, :-1, :].squeeze(-1)
+                    v_ns = v_s_full[:, 1:, :].squeeze(-1)
+                    
+                    r_active = exp_rews[:, burn_in:]
+                    d_active = exp_dones[:, burn_in:]
+                    td_error = r_active + (1.0 - d_active) * agent.gamma * v_ns - v_s
+                    advantages = F.relu(td_error + 1.0)
+                
+                agent.update_supervised(exp_obs, exp_acts, exp_masks, burn_in=burn_in, advantages=advantages)
+                metrics.stop_timer("agent_updating_bc")
+            
+            elif args.bc:
+                metrics.start_timer("agent_updating_bc")
+                agent.update_supervised(exp_obs, exp_acts, exp_masks, burn_in=burn_in)
+                metrics.stop_timer("agent_updating_bc")
+                
+            if args.offline_rl:
+                metrics.start_timer("agent_updating_rl")
+                agent.update_td(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
+                metrics.stop_timer("agent_updating_rl")
 
+        # --- ONLINE RL UPDATES ---
+        if has_online:
+            on_obs, on_acts, on_rews, on_dones, on_masks = buffers['online'].sample_batch(batch_size, seq_len=seq_len)
+            
+            metrics.start_timer("agent_updating_rl")
+            agent.update_td(on_obs, on_acts, on_rews, on_dones, on_masks, burn_in=burn_in)
+            metrics.stop_timer("agent_updating_rl")
+        
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"    Epoch {epoch+1}/{args.num_unified_epochs} complete...")
 
 def main():
     import argparse
@@ -201,6 +224,7 @@ def main():
     parser.add_argument("--preload_expert_data", type=str, default="expert_demonstrations_crafter.pkl")
     args = parser.parse_args()
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     hparam_str = f"rcql_on{int(args.online_rl)}_off{int(args.offline_rl)}_bc{int(args.bc)}_seed{args.seed}"
     results_base_dir = os.path.join("results", args.env, args.experiment_name, hparam_str)
     os.makedirs(results_base_dir, exist_ok=True)
@@ -211,17 +235,17 @@ def main():
         obs_dim = (3, 64, 64)
         action_dim = 17
     else:
-        # Fallback for simple tests
         env = gym.make(args.env, render_mode="rgb_array")
         obs_dim = env.observation_space.shape
         action_dim = env.action_space.n
 
-    agent = RCQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="RCQL", save_dir=results_base_dir, device_name="cpu")
+    agent = RCQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="RCQL", save_dir=results_base_dir, device_name=device)
 
-    # 2. Setup Episodic Buffers
+    # 2. Setup Fast GPU Buffers
+    # Crafter maximum episode limit is typically 2000-2500 steps. 2600 is safe.
     buffers = {
-        'example': EpisodicReplayBuffer(capacity=1000), 
-        'anti_example': EpisodicReplayBuffer(capacity=1000), # Standard is fine for anti-examples (pointwise rejection)
+        'expert': FastGPUEpisodicBuffer(max_episodes=50, max_ep_len=2600, device=device, obs_shape=obs_dim), 
+        'online': FastGPUEpisodicBuffer(max_episodes=200, max_ep_len=2600, device=device, obs_shape=obs_dim),
         'llm': LLMBuffer(),
         'curriculum': CurriculumBuffer(),
         'ssl': SemiSupervisedBuffer(capacity=5000),
@@ -229,21 +253,21 @@ def main():
     }
     
     metrics = MetricsLogger()
-    pre_load_episodic_data(args, agent, buffers, metrics)
+    pre_load_episodic_data(args, buffers, metrics)
     
-    # Router (Legacy support, though Crafter might need new heuristics)
     router = LLMRouter(buffers['curriculum'], buffers['ssl'], env_name=args.env)
     
     TOTAL_ITERATIONS = 20
     for iteration in range(TOTAL_ITERATIONS):
         print(f"\n=== Iteration {iteration} ===")
         
-        # PHASE 1: ACQUISITION
         episodes = []
         if args.num_rl_frames > 0:
-            episodes = run_rl_collection(agent, env, num_frames=args.num_rl_frames, metrics=metrics)
+            # If online_rl is enabled and we don't have enough episodes yet, 
+            # ensure we collect at least 8 to start training.
+            min_episodes = 8 if args.online_rl and iteration == 0 else 0
+            episodes = run_rl_collection(agent, env, buffers, num_frames=args.num_rl_frames, metrics=metrics, min_episodes=min_episodes)
         
-        # PHASE 2: INTERACTION
         if args.intervention and len(episodes) > 0:
             print("Starting Interactive Review...")
             summary_ep = min(episodes, key=lambda x: x['total_reward'])
@@ -255,25 +279,23 @@ def main():
             )
             corrected_trajectory, annotations, _ = wrapper.run()
             
-            # Convert trajectory to episode
-            human_episode = {'transitions': []}
+            human_episode = []
             for i in range(len(corrected_trajectory) - 1):
                 s, ns = corrected_trajectory[i], corrected_trajectory[i+1]
                 if ns.get('action') is not None:
-                    human_episode['transitions'].append({
+                    human_episode.append({
                         'obs': s['obs'], 'action': ns['action'], 'reward': ns.get('reward', 0.0),
                         'next_obs': ns['obs'], 'terminated': ns.get('terminated', False),
                         'truncated': ns.get('truncated', False)
                     })
-            if human_episode['transitions']:
-                buffers['example'].push(human_episode)
+            if human_episode:
+                buffers['expert'].add_episode(human_episode)
 
-        # PHASE 3: UPDATES
-        unified_train_step(args, agent, None, buffers, metrics)
+        # Train 
+        unified_train_step(args, agent, buffers, metrics)
 
-        # PHASE 4: EVALUATION
+        # Eval
         print("Evaluating...")
-        # Custom evaluation loop to track action distribution
         eval_rewards = []
         action_counts = collections.defaultdict(int)
         for _ in range(5):
@@ -290,11 +312,10 @@ def main():
         mean_ret = np.mean(eval_rewards)
         std_ret = np.std(eval_rewards)
         
-        # Calculate BC validation loss
         bc_loss = 0.0
-        if len(buffers['example']) > 0:
-            val_batch = buffers['example'].sample(min(len(buffers['example']), 16))
-            bc_loss = agent.get_bc_loss(val_batch)
+        if buffers['expert'].current_size > 0:
+            v_obs, v_acts, _, _, v_masks = buffers['expert'].sample_batch(min(buffers['expert'].current_size, 16), seq_len=48)
+            bc_loss = agent.get_bc_loss(v_obs, v_acts, v_masks, burn_in=16)
 
         print(f"    Eval Return: {mean_ret:.2f}")
         print(f"    Validation BC Loss: {bc_loss:.4f}")

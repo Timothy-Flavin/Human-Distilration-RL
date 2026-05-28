@@ -182,114 +182,127 @@ class RCQLAgent(Agent):
     def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         pass
 
-    def _prepare_batch(self, batch_episodes, seq_len=32):
-        """Samples sequences of length seq_len from anywhere in the episode."""
-        obs_seqs, action_seqs, reward_seqs, done_seqs = [], [], [], []
+    # def _prepare_batch(self, batch_episodes, seq_len=32):
+    #     """Samples sequences of length seq_len from anywhere in the episode."""
+    #     obs_seqs, action_seqs, reward_seqs, done_seqs = [], [], [], []
         
-        for ep in batch_episodes:
-            transitions = ep['transitions']
-            L = len(transitions)
+    #     for ep in batch_episodes:
+    #         transitions = ep['transitions']
+    #         L = len(transitions)
             
-            if L <= seq_len:
-                start_idx = 0
-                actual_len = L
-            else:
-                # Random window sampling
-                start_idx = random.randint(0, L - seq_len)
-                actual_len = seq_len
+    #         if L <= seq_len:
+    #             start_idx = 0
+    #             actual_len = L
+    #         else:
+    #             # Random window sampling
+    #             start_idx = random.randint(0, L - seq_len)
+    #             actual_len = seq_len
                 
-            sub_seq = transitions[start_idx : start_idx + actual_len]
+    #         sub_seq = transitions[start_idx : start_idx + actual_len]
             
-            # obs includes s_t ... s_{t+actual_len}
-            obs = [t['obs'] for t in sub_seq]
-            # s_{t+actual_len+1} is the next_obs of the last transition in window
-            obs.append(sub_seq[-1]['next_obs'])
+    #         # obs includes s_t ... s_{t+actual_len}
+    #         obs = [t['obs'] for t in sub_seq]
+    #         # s_{t+actual_len+1} is the next_obs of the last transition in window
+    #         obs.append(sub_seq[-1]['next_obs'])
             
-            actions = [t['action'] for t in sub_seq]
-            rewards = [t['reward'] for t in sub_seq]
-            dones = [float(t['terminated'] or t['truncated']) for t in sub_seq]
+    #         actions = [t['action'] for t in sub_seq]
+    #         rewards = [t['reward'] for t in sub_seq]
+    #         dones = [float(t['terminated'] or t['truncated']) for t in sub_seq]
             
-            if actual_len < seq_len:
-                pad_len = seq_len - actual_len
-                obs += [np.zeros_like(obs[0])] * pad_len
-                actions += [0] * pad_len
-                rewards += [0.0] * pad_len
-                dones += [1.0] * pad_len
+    #         if actual_len < seq_len:
+    #             pad_len = seq_len - actual_len
+    #             obs += [np.zeros_like(obs[0])] * pad_len
+    #             actions += [0] * pad_len
+    #             rewards += [0.0] * pad_len
+    #             dones += [1.0] * pad_len
                 
-            obs_seqs.append(obs)
-            action_seqs.append(actions)
-            reward_seqs.append(rewards)
-            done_seqs.append(dones)
+    #         obs_seqs.append(obs)
+    #         action_seqs.append(actions)
+    #         reward_seqs.append(rewards)
+    #         done_seqs.append(dones)
 
-        obs_tensor = torch.tensor(np.array(obs_seqs), dtype=torch.float32).to(self.device_name)
-        obs_tensor = self._ensure_channel_first(obs_tensor)
-        obs_tensor = self._normalize(obs_tensor)
+    #     obs_tensor = torch.tensor(np.array(obs_seqs), dtype=torch.float32).to(self.device_name)
+    #     obs_tensor = self._ensure_channel_first(obs_tensor)
+    #     obs_tensor = self._normalize(obs_tensor)
         
-        action_tensor = torch.tensor(np.array(action_seqs), dtype=torch.long).to(self.device_name)
-        reward_tensor = torch.tensor(np.array(reward_seqs), dtype=torch.float32).to(self.device_name)
-        done_tensor = torch.tensor(np.array(done_seqs), dtype=torch.float32).to(self.device_name)
+    #     action_tensor = torch.tensor(np.array(action_seqs), dtype=torch.long).to(self.device_name)
+    #     reward_tensor = torch.tensor(np.array(reward_seqs), dtype=torch.float32).to(self.device_name)
+    #     done_tensor = torch.tensor(np.array(done_seqs), dtype=torch.float32).to(self.device_name)
         
-        return obs_tensor, action_tensor, reward_tensor, done_tensor
+    #     return obs_tensor, action_tensor, reward_tensor, done_tensor
 
 
-
-    def update_value(self, batch_episodes, burn_in=16) -> dict:
-        joint_obs, _, rewards, dones = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
-        
-        # 1. Burn-in: Establish hidden state without grad
+    def update_value(self, obs, actions, rewards, dones, masks, burn_in=16) -> dict:
+        # 1. Burn-in Phase (No Gradients)
         with torch.no_grad():
-            burn_obs = joint_obs[:, :burn_in, :]
-            _, h_v = self.v_net(burn_obs)
-            _, h_v_target = self.v_target(burn_obs)
+            if burn_in > 0:
+                burn_obs = obs[:, :burn_in, :]
+                _, h_v = self.v_net(burn_obs)
+                _, h_v_target = self.v_target(burn_obs)
+            else:
+                h_v, h_v_target = None, None
 
-        # 2. Main Update: Calculate loss on the remaining sequence
-        obs_active = joint_obs[:, burn_in:, :] # Contains s_burn..s_end (len 33)
+        # 2. Main Sequence Processing
+        obs_active = obs[:, burn_in:, :] # Length: update_len + 1
+        r_active = rewards[:, burn_in:]
+        d_active = dones[:, burn_in:]
+        m_active = masks[:, burn_in:]
+
         v_full, _ = self.v_net(obs_active, hidden=h_v)
         current_v = v_full[:, :-1, :].squeeze(-1)
-        
+
         with torch.no_grad():
             v_target_full, _ = self.v_target(obs_active, hidden=h_v_target)
             next_v = v_target_full[:, 1:, :].squeeze(-1)
-            # rewards/dones need to be sliced to match the loss-active window
-            r_active = rewards[:, burn_in:]
-            d_active = dones[:, burn_in:]
             target_v = r_active + (1.0 - d_active) * self.gamma * next_v
 
-        v_loss = F.mse_loss(current_v, target_v)
+        # 3. Masked Loss
+        v_td_loss_unmasked = F.mse_loss(current_v, target_v, reduction='none')
+        valid_steps = m_active.sum() + 1e-8
+        v_loss = (v_td_loss_unmasked * m_active).sum() / valid_steps
+
         self.v_optimizer.zero_grad()
         v_loss.backward()
         self.v_optimizer.step()
 
         for param, target_param in zip(self.v_net.parameters(), self.v_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-        return {"loss_v": v_loss.item(), "v_mean": current_v.mean().item()}
+            
+        return {"loss_v": v_loss.item(), "v_mean": (current_v * m_active).sum().item() / valid_steps.item()}
 
-    def update_td(self, batch_episodes, burn_in=16, ssl: bool = False, masks: list = None) -> dict:
-        joint_obs, actions, rewards, dones = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
-        
-        # 1. Burn-in
+    def update_td(self, obs, actions, rewards, dones, masks, burn_in=16) -> dict:
+        # 1. Burn-in Phase
         with torch.no_grad():
-            burn_obs = joint_obs[:, :burn_in, :]
-            _, h_q = self.q_net(burn_obs)
-            _, h_q_target = self.q_target(burn_obs)
+            if burn_in > 0:
+                burn_obs = obs[:, :burn_in, :]
+                _, h_q = self.q_net(burn_obs)
+                _, h_q_target = self.q_target(burn_obs)
+            else:
+                h_q, h_q_target = None, None
 
-        # 2. Main Update
-        obs_active = joint_obs[:, burn_in:, :]
+        # 2. Main Sequence
+        obs_active = obs[:, burn_in:, :]
+        a_active = actions[:, burn_in:]
+        r_active = rewards[:, burn_in:]
+        d_active = dones[:, burn_in:]
+        m_active = masks[:, burn_in:]
+
         q_logits_full, _ = self.q_net(obs_active, hidden=h_q)
         q_logits = q_logits_full[:, :-1, :]
-        
-        a_active = actions[:, burn_in:]
         current_q = q_logits.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
-        
+
         with torch.no_grad():
             q_target_full, _ = self.q_target(obs_active, hidden=h_q_target)
             next_q = q_target_full[:, 1:, :].max(2)[0]
-            r_active = rewards[:, burn_in:]
-            d_active = dones[:, burn_in:]
             target_q = r_active + (1.0 - d_active) * self.gamma * next_q
 
-        q_loss = F.mse_loss(current_q, target_q)
-        cql_loss = torch.logsumexp(q_logits, dim=2).mean() - current_q.mean()
+        # 3. Masked Loss
+        q_td_loss_unmasked = F.mse_loss(current_q, target_q, reduction='none')
+        cql_loss_unmasked = torch.logsumexp(q_logits, dim=2) - current_q
+
+        valid_steps = m_active.sum() + 1e-8
+        q_loss = (q_td_loss_unmasked * m_active).sum() / valid_steps
+        cql_loss = (cql_loss_unmasked * m_active).sum() / valid_steps
         total_loss = q_loss + self.cql_alpha * cql_loss
 
         self.q_optimizer.zero_grad()
@@ -299,82 +312,75 @@ class RCQLAgent(Agent):
         for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        return {"loss_td": total_loss.item(), "q_loss": q_loss.item(), "cql_loss": cql_loss.item(), "q_mean": current_q.mean().item()}
+        return {"loss_td": total_loss.item(), "q_loss": q_loss.item(), "cql_loss": cql_loss.item()}
 
-    def update_supervised(self, batch_episodes, burn_in=16, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
-        joint_obs, actions, _, _ = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
-        
-        # 1. Burn-in
+    def update_supervised(self, obs, actions, masks, burn_in=16, anti=False, advantages=None) -> dict:
+        # 1. Burn-in Phase
         with torch.no_grad():
-            burn_obs = joint_obs[:, :burn_in, :]
-            _, h_q = self.q_net(burn_obs)
+            if burn_in > 0:
+                burn_obs = obs[:, :burn_in, :]
+                _, h_q = self.q_net(burn_obs)
+            else:
+                h_q = None
 
-        # 2. Main Update
-        obs_active = joint_obs[:, burn_in:-1, :] # s_burn..s_T (len 32)
+        # 2. Main Sequence
+        obs_active = obs[:, burn_in:-1, :] # s_burn..s_T
         a_active = actions[:, burn_in:]
-        
-        logits, _ = self.q_net(obs_active, hidden=h_q)
-        logits = logits.reshape(-1, self.action_dim)
-        labels = a_active.reshape(-1)
+        m_active = masks[:, burn_in:]
 
+        logits, _ = self.q_net(obs_active, hidden=h_q)
+
+        # 3. Masked Supervised Loss
         if anti:
-            probs = F.softmax(logits, dim=1)
-            bad_action_probs = probs.gather(1, labels.unsqueeze(1)).squeeze()
-            loss = -torch.log(1 - bad_action_probs + 1e-8).mean()
+            probs = F.softmax(logits, dim=2)
+            bad_action_probs = probs.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
+            loss_unmasked = -torch.log(1 - bad_action_probs + 1e-8)
         else:
             if advantages is not None:
-                # Adv needs careful slicing if passed, but usually AWBC doesn't use burn-in
-                # for the adv tensor calculation itself.
-                adv = advantages.to(self.device_name).reshape(-1)
-                log_probs = F.log_softmax(logits, dim=1)
-                selected_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze()
-                loss = -(adv * selected_log_probs).mean()
+                adv = advantages.to(self.device_name)
+                log_probs = F.log_softmax(logits, dim=2)
+                selected_log_probs = log_probs.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
+                loss_unmasked = -(adv * selected_log_probs)
             else:
-                loss = F.cross_entropy(logits, labels)
+                logits_flat = logits.reshape(-1, self.action_dim)
+                a_flat = a_active.reshape(-1)
+                ce_unmasked = F.cross_entropy(logits_flat, a_flat, reduction='none')
+                loss_unmasked = ce_unmasked.reshape(a_active.shape)
+
+        valid_steps = m_active.sum() + 1e-8
+        loss = (loss_unmasked * m_active).sum() / valid_steps
 
         self.q_optimizer.zero_grad()
         loss.backward()
         self.q_optimizer.step()
+        
         return {"loss_supervised": loss.item()}
-
-    def get_bc_loss(self, batch_episodes, burn_in=16) -> float:
-        """Calculates supervised loss with burn-in Settlement."""
+    
+    def get_bc_loss(self, obs, actions, masks, burn_in=16) -> float:
         self.q_net.eval()
         with torch.no_grad():
-            joint_obs, actions, _, _ = self._prepare_batch(batch_episodes, seq_len=burn_in+32)
-            # Burn-in pass
-            burn_obs = joint_obs[:, :burn_in, :]
-            _, h_q = self.q_net(burn_obs)
-            
-            # Loss pass
-            obs_active = joint_obs[:, burn_in:-1, :]
+            if burn_in > 0:
+                burn_obs = obs[:, :burn_in, :]
+                _, h_q = self.q_net(burn_obs)
+            else:
+                h_q = None
+
+            obs_active = obs[:, burn_in:-1, :]
             a_active = actions[:, burn_in:]
+            m_active = masks[:, burn_in:]
+
             logits, _ = self.q_net(obs_active, hidden=h_q)
-            logits = logits.reshape(-1, self.action_dim)
-            labels = a_active.reshape(-1)
-            loss = F.cross_entropy(logits, labels)
+            logits_flat = logits.reshape(-1, self.action_dim)
+            a_flat = a_active.reshape(-1)
+            
+            ce_unmasked = F.cross_entropy(logits_flat, a_flat, reduction='none')
+            loss_unmasked = ce_unmasked.reshape(a_active.shape)
+            
+            valid_steps = m_active.sum() + 1e-8
+            loss = (loss_unmasked * m_active).sum() / valid_steps
+            
         self.q_net.train()
         return loss.item()
-
-
-        if anti:
-            probs = F.softmax(logits, dim=1)
-            bad_action_probs = probs.gather(1, labels.unsqueeze(1)).squeeze()
-            loss = -torch.log(1 - bad_action_probs + 1e-8).mean()
-        else:
-            if advantages is not None:
-                adv = advantages.to(self.device_name).view(-1)
-                log_probs = F.log_softmax(logits, dim=1)
-                selected_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze()
-                loss = -(adv * selected_log_probs).mean()
-            else:
-                loss = F.cross_entropy(logits, labels)
-
-        self.q_optimizer.zero_grad()
-        loss.backward()
-        self.q_optimizer.step()
-        return {"loss_supervised": loss.item()}
-
     def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
         if len(obs.shape) == 4:
             obs = obs.unsqueeze(1)

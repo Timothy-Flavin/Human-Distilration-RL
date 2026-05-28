@@ -5,6 +5,7 @@ import random
 from RCQL import RCQLAgent
 from rcql_test_env import FlickeringCatchEnv
 import matplotlib.pyplot as plt
+from buffers import FastGPUEpisodicBuffer
 
 def test_pipeline_sliding_window():
     """
@@ -88,6 +89,13 @@ def run_flicker_catch(num_episodes=1000):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     agent = RCQLAgent(obs_dim, action_dim, device_name=device, lr=1e-3, epsilon=0.2)
     agent.cql_alpha = 0.0
+    # Before the episode loop
+    fast_buffer = FastGPUEpisodicBuffer(
+        max_episodes=num_episodes, 
+        max_ep_len=16, 
+        device=device, 
+        obs_shape=(3, 16, 16)  # <--- Add this
+    )
     
     eval_intervals = 50
     eval_episodes = 20
@@ -106,13 +114,13 @@ def run_flicker_catch(num_episodes=1000):
             episode.append({'obs': obs, 'action': action, 'reward': reward, 'next_obs': next_obs, 'terminated': term, 'truncated': trunc})
             obs = next_obs
         
-        agent.store_episode({'transitions': episode})
-        
-        if len(agent.replay_buffer) >= 16:
+        #agent.store_episode({'transitions': episode})
+        fast_buffer.add_episode(episode)
+        if fast_buffer.current_size >= 16:
             for _ in range(4):
-                batch = random.sample(list(agent.replay_buffer), 8)
-                agent.update_td(batch)
-                agent.update_value(batch)
+                # seq_len=15 covers the full drop
+                obs_b, act_b, rew_b, done_b, mask_b = fast_buffer.sample_batch(8, seq_len=15)
+                agent.update_td(obs_b, act_b, rew_b, done_b, mask_b, burn_in=4)
         
         if (ep + 1) % eval_intervals == 0:
             eval_rewards = []
@@ -143,5 +151,5 @@ def run_flicker_catch(num_episodes=1000):
     print("    [*] Plot saved to flicker_catch_results.png")
 
 if __name__ == "__main__":
-    test_pipeline_sliding_window()
+    #test_pipeline_sliding_window()
     run_flicker_catch()

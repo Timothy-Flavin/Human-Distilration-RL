@@ -5,6 +5,7 @@ from rcql_test_env import MemorySanityEnv
 from RCQL import RCQLAgent
 import random
 import os
+from buffers import FastGPUEpisodicBuffer # Assuming you saved it here
 
 # Suppress hardware warnings globally for manual runs
 os.environ['MKLDNN_VERBOSE'] = '0'
@@ -43,6 +44,12 @@ def run_test(mode="always_blue", num_episodes=512, test_name="Sanity Test"):
     # standard hyperparameters
     agent = RCQLAgent(obs_dim, action_dim, name=f"RCQL_{mode}", device_name=device, lr=3e-4, epsilon=0.2)
     agent.cql_alpha = 0.0 # pure Q-learning verification
+    fast_buffer = FastGPUEpisodicBuffer(
+        max_episodes=num_episodes, 
+        max_ep_len=10, 
+        device=device, 
+        obs_shape=(3, 16, 16)  # <--- Add this
+    )
     
     eval_intervals = 32
     eval_episodes = 16
@@ -69,13 +76,15 @@ def run_test(mode="always_blue", num_episodes=512, test_name="Sanity Test"):
             })
             obs = next_obs
             
-        agent.store_episode({'transitions': episode_transitions})
-        
-        if len(agent.replay_buffer) >= 16:
+        agent.store_episode({'transitions': episode_transitions}) # Keep for compatibility if needed
+        fast_buffer.add_episode(episode_transitions)
+        if fast_buffer.current_size >= 16:
             for _ in range(4):
-                batch = random.sample(list(agent.replay_buffer), 8)
-                agent.update_td(batch)
-                agent.update_value(batch)
+                # Sample with seq_len=8 (covers the entire 8-step episode)
+                obs_b, act_b, rew_b, done_b, mask_b = fast_buffer.sample_batch(8, seq_len=8)
+                # Use a small burn_in for the tiny test env
+                agent.update_td(obs_b, act_b, rew_b, done_b, mask_b, burn_in=0)
+                # agent.update_value(obs_b, act_b, rew_b, done_b, mask_b, burn_in=2)
             
         if (ep + 1) % 20 == 0:
             print(f"[*] Episode {ep+1}/{num_episodes}...")
@@ -101,8 +110,10 @@ def run_test(mode="always_blue", num_episodes=512, test_name="Sanity Test"):
                 qs_list = [get_final_step_qs(agent, "stochastic", device) for _ in range(5)]
                 final_qs = np.mean(qs_list, axis=0)
 
-            mean_r = np.mean(rewards); std_r = np.std(rewards)
-            eval_rewards_mean.append(mean_r); eval_rewards_std.append(std_r)
+            mean_r = np.mean(rewards)
+            std_r = np.std(rewards)
+            eval_rewards_mean.append(mean_r)
+            eval_rewards_std.append(std_r)
             eval_steps.append(ep + 1)
             for a in range(action_dim):
                 eval_q_values[a].append(final_qs[a])

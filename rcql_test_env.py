@@ -57,6 +57,7 @@ class MemorySanityEnv(gym.Env):
             else:
                 self.target_action = 2  # Noise
                 obs = self._get_noise()
+                
 
         return obs, {}
 
