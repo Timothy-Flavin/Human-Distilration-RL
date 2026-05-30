@@ -15,7 +15,6 @@ CLEANED_EXPERT_DATA="expert_demonstrations_crafter_cleaned.pkl"
 ITERATIONS=20
 UNIFIED_EPOCHS_OFFLINE=400
 UNIFIED_EPOCHS_ONLINE=400
-RL_FRAMES=2000
 
 echo "=========================================================="
 echo "Freshman: Starting Recurrent Hands-Free Suite (Crafter)"

@@ -268,7 +268,12 @@ class RCQLAgent(Agent):
         for param, target_param in zip(self.v_net.parameters(), self.v_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
             
-        return {"loss_v": v_loss.item(), "v_mean": (current_v * m_active).sum().item() / valid_steps.item()}
+        return {
+            "loss_v": v_loss.item(), 
+            "v_mean": (current_v * m_active).sum().item() / valid_steps.item(),
+            "current_v": current_v.detach(),
+            "next_v": next_v.detach()
+        }
 
     def update_td(self, obs, actions, rewards, dones, masks, burn_in=16) -> dict:
         # 1. Burn-in Phase
@@ -312,16 +317,22 @@ class RCQLAgent(Agent):
         for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        return {"loss_td": total_loss.item(), "q_loss": q_loss.item(), "cql_loss": cql_loss.item()}
+        return {
+            "loss_td": total_loss.item(), 
+            "q_loss": q_loss.item(), 
+            "cql_loss": cql_loss.item(),
+            "h_q": h_q # Return cached h_q for supervised update
+        }
 
-    def update_supervised(self, obs, actions, masks, burn_in=16, anti=False, advantages=None) -> dict:
-        # 1. Burn-in Phase
-        with torch.no_grad():
-            if burn_in > 0:
-                burn_obs = obs[:, :burn_in, :]
-                _, h_q = self.q_net(burn_obs)
-            else:
-                h_q = None
+    def update_supervised(self, obs, actions, masks, burn_in=16, anti=False, advantages=None, h_q=None) -> dict:
+        # 1. Burn-in Phase (only if h_q not provided)
+        if h_q is None:
+            with torch.no_grad():
+                if burn_in > 0:
+                    burn_obs = obs[:, :burn_in, :]
+                    _, h_q = self.q_net(burn_obs)
+                else:
+                    h_q = None
 
         # 2. Main Sequence
         obs_active = obs[:, burn_in:-1, :] # s_burn..s_T

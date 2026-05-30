@@ -161,52 +161,64 @@ def unified_train_step(args, agent, buffers, metrics):
 
     print(f"Updating Recurrent Agent ({args.num_unified_epochs} epochs)...")
     
+    start_time = time.time()
+    total_frames_processed = 0
+
     for epoch in range(args.num_unified_epochs):
         
         # --- OFFLINE / BEHAVIOR CLONING UPDATES ---
         if has_offline:
             exp_obs, exp_acts, exp_rews, exp_dones, exp_masks = buffers['expert'].sample_batch(batch_size, seq_len=seq_len)
+            total_frames_processed += batch_size * (seq_len + 1)
             
+            cached_v = None
+            cached_h_q = None
+
             if args.awbc:
                 metrics.start_timer("agent_updating_value")
-                agent.update_value(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
+                v_results = agent.update_value(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
+                cached_v = (v_results['current_v'], v_results['next_v'])
                 metrics.stop_timer("agent_updating_value")
+
+            if args.offline_rl:
+                metrics.start_timer("agent_updating_rl")
+                td_results = agent.update_td(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
+                cached_h_q = td_results.get('h_q')
+                metrics.stop_timer("agent_updating_rl")
                 
+            if args.awbc or args.bc:
                 metrics.start_timer("agent_updating_bc")
-                # Calculate Advantage using Value Network: A = r + gamma*V(s') - V(s)
-                with torch.no_grad():
-                    v_s_full, _ = agent.v_net(exp_obs[:, burn_in:, :])
-                    v_s = v_s_full[:, :-1, :].squeeze(-1)
-                    v_ns = v_s_full[:, 1:, :].squeeze(-1)
-                    
+                
+                advantages = None
+                if args.awbc and cached_v is not None:
+                    # Calculate Advantage using Value Network: A = r + gamma*V(s') - V(s)
+                    v_s, v_ns = cached_v
                     r_active = exp_rews[:, burn_in:]
                     d_active = exp_dones[:, burn_in:]
                     td_error = r_active + (1.0 - d_active) * agent.gamma * v_ns - v_s
                     advantages = F.relu(td_error + 1.0)
                 
-                agent.update_supervised(exp_obs, exp_acts, exp_masks, burn_in=burn_in, advantages=advantages)
+                agent.update_supervised(exp_obs, exp_acts, exp_masks, burn_in=burn_in, advantages=advantages, h_q=cached_h_q)
                 metrics.stop_timer("agent_updating_bc")
-            
-            elif args.bc:
-                metrics.start_timer("agent_updating_bc")
-                agent.update_supervised(exp_obs, exp_acts, exp_masks, burn_in=burn_in)
-                metrics.stop_timer("agent_updating_bc")
-                
-            if args.offline_rl:
-                metrics.start_timer("agent_updating_rl")
-                agent.update_td(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
-                metrics.stop_timer("agent_updating_rl")
 
         # --- ONLINE RL UPDATES ---
         if has_online:
             on_obs, on_acts, on_rews, on_dones, on_masks = buffers['online'].sample_batch(batch_size, seq_len=seq_len)
+            total_frames_processed += batch_size * (seq_len + 1)
             
             metrics.start_timer("agent_updating_rl")
             agent.update_td(on_obs, on_acts, on_rews, on_dones, on_masks, burn_in=burn_in)
             metrics.stop_timer("agent_updating_rl")
         
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"    Epoch {epoch+1}/{args.num_unified_epochs} complete...")
+            elapsed = time.time() - start_time
+            fps = total_frames_processed / (elapsed + 1e-6)
+            print(f"    Epoch {epoch+1}/{args.num_unified_epochs} complete... ({fps:.2f} FPS)")
+
+    total_elapsed = time.time() - start_time
+    total_fps = total_frames_processed / (total_elapsed + 1e-6)
+    print(f"[Benchmark] Training step complete. Total FPS: {total_fps:.2f}")
+    metrics.timers["training_throughput_fps"] = total_fps
 
 def main():
     import argparse
@@ -242,10 +254,10 @@ def main():
     agent = RCQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="RCQL", save_dir=results_base_dir, device_name=device)
 
     # 2. Setup Fast GPU Buffers
-    # Crafter maximum episode limit is typically 2000-2500 steps. 2600 is safe.
+    # Total transitions: 200,000 (~2.4 GB)
     buffers = {
-        'expert': FastGPUEpisodicBuffer(max_episodes=50, max_ep_len=2600, device=device, obs_shape=obs_dim), 
-        'online': FastGPUEpisodicBuffer(max_episodes=200, max_ep_len=2600, device=device, obs_shape=obs_dim),
+        'expert': FastGPUEpisodicBuffer(max_total_transitions=50000, device=device, obs_shape=obs_dim), 
+        'online': FastGPUEpisodicBuffer(max_total_transitions=150000, device=device, obs_shape=obs_dim),
         'llm': LLMBuffer(),
         'curriculum': CurriculumBuffer(),
         'ssl': SemiSupervisedBuffer(capacity=5000),

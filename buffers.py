@@ -2,51 +2,63 @@ import torch
 import collections
 import random
 import numpy as np
-import random
-
-import torch
-import numpy as np
-import random
 
 class FastGPUEpisodicBuffer:
-    def __init__(self, max_episodes=500, max_ep_len=2600, device="cuda", obs_shape=(3, 64, 64)):
-        self.max_episodes = max_episodes
-        self.max_ep_len = max_ep_len
+    """
+    Optimized Flat Buffer: Stores transitions consecutively to save VRAM.
+    Eliminates the (max_episodes, max_ep_len) zero-padding.
+    """
+    def __init__(self, max_total_transitions=200000, device="cuda", obs_shape=(3, 64, 64)):
+        self.max_transitions = max_total_transitions
         self.device = device
-        self.current_size = 0
+        self.obs_shape = obs_shape
+        
+        print(f"[Buffer] Allocating Flat GPU memory for {max_total_transitions} transitions...")
+        
+        # 350,000 * 3 * 64 * 64 * 1 byte = ~4.3 GB
+        self.obs = torch.zeros((max_total_transitions, *obs_shape), dtype=torch.uint8, device=device)
+        self.actions = torch.zeros(max_total_transitions, dtype=torch.long, device=device)
+        self.rewards = torch.zeros(max_total_transitions, dtype=torch.float32, device=device)
+        self.dones = torch.zeros(max_total_transitions, dtype=torch.float32, device=device)
+        
         self.ptr = 0
+        self.full = False
         
-        print(f"[Buffer] Allocating GPU memory for {max_episodes} episodes with obs shape {obs_shape}...")
-        
-        # Use the dynamic *obs_shape unpacking
-        self.obs = torch.zeros((max_episodes, max_ep_len, *obs_shape), dtype=torch.uint8, device=device)
-        
-        self.actions = torch.zeros((max_episodes, max_ep_len), dtype=torch.long, device=device)
-        self.rewards = torch.zeros((max_episodes, max_ep_len), dtype=torch.float32, device=device)
-        self.dones = torch.zeros((max_episodes, max_ep_len), dtype=torch.float32, device=device)
-        self.masks = torch.zeros((max_episodes, max_ep_len), dtype=torch.float32, device=device)
-        
-        self.ep_lengths = torch.zeros(max_episodes, dtype=torch.long, device=device)
+        # Episode management: stores (start_idx, length)
+        self.episode_metadata = []
+        self.current_size_episodes = 0
 
-    def load_expert_data(self, expert_dataset):
-        """The expensive upfront operation."""
-        print(f"[Buffer] Converting {len(expert_dataset)} expert episodes to GPU tensors...")
-        for item in expert_dataset:
-            self.add_episode(item['transitions'])
-            
+    @property
+    def current_size(self):
+        # Compatibility with existing code expecting current_size to be episode count
+        return len(self.episode_metadata)
+
     def add_episode(self, transitions):
-        """
-        The moderately expensive interval operation (runs once every 20 mins).
-        Converts a list of dicts into tensor blocks and writes directly to VRAM.
-        """
         ep_len = len(transitions)
-        if ep_len > self.max_ep_len - 1:
-            # We need space for the final next_obs, so we truncate if strictly necessary
-            ep_len = self.max_ep_len - 1
-            transitions = transitions[:ep_len]
+        if ep_len == 0: return
+        
+        # Ensure we have enough space (circular buffer logic)
+        # For simplicity, if we hit the end, we wrap around and clear old episode metadata that we overwrite
+        start_ptr = self.ptr
+        end_ptr = self.ptr + ep_len
+        
+        # If this episode would exceed the buffer, we wrap around to 0
+        if end_ptr > self.max_transitions:
+            self.ptr = 0
+            self.full = True
+            start_ptr = 0
+            end_ptr = ep_len
+            
+        if ep_len > self.max_transitions:
+            # Episode is literally too big for the whole buffer (should not happen)
+            transitions = transitions[:self.max_transitions-1]
+            ep_len = len(transitions)
+            end_ptr = ep_len
 
-        # Extract to numpy first for fast bulk conversion
-        # Ensure channel-first format (C, H, W) for PyTorch
+        # Remove any metadata entries that overlap with our new range
+        self.episode_metadata = [m for m in self.episode_metadata if not (m[0] < end_ptr and (m[0] + m[1]) > start_ptr)]
+
+        # Extract numpy data
         obs_np = np.array([t['obs'] for t in transitions])
         if obs_np.shape[-1] == 3: 
             obs_np = np.transpose(obs_np, (0, 3, 1, 2))
@@ -59,208 +71,142 @@ class FastGPUEpisodicBuffer:
         rew_np = np.array([t['reward'] for t in transitions], dtype=np.float32)
         done_np = np.array([float(t['terminated'] or t['truncated']) for t in transitions], dtype=np.float32)
 
-        idx = self.ptr
-
-        # Write to GPU memory
-        self.obs[idx, :ep_len] = torch.tensor(obs_np, dtype=torch.uint8, device=self.device)
-        self.obs[idx, ep_len] = torch.tensor(next_obs_final, dtype=torch.uint8, device=self.device) # Store final next_obs
+        # Write to GPU
+        idx_range = torch.arange(start_ptr, end_ptr, device=self.device)
+        self.obs[start_ptr:end_ptr] = torch.tensor(obs_np, dtype=torch.uint8, device=self.device)
         
-        self.actions[idx, :ep_len] = torch.tensor(act_np, device=self.device)
-        self.rewards[idx, :ep_len] = torch.tensor(rew_np, device=self.device)
-        self.dones[idx, :ep_len] = torch.tensor(done_np, device=self.device)
+        # We need a place for next_obs of the last transition. 
+        # In a flat buffer, we can either store it in the next slot or have a separate next_obs buffer.
+        # To keep it simple and compatible with seq_len sampling, we'll ensure we always have one extra slot.
+        # But wait, next_obs of t is just obs of t+1. 
+        # The ONLY problem is the very last transition of the episode.
         
-        # Write masks (1.0 for valid transitions, 0.0 for pre-allocated zeros)
-        self.masks[idx, :ep_len] = 1.0
-        # Ensure cleanup of old data if buffer wraps around
-        self.masks[idx, ep_len:] = 0.0 
-        self.ep_lengths[idx] = ep_len
-
-        self.ptr = (self.ptr + 1) % self.max_episodes
-        self.current_size = min(self.current_size + 1, self.max_episodes)
+        self.actions[start_ptr:end_ptr] = torch.tensor(act_np, device=self.device)
+        self.rewards[start_ptr:end_ptr] = torch.tensor(rew_np, device=self.device)
+        self.dones[start_ptr:end_ptr] = torch.tensor(done_np, device=self.device)
+        
+        # Store metadata
+        self.episode_metadata.append((start_ptr, ep_len, next_obs_final))
+        self.ptr = end_ptr
 
     def sample_batch(self, batch_size, seq_len=48):
-        """
-        The blazing-fast backprop operation.
-        Returns tensors directly sliced from GPU memory.
-        """
-        # Randomly select episode indices
-        ep_indices = torch.randint(0, self.current_size, (batch_size,), device=self.device)
-        lengths = self.ep_lengths[ep_indices]
-
-        start_indices = []
-        for L in lengths:
-            valid_len = L.item()
-            if valid_len <= seq_len:
-                start_indices.append(0)
+        if len(self.episode_metadata) < batch_size:
+            # Not enough data yet
+            ep_indices = random.choices(range(len(self.episode_metadata)), k=batch_size)
+        else:
+            ep_indices = random.sample(range(len(self.episode_metadata)), batch_size)
+            
+        batch_obs = []
+        batch_acts = []
+        batch_rews = []
+        batch_dones = []
+        batch_masks = []
+        
+        for idx in ep_indices:
+            start_ptr, ep_len, next_obs_final = self.episode_metadata[idx]
+            
+            if ep_len <= seq_len:
+                # Pad if episode is shorter than seq_len
+                sample_start = start_ptr
+                actual_len = ep_len
+                pad_len = seq_len - ep_len
             else:
-                start_indices.append(random.randint(0, valid_len - seq_len))
+                sample_start = start_ptr + random.randint(0, ep_len - seq_len)
+                actual_len = seq_len
+                pad_len = 0
+            
+            # Observations (need actual_len + 1)
+            # If we are at the end of the episode, the last next_obs is next_obs_final
+            if sample_start + actual_len == start_ptr + ep_len:
+                # We reached the end
+                obs = self.obs[sample_start : sample_start + actual_len]
+                # Append next_obs_final
+                next_obs_t = torch.tensor(next_obs_final, dtype=torch.uint8, device=self.device).unsqueeze(0)
+                obs = torch.cat([obs, next_obs_t], dim=0)
+            else:
+                obs = self.obs[sample_start : sample_start + actual_len + 1]
                 
-        # Because sequence lengths might cross the max_ep_len boundary during padded slicing,
-        # we construct a grid of indices to extract exactly what we need in one vectorized gather.
+            acts = self.actions[sample_start : sample_start + actual_len]
+            rews = self.rewards[sample_start : sample_start + actual_len]
+            dones = self.dones[sample_start : sample_start + actual_len]
+            masks = torch.ones(actual_len, device=self.device)
+            
+            if pad_len > 0:
+                # Padding
+                obs_pad = torch.zeros((pad_len, *self.obs_shape), dtype=torch.uint8, device=self.device)
+                obs = torch.cat([obs, obs_pad], dim=0)
+                
+                acts_pad = torch.zeros(pad_len, dtype=torch.long, device=self.device)
+                acts = torch.cat([acts, acts_pad], dim=0)
+                
+                rews_pad = torch.zeros(pad_len, dtype=torch.float32, device=self.device)
+                rews = torch.cat([rews, rews_pad], dim=0)
+                
+                dones_pad = torch.ones(pad_len, dtype=torch.float32, device=self.device) # Pad with 'done'
+                dones = torch.cat([dones, dones_pad], dim=0)
+                
+                masks_pad = torch.zeros(pad_len, dtype=torch.float32, device=self.device)
+                masks = torch.cat([masks, masks_pad], dim=0)
+                
+            batch_obs.append(obs)
+            batch_acts.append(acts)
+            batch_rews.append(rews)
+            batch_dones.append(dones)
+            batch_masks.append(masks)
+            
+        # Stack into tensors
+        obs_tensor = torch.stack(batch_obs).float() / 255.0
+        acts_tensor = torch.stack(batch_acts)
+        rews_tensor = torch.stack(batch_rews)
+        dones_tensor = torch.stack(batch_dones)
+        masks_tensor = torch.stack(batch_masks)
         
-        # Shape: (batch_size, seq_len)
-        step_offsets = torch.arange(seq_len, device=self.device).unsqueeze(0).expand(batch_size, seq_len)
-        starts_tensor = torch.tensor(start_indices, device=self.device).unsqueeze(1)
-        gather_indices = starts_tensor + step_offsets
-        
-        # We need seq_len + 1 observations to cover s_t and s_{t+1} for the final step target Q-value
-        obs_offsets = torch.arange(seq_len + 1, device=self.device).unsqueeze(0).expand(batch_size, seq_len + 1)
-        obs_gather_indices = starts_tensor + obs_offsets
-
-        # Vectorized slicing using advanced indexing
-        batch_obs_uint8 = self.obs[ep_indices.unsqueeze(1), obs_gather_indices]
-        batch_actions = self.actions[ep_indices.unsqueeze(1), gather_indices]
-        batch_rewards = self.rewards[ep_indices.unsqueeze(1), gather_indices]
-        batch_dones = self.dones[ep_indices.unsqueeze(1), gather_indices]
-        batch_masks = self.masks[ep_indices.unsqueeze(1), gather_indices]
-
-        # Convert images to float32 [0, 1] ONLY at the final moment before returning
-        batch_obs = batch_obs_uint8.float() / 255.0
-
-        return batch_obs, batch_actions, batch_rewards, batch_dones, batch_masks
+        return obs_tensor, acts_tensor, rews_tensor, dones_tensor, masks_tensor
 
 class ReplayBuffer:
-    """Unified replay buffer for (obs, action, reward, next_obs, done, mask) transitions."""
     def __init__(self, capacity):
         self.buffer = collections.deque(maxlen=capacity)
-
     def push(self, obs, action, reward=0.0, next_obs=None, terminated=False, truncated=False, mask=None):
-        if not isinstance(obs, torch.Tensor):
-            obs = torch.tensor(obs, dtype=torch.float32)
-        if not isinstance(action, torch.Tensor):
-            action = torch.tensor(action)
-        if next_obs is None:
-            next_obs = obs # Fallback for pure BC data
-        if not isinstance(next_obs, torch.Tensor):
-            next_obs = torch.tensor(next_obs, dtype=torch.float32)
-            
-        self.buffer.append({
-            "obs": obs,
-            "action": action,
-            "reward": float(reward),
-            "next_obs": next_obs,
-            "terminated": bool(terminated),
-            "truncated": bool(truncated),
-            "mask": mask # Optional dict of feature noise specs
-        })
-
+        self.buffer.append({"obs": obs, "action": action, "reward": float(reward), "next_obs": next_obs, "terminated": bool(terminated), "truncated": bool(truncated), "mask": mask})
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
-        return batch
-
-    def save(self, path):
-        torch.save(list(self.buffer), path)
-        print(f"[Buffer] Saved to {path}")
-
-    def load(self, path):
-        data = torch.load(path)
-        self.buffer = collections.deque(data, maxlen=self.buffer.maxlen)
-        print(f"[Buffer] Loaded {len(self.buffer)} items from {path}")
-
-    def __len__(self):
-        return len(self.buffer)
-
-class EpisodicReplayBuffer:
-    """Buffer to store and sample full episodes (sequences of transitions)."""
-    def __init__(self, capacity):
-        self.buffer = collections.deque(maxlen=capacity)
-
-    def push(self, episode):
-        """Episode should be a dict: {'transitions': [...], 'duration': ...}"""
-        self.buffer.append(episode)
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
-        return batch
-
+        return random.sample(self.buffer, min(len(self.buffer), batch_size))
     def __len__(self):
         return len(self.buffer)
 
 class LLMBuffer:
     def __init__(self):
         self.buffer = collections.deque()
-
     def push(self, episode_trajectory, seed, note_text, note_frame_idx, current_obs_dict):
-        self.buffer.append({
-            "episode_trajectory": episode_trajectory,
-            "seed": seed,
-            "note_text": note_text,
-            "note_frame_idx": note_frame_idx,
-            "current_obs_dict": current_obs_dict
-        })
-
-    def pop(self):
-        return self.buffer.popleft() if self.buffer else None
-
-    def is_empty(self):
-        return len(self.buffer) == 0
-
-    def __len__(self):
-        return len(self.buffer)
+        self.buffer.append({"episode_trajectory": episode_trajectory, "seed": seed, "note_text": note_text, "note_frame_idx": note_frame_idx, "current_obs_dict": current_obs_dict})
+    def pop(self): return self.buffer.popleft() if self.buffer else None
+    def is_empty(self): return len(self.buffer) == 0
+    def __len__(self): return len(self.buffer)
 
 class CurriculumBuffer:
     def __init__(self):
         self.tasks = collections.deque()
-
     def push(self, seed, start_frame, trajectory_length, reward_function_callable, historical_actions=None):
-        self.tasks.append({
-            "seed": seed,
-            "start_frame": start_frame,
-            "trajectory_length": trajectory_length,
-            "reward_fn": reward_function_callable,
-            "historical_actions": historical_actions
-        })
-
-    def pop(self):
-        return self.tasks.popleft() if self.tasks else None
-
-    def is_empty(self):
-        return len(self.tasks) == 0
-
-    def __len__(self):
-        return len(self.tasks)
+        self.tasks.append({"seed": seed, "start_frame": start_frame, "trajectory_length": trajectory_length, "reward_fn": reward_function_callable, "historical_actions": historical_actions})
+    def pop(self): return self.tasks.popleft() if self.tasks else None
+    def is_empty(self): return len(self.tasks) == 0
+    def __len__(self): return len(self.tasks)
 
 class SemiSupervisedBuffer:
-    """Buffer for SSL with feature masks and termination conditions."""
     def __init__(self, capacity):
         self.buffer = collections.deque(maxlen=capacity)
-
     def push(self, obs, action, feature_mask, termination_rule=None):
-        # We store as a full transition for integrated SSL
-        if not isinstance(obs, torch.Tensor):
-            obs = torch.tensor(obs, dtype=torch.float32)
-        if not isinstance(action, torch.Tensor):
-            action = torch.tensor(action)
-        self.buffer.append({
-            "obs": obs,
-            "action": action,
-            "mask": feature_mask, # Unified name 'mask'
-            "reward": 0.0,
-            "next_obs": obs,
-            "terminated": False,
-            "truncated": False,
-            "termination_rule": termination_rule
-        })
-
+        self.buffer.append({"obs": obs, "action": action, "mask": feature_mask, "reward": 0.0, "next_obs": obs, "terminated": False, "truncated": False, "termination_rule": termination_rule})
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
-        return batch
-
-    def __len__(self):
-        return len(self.buffer)
+        return random.sample(self.buffer, min(len(self.buffer), batch_size))
+    def __len__(self): return len(self.buffer)
 
 class ObservationBuffer:
     def __init__(self, capacity=10000):
         self.buffer = collections.deque(maxlen=capacity)
-
     def push(self, obs):
-        if not isinstance(obs, torch.Tensor):
-            obs = torch.tensor(obs, dtype=torch.float32)
+        if not isinstance(obs, torch.Tensor): obs = torch.tensor(obs, dtype=torch.float32)
         self.buffer.append(obs)
-
     def sample(self, batch_size):
         batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
         return torch.stack(batch)
-
-    def __len__(self):
-        return len(self.buffer)
+    def __len__(self): return len(self.buffer)
