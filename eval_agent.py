@@ -9,6 +9,8 @@ from CQL import CQLAgent
 from PPO import PPOAgent
 from buffers import ReplayBuffer
 
+from compliance_metrics import get_compliance_score
+
 def evaluate_return(agent, env_name, num_episodes=25):
     if env_name == "highway":
         env_name = "highway-v0"
@@ -31,7 +33,7 @@ def evaluate_return(agent, env_name, num_episodes=25):
             env = CrafterEvalWrapper()
         except ImportError:
             print("[!] Crafter not found for evaluation.")
-            return 0, 0
+            return 0, 0, 0
     else:
         if "highway" in env_name:
             import highway_env
@@ -41,6 +43,7 @@ def evaluate_return(agent, env_name, num_episodes=25):
             env = FlattenObservation(env)
             
     total_returns = []
+    compliance_scores = []
     
     for _ in range(num_episodes):
         obs, info = env.reset()
@@ -49,14 +52,17 @@ def evaluate_return(agent, env_name, num_episodes=25):
         terminated = False
         truncated = False
         episode_return = 0
+        episode_obs = [obs]
         while not (terminated or truncated):
             action = agent.predict(obs) # predict uses deterministic=True
             obs, reward, terminated, truncated, info = env.step(action)
             episode_return += reward
+            episode_obs.append(obs)
         total_returns.append(episode_return)
+        compliance_scores.append(get_compliance_score(env_name, episode_obs))
     
     env.close()
-    return np.mean(total_returns), np.std(total_returns)
+    return np.mean(total_returns), np.std(total_returns), np.mean(compliance_scores)
 
 
 def calculate_cross_entropy(agent, buffer, anti=False):
@@ -67,9 +73,22 @@ def calculate_cross_entropy(agent, buffer, anti=False):
     batch_size = min(len(buffer), 1024)
     batch_items = buffer.sample(batch_size)
     
-    # Extract and stack
-    obs = torch.stack([item['obs'] for item in batch_items]).to(agent.device_name)
-    labels = torch.stack([item['action'] for item in batch_items]).to(agent.device_name)
+    # Extract and convert to tensors robustly
+    obs_list = []
+    labels_list = []
+    for item in batch_items:
+        o = item['obs']
+        if not isinstance(o, torch.Tensor):
+            o = torch.tensor(o, dtype=torch.float32)
+        obs_list.append(o)
+        
+        a = item['action']
+        if not isinstance(a, torch.Tensor):
+            a = torch.tensor(a, dtype=torch.long)
+        labels_list.append(a)
+
+    obs = torch.stack(obs_list).to(agent.device_name)
+    labels = torch.stack(labels_list).to(agent.device_name)
     
     # We assume the agent has a way to set eval mode or it doesn't matter for get_logits
     with torch.no_grad():
@@ -121,7 +140,7 @@ def main():
     
     # 2. Measure Return
     print(f"Evaluating return for {args.agent_path}...")
-    mean_ret, std_ret = evaluate_return(agent, args.env_name)
+    mean_ret, std_ret, compliance_score = evaluate_return(agent, args.env_name)
     
     # 3. Measure Cross-Entropy
     bc_loss = None
@@ -142,6 +161,7 @@ def main():
         "agent_path": args.agent_path,
         "mean_return": mean_ret,
         "std_return": std_ret,
+        "compliance_score": compliance_score,
         "bc_cross_entropy": bc_loss,
         "anti_bc_cross_entropy": anti_bc_loss
     }

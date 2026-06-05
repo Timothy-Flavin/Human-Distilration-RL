@@ -23,10 +23,10 @@ def lander_precision_score(obs_sequence):
 
 def highway_safety_score(obs_sequence):
     """
-    Measures tailgating penalty.
-    - Standard highway-env observation is (5, 5) flattened to (25,).
-    - obs[0:5] is ego [presence, x, y, vx, vy]
-    - obs[5:10] is lead vehicle
+    Measures tailgating penalty (Following Distance Compliance).
+    - Row 0 (Ego): Absolute World Coordinates [presence, x, y, vx, vy]
+    - Rows 1-4 (Others): Ego-Relative Coordinates [presence, dx, dy, dvx, dvy]
+    - Threshold: 2 car lengths (~10m). In normalized units (100m scale), this is 0.1.
     """
     scores = []
     for obs in obs_sequence:
@@ -34,22 +34,29 @@ def highway_safety_score(obs_sequence):
         if len(obs) == 25:
             obs = obs.reshape(5, 5)
         
-        ego_x = obs[0, 1]
-        lead_presence = obs[1, 0]
-        lead_x = obs[1, 1]
+        min_penalty = 0
+        # Rows 1-4 are other vehicles relative to ego
+        for i in range(1, 5):
+            presence = obs[i, 0]
+            if presence < 0.5:
+                continue
+            
+            rel_x = obs[i, 1]
+            rel_y = obs[i, 2]
+            
+            # rel_x > 0 means the vehicle is IN FRONT of ego
+            # abs(rel_y) < 0.1 means the vehicle is in the SAME LANE (lane width is 0.25)
+            if rel_x > 0 and abs(rel_y) < 0.1:
+                # Penalty if distance is below 'safe' threshold (0.1 normalized = 2 car lengths)
+                if rel_x < 0.1:
+                    # More negative the closer it gets
+                    # At 0.1, penalty is -0.1. At 0.0, penalty is -1.1.
+                    penalty = - ( (0.1 - rel_x) / 0.1 ) - 0.1
+                    min_penalty = min(min_penalty, penalty)
         
-        if lead_presence > 0.5:
-            dist = lead_x - ego_x
-            # Penalty if distance is below 'safe' threshold (e.g. 0.1 normalized)
-            # and ego is behind (dist > 0)
-            if 0 < dist < 0.15:
-                penalty = - (0.15 - dist) * 10
-            else:
-                penalty = 0
-        else:
-            penalty = 0
-        scores.append(penalty)
-    return np.mean(scores)
+        scores.append(min_penalty)
+    
+    return np.mean(scores) if scores else 0.0
 
 def get_compliance_score(env_name, obs_sequence):
     if not obs_sequence or not isinstance(obs_sequence[0], np.ndarray):

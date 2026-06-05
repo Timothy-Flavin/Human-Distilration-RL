@@ -156,15 +156,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="LunarLander-v3", help="Environment to record")
     args = parser.parse_args()
+    print("yooo")
     
     env_name = args.env
     if env_name == "highway":
         env_name = "highway-v0"
     elif env_name == "crafter":
         env_name = "crafter"
+    print("yooo")
         
     utils = get_utils(env_name)
     
+    print("yooo")
+
     if utils is None:
         print(f"[!] Error: Unsupported environment '{env_name}'")
         return
@@ -172,11 +176,13 @@ def main():
     # Ensure environment-specific imports are handled
     if "highway" in env_name:
         try: import highway_env
-        except ImportError: return
+        except ImportError: 
+            print("no highway")
     elif "crafter" in env_name:
         try: import crafter
         except ImportError:
             print("[!] Error: crafter not found. Please install it.")
+    print("yooo")
 
     dataset_path = f"expert_demonstrations_{env_name}.pkl"
     

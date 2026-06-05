@@ -47,13 +47,14 @@ class MetricsLogger:
         if source in self.frames:
             self.frames[source] += count
 
-    def log_evaluation(self, iteration, return_mean, return_std, bc_loss=None, anti_bc_loss=None):
+    def log_evaluation(self, iteration, return_mean, return_std, bc_loss=None, anti_bc_loss=None, compliance_score=None):
         self.evaluations.append({
             "iteration": iteration,
             "return_mean": return_mean,
             "return_std": return_std,
             "bc_loss": bc_loss,
-            "anti_bc_loss": anti_bc_loss
+            "anti_bc_loss": anti_bc_loss,
+            "compliance_score": compliance_score
         })
 
     def get_summary(self):
@@ -79,4 +80,6 @@ class MetricsLogger:
         if self.evaluations:
             last = self.evaluations[-1]
             print(f"Eval Return: {last['return_mean']:.2f} +/- {last['return_std']:.2f}")
+            if last.get('compliance_score') is not None:
+                print(f"Compliance Score: {last['compliance_score']:.4f}")
         print("-------------------------\n")

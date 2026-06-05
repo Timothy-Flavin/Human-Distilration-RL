@@ -24,7 +24,19 @@ def plot_metrics(metrics_path, output_dir):
     plt.savefig(os.path.join(output_dir, "returns.png"))
     plt.close()
     
-    # 2. Plot Behavior Similarity (Inverse Loss)
+    # 2. Plot Compliance Score
+    compliance_scores = [e.get("compliance_score") for e in data["evaluations"] if e.get("compliance_score") is not None]
+    if compliance_scores:
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(compliance_scores)), compliance_scores, '-o', color='green')
+        plt.title("Compliance Score Over Time")
+        plt.xlabel("Iteration")
+        plt.ylabel("Mean Compliance Score")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "compliance.png"))
+        plt.close()
+
+    # 3. Plot Behavior Similarity (Inverse Loss)
     plt.figure(figsize=(10, 5))
     bc_losses = [e["bc_loss"] for e in data["evaluations"] if e["bc_loss"] is not None]
     anti_bc_losses = [e["anti_bc_loss"] for e in data["evaluations"] if e["anti_bc_loss"] is not None]

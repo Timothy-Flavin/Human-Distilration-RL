@@ -67,16 +67,18 @@ class CQLAgent(Agent):
     def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         self.replay_buffer.append((obs, action, reward, next_obs, terminated, truncated))
 
-    def update_value(self, batch) -> dict:
+    def update_value(self, obs, actions=None, rewards=None, next_obs=None, dones=None) -> dict:
         """
         Independent Value function update using standard Bellman MSE.
         Used as the baseline for advantage calculation.
         """
-        obs, actions, rewards, next_obs, terminated, truncated = zip(*batch)
-        obs = torch.tensor(np.array(obs), dtype=torch.float32).to(self.device_name)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device_name)
-        next_obs = torch.tensor(np.array(next_obs), dtype=torch.float32).to(self.device_name)
-        dones = torch.tensor(np.array(terminated) | np.array(truncated), dtype=torch.float32).to(self.device_name)
+        if isinstance(obs, (list, collections.deque)):
+            batch = obs
+            obs_np, _, rewards_np, next_obs_np, terminated, truncated = zip(*batch)
+            obs = torch.tensor(np.array(obs_np), dtype=torch.float32).to(self.device_name)
+            rewards = torch.tensor(rewards_np, dtype=torch.float32).to(self.device_name)
+            next_obs = torch.tensor(np.array(next_obs_np), dtype=torch.float32).to(self.device_name)
+            dones = torch.tensor(np.array(terminated) | np.array(truncated), dtype=torch.float32).to(self.device_name)
 
         # Standard Bellman V-learning
         current_v = self.v_net(obs).squeeze()
@@ -96,15 +98,16 @@ class CQLAgent(Agent):
 
         return {"loss_v": v_loss.item(), "v_mean": current_v.mean().item()}
 
-    def update_td(self, batch, ssl: bool = False, masks: list = None) -> dict:
+    def update_td(self, obs, actions=None, rewards=None, next_obs=None, dones=None, ssl: bool = False, masks: list = None) -> dict:
         """Conservative Q-Learning TD Update."""
-        obs_np, actions, rewards, next_obs_np, terminated, truncated = zip(*batch)
-        
-        obs = torch.tensor(np.array(obs_np), dtype=torch.float32).to(self.device_name)
-        actions = torch.tensor(actions, dtype=torch.long).to(self.device_name)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device_name)
-        next_obs = torch.tensor(np.array(next_obs_np), dtype=torch.float32).to(self.device_name)
-        dones = torch.tensor(np.array(terminated) | np.array(truncated), dtype=torch.float32).to(self.device_name)
+        if isinstance(obs, (list, collections.deque)):
+            batch = obs
+            obs_np, actions_np, rewards_np, next_obs_np, terminated, truncated = zip(*batch)
+            obs = torch.tensor(np.array(obs_np), dtype=torch.float32).to(self.device_name)
+            actions = torch.tensor(actions_np, dtype=torch.long).to(self.device_name)
+            rewards = torch.tensor(rewards_np, dtype=torch.float32).to(self.device_name)
+            next_obs = torch.tensor(np.array(next_obs_np), dtype=torch.float32).to(self.device_name)
+            dones = torch.tensor(np.array(terminated) | np.array(truncated), dtype=torch.float32).to(self.device_name)
 
         if ssl and masks:
             obs = self.ssl_augment(obs, masks)
@@ -138,11 +141,13 @@ class CQLAgent(Agent):
             "q_mean": dataset_q.mean().item()
         }
 
-    def update_supervised(self, batch, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
+    def update_supervised(self, obs, labels=None, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
         """Behavior Cloning (Cross-Entropy) Loss."""
-        obs_np, labels = zip(*batch)
-        obs = torch.tensor(np.array(obs_np), dtype=torch.float32).to(self.device_name)
-        labels = torch.tensor(labels, dtype=torch.long).to(self.device_name)
+        if isinstance(obs, (list, collections.deque)):
+            batch = obs
+            obs_np, labels_np = zip(*batch)
+            obs = torch.tensor(np.array(obs_np), dtype=torch.float32).to(self.device_name)
+            labels = torch.tensor(labels_np, dtype=torch.long).to(self.device_name)
 
         if ssl and masks:
             obs = self.ssl_augment(obs, masks)

@@ -210,3 +210,63 @@ class ObservationBuffer:
         batch = random.sample(self.buffer, min(len(self.buffer), batch_size))
         return torch.stack(batch)
     def __len__(self): return len(self.buffer)
+
+class DenseTorchBuffer:
+    """
+    Optimized Flat Buffer for non-recurrent (vector) observations.
+    Pre-allocates memory for fast vectorized sampling.
+    """
+    def __init__(self, capacity, obs_dim, device="cpu"):
+        self.capacity = capacity
+        self.device = device
+        self.obs_dim = obs_dim
+        
+        print(f"[DenseBuffer] Pre-allocating {capacity} transitions (Obs Dim: {obs_dim}) on {device}...")
+        self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=device)
+        self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros(capacity, dtype=torch.long, device=device)
+        self.rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.dones = torch.zeros(capacity, dtype=torch.float32, device=device)
+        
+        self.ptr = 0
+        self.size = 0
+
+    def add_transitions(self, transitions):
+        """
+        Ingests a list of transition dictionaries.
+        """
+        num_new = len(transitions)
+        if num_new == 0: return
+
+        # Extract and convert to numpy for bulk transfer
+        obs_np = np.array([t['obs'] for t in transitions], dtype=np.float32)
+        next_obs_np = np.array([t['next_obs'] for t in transitions], dtype=np.float32)
+        act_np = np.array([t['action'] for t in transitions], dtype=np.int64)
+        rew_np = np.array([t['reward'] for t in transitions], dtype=np.float32)
+        done_np = np.array([float(t['terminated'] or t['truncated']) for t in transitions], dtype=np.float32)
+
+        # Vectorized write to pre-allocated tensor slices
+        indices = (torch.arange(self.ptr, self.ptr + num_new)) % self.capacity
+        
+        self.obs[indices] = torch.from_numpy(obs_np).to(self.device)
+        self.next_obs[indices] = torch.from_numpy(next_obs_np).to(self.device)
+        self.actions[indices] = torch.from_numpy(act_np).to(self.device)
+        self.rewards[indices] = torch.from_numpy(rew_np).to(self.device)
+        self.dones[indices] = torch.from_numpy(done_np).to(self.device)
+        
+        self.ptr = (self.ptr + num_new) % self.capacity
+        self.size = min(self.size + num_new, self.capacity)
+
+    def sample(self, batch_size):
+        if self.size == 0: return None
+        indices = torch.randint(0, self.size, (batch_size,), device=self.device)
+        return (
+            self.obs[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.next_obs[indices],
+            self.dones[indices]
+        )
+
+    def __len__(self):
+        return self.size

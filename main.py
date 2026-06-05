@@ -11,7 +11,7 @@ import collections
 from Agent import Agent
 from CQL import CQLAgent
 from wrapper import InteractiveGymWrapper
-from buffers import ReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuffer, ObservationBuffer
+from buffers import ReplayBuffer, LLMBuffer, CurriculumBuffer, SemiSupervisedBuffer, ObservationBuffer, DenseTorchBuffer
 from metrics import MetricsLogger
 from llm_router import LLMRouter
 from eval_agent import evaluate_return, calculate_cross_entropy
@@ -30,6 +30,7 @@ def pre_load_data(args, agent, buffers, metrics):
         
         loaded_count = 0
         total_duration = 0.0
+        all_transitions = []
         
         for item in expert_dataset:
             if isinstance(item, dict):
@@ -39,6 +40,7 @@ def pre_load_data(args, agent, buffers, metrics):
                 transitions = item
                 total_duration += len(transitions) / 30.0
                 
+            all_transitions.extend(transitions)
             for t in transitions:
                 # Push full transitions to example buffer (Expert Source)
                 buffers['example'].push(
@@ -48,6 +50,10 @@ def pre_load_data(args, agent, buffers, metrics):
                 )
                 loaded_count += 1
         
+        if 'dense_example' in buffers:
+            print(f"[Preload] Flushing {len(all_transitions)} transitions to DenseTorchBuffer...")
+            buffers['dense_example'].add_transitions(all_transitions)
+            
         print(f"[Preload] Successfully loaded {loaded_count} transitions into example_buffer.")
         metrics.log_frames(loaded_count, source="expert_preload")
         metrics.timers["expert_preload_effort"] = total_duration
@@ -110,77 +116,92 @@ def unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristi
     """Refactored core training loop: Decouples Loss Signals from Data Sources."""
     print(f"Updating Agent (Unified Pipeline, {args.num_unified_epochs} epochs)...")
     
+    # Use DenseTorchBuffers if available
+    dense_online = buffers.get('dense_online')
+    dense_example = buffers.get('dense_example')
+    dense_anti = buffers.get('dense_anti_example')
+
     for epoch in range(args.num_unified_epochs):
         # --- 0. VALUE FUNCTION UPDATE (Independent Signal for AWBC) ---
         if args.awbc:
-            all_batch = []
-            if len(agent.replay_buffer) >= 16:
-                all_batch.extend(random.sample(agent.replay_buffer, 16))
-            if len(buffers['example']) >= 16:
-                batch_items = buffers['example'].sample(16)
-                all_batch.extend([(item['obs'], item['action'], item['reward'], item['next_obs'], item['terminated'], item['truncated']) for item in batch_items])
+            obs_list, act_list, rew_list, n_obs_list, done_list = [], [], [], [], []
+            
+            # Sample from Online RL data
+            if dense_online and len(dense_online) >= 16:
+                o, a, r, no, d = dense_online.sample(16)
+                obs_list.append(o); act_list.append(a); rew_list.append(r); n_obs_list.append(no); done_list.append(d)
+            
+            # Sample from Human/Expert data
+            if dense_example and len(dense_example) >= 16:
+                o, a, r, no, d = dense_example.sample(16)
+                obs_list.append(o); act_list.append(a); rew_list.append(r); n_obs_list.append(no); done_list.append(d)
                 
-            if len(all_batch) >= 16:
+            if obs_list:
+                obs = torch.cat(obs_list)
+                actions = torch.cat(act_list)
+                rewards = torch.cat(rew_list)
+                next_obs = torch.cat(n_obs_list)
+                dones = torch.cat(done_list)
+                
                 metrics.start_timer("agent_updating_value")
-                agent.update_value(all_batch)
+                agent.update_value(obs, actions, rewards, next_obs, dones)
                 metrics.stop_timer("agent_updating_value")
 
         # --- 1. LOSS SIGNAL: TEMPORAL DIFFERENCE (RL) ---
         
         # Source: Online RL (Exploration Data)
-        if args.online_rl and len(agent.replay_buffer) >= 32:
+        if args.online_rl and dense_online and len(dense_online) >= 32:
             metrics.start_timer("agent_updating_rl")
-            batch = random.sample(agent.replay_buffer, 32)
-            agent.update_td(batch, ssl=False) 
+            obs, actions, rewards, next_obs, dones = dense_online.sample(32)
+            agent.update_td(obs, actions, rewards, next_obs, dones, ssl=False) 
             metrics.stop_timer("agent_updating_rl")
 
         # Source: Offline RL (Human/Expert Data)
-        if args.offline_rl and len(buffers['example']) >= 32:
+        if args.offline_rl and dense_example and len(dense_example) >= 32:
             metrics.start_timer("agent_updating_rl")
-            batch_items = buffers['example'].sample(32)
-            batch = [(item['obs'], item['action'], item['reward'], item['next_obs'], item['terminated'], item['truncated']) for item in batch_items]
-            masks = [item.get('mask') for item in batch_items] if args.ssl else None
-            agent.update_td(batch, ssl=args.ssl, masks=masks)
+            obs, actions, rewards, next_obs, dones = dense_example.sample(32)
+            # Note: SSL masks are currently not supported in dense buffer for simplicity
+            agent.update_td(obs, actions, rewards, next_obs, dones, ssl=False)
             metrics.stop_timer("agent_updating_rl")
 
         # --- 2. LOSS SIGNAL: SUPERVISED (BC) ---
 
-        if (args.bc or args.awbc) and len(buffers['example']) >= 32:
+        if (args.bc or args.awbc) and dense_example and len(dense_example) >= 32:
             metrics.start_timer("agent_updating_bc")
-            batch_items = buffers['example'].sample(32)
-            batch = [(item['obs'], item['action']) for item in batch_items]
-            masks = [item.get('mask') for item in batch_items] if args.ssl else None
+            obs, actions, rewards, next_obs, dones = dense_example.sample(32)
             
             advantages = None
             if args.awbc:
                 # Calculate Advantage using TD Error: A = r + gamma*V(s') - V(s)
-                obs_t = torch.stack([item['obs'] for item in batch_items]).to(agent.device_name)
-                next_obs_t = torch.stack([item['next_obs'] for item in batch_items]).to(agent.device_name)
-                rewards_t = torch.tensor([item['reward'] for item in batch_items], dtype=torch.float32).to(agent.device_name)
-                dones_t = torch.tensor([item['terminated'] or item['truncated'] for item in batch_items], dtype=torch.float32).to(agent.device_name)
-                
                 with torch.no_grad():
-                    v_s = agent.get_value(obs_t)
-                    v_ns = agent.get_value(next_obs_t)
-                    td_error = rewards_t + (1 - dones_t) * agent.gamma * v_ns - v_s
+                    v_s = agent.get_value(obs)
+                    v_ns = agent.get_value(next_obs)
+                    td_error = rewards + (1 - dones) * agent.gamma * v_ns - v_s
                     # Weight w = exp(Adv / temp). Using relu as a stable proxy.
                     advantages = F.relu(td_error + 1.0)
             
-            agent.update_supervised(batch, ssl=args.ssl, masks=masks, advantages=advantages)
+            agent.update_supervised(obs, actions, ssl=False, advantages=advantages)
             metrics.stop_timer("agent_updating_bc")
 
         # --- 3. LOSS SIGNAL: ANTI-BC ---
-        if args.anti_bc and len(buffers['anti_example']) >= 32:
+        if args.anti_bc and dense_anti and len(dense_anti) >= 32:
             metrics.start_timer("agent_updating_anti_bc")
-            batch_items = buffers['anti_example'].sample(32)
-            batch = [(item['obs'], item['action']) for item in batch_items]
-            agent.update_supervised(batch, anti=True)
+            obs, actions, rewards, next_obs, dones = dense_anti.sample(32)
+            agent.update_supervised(obs, actions, anti=True)
             metrics.stop_timer("agent_updating_anti_bc")
 
         # --- 4. LOSS SIGNAL: CURRICULUM/KL ---
         if args.curriculum and args.curriculum_method == 'kl' and len(buffers['kl_target']) >= 32:
             kl_obs = buffers['kl_target'].sample(32)
             agent.kl_update(kl_obs, aux_agent)
+
+def sync_dense_buffers(buffers):
+    """Syncs Pythonic list-of-dicts buffers to DenseTorchBuffers for training."""
+    if 'dense_example' in buffers and len(buffers['example']) > 0:
+        # Re-syncing ensures any human corrections/annotations are included
+        buffers['dense_example'].add_transitions(list(buffers['example'].buffer))
+    if 'dense_anti_example' in buffers and len(buffers['anti_example']) > 0:
+        buffers['dense_anti_example'].add_transitions(list(buffers['anti_example'].buffer))
 
 def main():
     global args
@@ -282,7 +303,12 @@ def main():
         'ssl': SemiSupervisedBuffer(capacity=5000),
         'kl_target': ObservationBuffer(capacity=10000)
     }
-    
+
+    # Initialize Dense Tensors for training speed
+    buffers['dense_online'] = DenseTorchBuffer(capacity=100000, obs_dim=obs_dim, device=agent.device_name)
+    buffers['dense_example'] = DenseTorchBuffer(capacity=100000, obs_dim=obs_dim, device=agent.device_name)
+    buffers['dense_anti_example'] = DenseTorchBuffer(capacity=10000, obs_dim=obs_dim, device=agent.device_name)
+
     metrics = MetricsLogger()
     pre_load_data(args, agent, buffers, metrics)
     
@@ -304,6 +330,11 @@ def main():
         if args.num_rl_frames > 0:
             print(f"Collecting {args.num_rl_frames} RL frames...")
             episodes = run_rl_collection(agent, env, num_frames=args.num_rl_frames, metrics=metrics, update=args.online_rl)
+            
+            # Flush new transitions to Dense Online Buffer
+            for ep in episodes:
+                # Exclude the final dummy state (last item in trajectory)
+                buffers['dense_online'].add_transitions(ep['trajectory'][:-1])
         
         # PHASE 2: INTERACTION
         annotations = []
@@ -379,14 +410,15 @@ def main():
                 # If we leave them, they'll accumulate. Let's just warn for now.
 
         # PHASE 4: UNIFIED UPDATE
+        sync_dense_buffers(buffers)
         unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristics, global_buffer_proxy)
 
         # --- PHASE 5: EVALUATION ---
         print("Evaluating Agent...")
-        mean_ret, std_ret = evaluate_return(agent, env_name, num_episodes=5)
+        mean_ret, std_ret, compliance_score = evaluate_return(agent, env_name, num_episodes=5)
         # Always calculate BC loss for Human Likeness tracking if buffer is not empty
         bc_loss = calculate_cross_entropy(agent, buffers['example'], anti=False) if len(buffers['example']) > 0 else 0.0
-        metrics.log_evaluation(iteration, mean_ret, std_ret, bc_loss)
+        metrics.log_evaluation(iteration, mean_ret, std_ret, bc_loss, compliance_score=compliance_score)
 
         metrics.log_iteration()
         metrics.save_to_json(os.path.join(results_base_dir, "metrics_latest.json"))
