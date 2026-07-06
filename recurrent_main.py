@@ -166,51 +166,60 @@ def unified_train_step(args, agent, buffers, metrics):
 
     for epoch in range(args.num_unified_epochs):
         
-        # --- OFFLINE / BEHAVIOR CLONING UPDATES ---
+        exp_batch = None
         if has_offline:
-            exp_obs, exp_acts, exp_rews, exp_dones, exp_masks = buffers['expert'].sample_batch(batch_size, seq_len=seq_len)
+            exp_batch = buffers['expert'].sample_batch(batch_size, seq_len=seq_len)
             total_frames_processed += batch_size * (seq_len + 1)
-            
-            cached_v = None
-            cached_h_q = None
-
-            if args.awbc:
-                metrics.start_timer("agent_updating_value")
-                v_results = agent.update_value(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
-                cached_v = (v_results['current_v'], v_results['next_v'])
-                metrics.stop_timer("agent_updating_value")
-
-            if args.offline_rl:
-                metrics.start_timer("agent_updating_rl")
-                td_results = agent.update_td(exp_obs, exp_acts, exp_rews, exp_dones, exp_masks, burn_in=burn_in)
-                cached_h_q = td_results.get('h_q')
-                metrics.stop_timer("agent_updating_rl")
-                
-            if args.awbc or args.bc:
-                metrics.start_timer("agent_updating_bc")
-                
-                advantages = None
-                if args.awbc and cached_v is not None:
-                    # Calculate Advantage using Value Network: A = r + gamma*V(s') - V(s)
-                    v_s, v_ns = cached_v
-                    r_active = exp_rews[:, burn_in:]
-                    d_active = exp_dones[:, burn_in:]
-                    td_error = r_active + (1.0 - d_active) * agent.gamma * v_ns - v_s
-                    advantages = F.relu(td_error + 1.0)
-                
-                agent.update_supervised(exp_obs, exp_acts, exp_masks, burn_in=burn_in, advantages=advantages, h_q=cached_h_q)
-                metrics.stop_timer("agent_updating_bc")
-
-        # --- ONLINE RL UPDATES ---
+        
+        on_batch = None
         if has_online:
-            on_obs, on_acts, on_rews, on_dones, on_masks = buffers['online'].sample_batch(batch_size, seq_len=seq_len)
+            on_batch = buffers['online'].sample_batch(batch_size, seq_len=seq_len)
             total_frames_processed += batch_size * (seq_len + 1)
+
+        # 1. VALUE FUNCTION UPDATES (for AWBC)
+        cached_v = None
+        if args.awbc:
+            metrics.start_timer("agent_updating_value")
+            # Update value using expert data
+            if exp_batch:
+                v_results = agent.update_value(*exp_batch, burn_in=burn_in)
+                cached_v = (v_results['current_v'], v_results['next_v'])
             
+            # Update value using online data (if available)
+            if on_batch:
+                agent.update_value(*on_batch, burn_in=burn_in)
+            metrics.stop_timer("agent_updating_value")
+
+        # 2. TD / POLICY UPDATES (CQL or Online RL)
+        cached_h_q = None
+        if args.offline_rl and exp_batch:
             metrics.start_timer("agent_updating_rl")
-            agent.update_td(on_obs, on_acts, on_rews, on_dones, on_masks, burn_in=burn_in)
+            td_results = agent.update_td(*exp_batch, burn_in=burn_in)
+            cached_h_q = td_results.get('h_q')
             metrics.stop_timer("agent_updating_rl")
         
-        if (epoch + 1) % 10 == 0 or epoch == 0:
+        if args.online_rl and on_batch:
+            metrics.start_timer("agent_updating_rl")
+            agent.update_td(*on_batch, burn_in=burn_in, use_cql=False)
+            metrics.stop_timer("agent_updating_rl")
+
+        # 3. SUPERVISED / BC UPDATES
+        if (args.awbc or args.bc) and exp_batch:
+            metrics.start_timer("agent_updating_bc")
+            advantages = None
+            if args.awbc and cached_v is not None:
+                # Calculate Advantage using Value Network: A = r + gamma*V(s') - V(s)
+                v_s, v_ns = cached_v
+                r_active = exp_batch[2][:, burn_in:] # rewards
+                d_active = exp_batch[3][:, burn_in:] # dones
+                td_error = r_active + (1.0 - d_active) * agent.gamma * v_ns - v_s
+                advantages = F.relu(td_error + 1.0)
+            
+            agent.update_supervised(exp_batch[0], exp_batch[1], exp_batch[4], 
+                                     burn_in=burn_in, advantages=advantages, h_q=cached_h_q)
+            metrics.stop_timer("agent_updating_bc")
+        
+        if (epoch + 1) % 50 == 0 or epoch == 0:
             elapsed = time.time() - start_time
             fps = total_frames_processed / (elapsed + 1e-6)
             print(f"    Epoch {epoch+1}/{args.num_unified_epochs} complete... ({fps:.2f} FPS)")
@@ -237,9 +246,12 @@ def main():
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    hparam_str = f"rcql_on{int(args.online_rl)}_off{int(args.offline_rl)}_bc{int(args.bc)}_seed{args.seed}"
+    
+    # Use awbc in folder name if passed, as it implies a different training mode
+    hparam_str = f"rcql_on{int(args.online_rl)}_off{int(args.offline_rl)}_bc{int(args.bc or args.awbc)}_aw{int(args.awbc)}_seed{args.seed}"
     results_base_dir = os.path.join("results", args.env, args.experiment_name, hparam_str)
     os.makedirs(results_base_dir, exist_ok=True)
+
 
     # 1. Setup Environment
     if args.env == "crafter":
@@ -269,7 +281,7 @@ def main():
     
     router = LLMRouter(buffers['curriculum'], buffers['ssl'], env_name=args.env)
     
-    TOTAL_ITERATIONS = 20
+    TOTAL_ITERATIONS = 50
     for iteration in range(TOTAL_ITERATIONS):
         print(f"\n=== Iteration {iteration} ===")
         

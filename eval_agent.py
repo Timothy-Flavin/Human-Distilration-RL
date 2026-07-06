@@ -15,6 +15,12 @@ def evaluate_return(agent, env_name, num_episodes=25):
     if env_name == "highway":
         env_name = "highway-v0"
     
+    # Optimization: For vector-based environments, step-by-step GPU inference is slow.
+    original_device = agent.device_name
+    use_cpu = (original_device == "cuda" and isinstance(agent.obs_dim, int) and agent.obs_dim < 200)
+    if use_cpu:
+        agent.to("cpu")
+
     if env_name == "crafter":
         try:
             import crafter
@@ -33,6 +39,7 @@ def evaluate_return(agent, env_name, num_episodes=25):
             env = CrafterEvalWrapper()
         except ImportError:
             print("[!] Crafter not found for evaluation.")
+            if use_cpu: agent.to(original_device)
             return 0, 0, 0
     else:
         if "highway" in env_name:
@@ -62,6 +69,10 @@ def evaluate_return(agent, env_name, num_episodes=25):
         compliance_scores.append(get_compliance_score(env_name, episode_obs))
     
     env.close()
+    
+    if use_cpu:
+        agent.to(original_device)
+        
     return np.mean(total_returns), np.std(total_returns), np.mean(compliance_scores)
 
 

@@ -1,6 +1,18 @@
 import time
 import json
 import os
+import numpy as np
+import torch
+
+class MetricsEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (torch.Tensor, torch.nn.Parameter)):
+            return obj.detach().cpu().numpy().tolist()
+        return super(MetricsEncoder, self).default(obj)
 
 class MetricsLogger:
     def __init__(self):
@@ -17,6 +29,7 @@ class MetricsLogger:
             "agent_updating_ssl": 0.0,
             "agent_updating_rl": 0.0,
             "agent_updating_value": 0.0,
+            "agent_updating_unified": 0.0,
             "expert_preload_effort": 0.0,
         }
         
@@ -66,7 +79,7 @@ class MetricsLogger:
 
     def save_to_json(self, path):
         with open(path, "w") as f:
-            json.dump(self.get_summary(), f, indent=4)
+            json.dump(self.get_summary(), f, indent=4, cls=MetricsEncoder)
         print(f"[Metrics] Saved to {path}")
 
     def log_iteration(self):

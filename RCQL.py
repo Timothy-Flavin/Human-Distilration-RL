@@ -275,7 +275,7 @@ class RCQLAgent(Agent):
             "next_v": next_v.detach()
         }
 
-    def update_td(self, obs, actions, rewards, dones, masks, burn_in=16) -> dict:
+    def update_td(self, obs, actions, rewards, dones, masks, burn_in=16, use_cql=True) -> dict:
         # 1. Burn-in Phase
         with torch.no_grad():
             if burn_in > 0:
@@ -303,12 +303,17 @@ class RCQLAgent(Agent):
 
         # 3. Masked Loss
         q_td_loss_unmasked = F.mse_loss(current_q, target_q, reduction='none')
-        cql_loss_unmasked = torch.logsumexp(q_logits, dim=2) - current_q
-
+        
         valid_steps = m_active.sum() + 1e-8
         q_loss = (q_td_loss_unmasked * m_active).sum() / valid_steps
-        cql_loss = (cql_loss_unmasked * m_active).sum() / valid_steps
-        total_loss = q_loss + self.cql_alpha * cql_loss
+        
+        cql_loss = torch.tensor(0.0).to(self.device_name)
+        if use_cql:
+            cql_loss_unmasked = torch.logsumexp(q_logits, dim=2) - current_q
+            cql_loss = (cql_loss_unmasked * m_active).sum() / valid_steps
+            total_loss = q_loss + self.cql_alpha * cql_loss
+        else:
+            total_loss = q_loss
 
         self.q_optimizer.zero_grad()
         total_loss.backward()
@@ -422,6 +427,33 @@ class RCQLAgent(Agent):
         kl_loss.backward()
         self.q_optimizer.step()
         return {"loss_kl": kl_loss.item()}
+
+    def to(self, device_name):
+        self.device_name = device_name
+        self.q_net.to(device_name)
+        self.q_target.to(device_name)
+        self.v_net.to(device_name)
+        self.v_target.to(device_name)
+        # Move optimizer states
+        for state in self.q_optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device_name)
+        for state in self.v_optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device_name)
+
+    def sync_from(self, source_agent):
+        with torch.no_grad():
+            for p, src_p in zip(self.q_net.parameters(), source_agent.q_net.parameters()):
+                p.data.copy_(src_p.data)
+            for p, src_p in zip(self.v_net.parameters(), source_agent.v_net.parameters()):
+                p.data.copy_(src_p.data)
+            for p, src_p in zip(self.q_target.parameters(), source_agent.q_target.parameters()):
+                p.data.copy_(src_p.data)
+            for p, src_p in zip(self.v_target.parameters(), source_agent.v_target.parameters()):
+                p.data.copy_(src_p.data)
 
     def _save_checkpoint(self, path):
         state = {'q_net': self.q_net.state_dict(), 'v_net': self.v_net.state_dict()}

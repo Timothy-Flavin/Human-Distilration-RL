@@ -7,6 +7,7 @@ import copy
 import collections
 import random
 import os
+import time
 from Agent import Agent
 
 class QNetwork(nn.Module):
@@ -54,6 +55,15 @@ class CQLAgent(Agent):
         
         self.replay_buffer = collections.deque(maxlen=100000)
 
+        # Experimental: Compile the unified iteration for kernel fusion
+        try:
+            print("[CQL] Attempting torch.compile for structural fusion...")
+            # We compile the networks to fuse their internal layers
+            self.q_net = torch.compile(self.q_net)
+            self.v_net = torch.compile(self.v_net)
+        except Exception as e:
+            print(f"[CQL] torch.compile failed or not supported: {e}")
+
     def act(self, observations: torch.Tensor, deterministic: bool = False):
         with torch.no_grad():
             q_values = self.q_net(observations)
@@ -66,6 +76,160 @@ class CQLAgent(Agent):
 
     def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         self.replay_buffer.append((obs, action, reward, next_obs, terminated, truncated))
+
+    def sync_from(self, source_agent):
+        """Vectorized parameter copy to avoid heavy state_dict moves."""
+        with torch.no_grad():
+            for p, src_p in zip(self.q_net.parameters(), source_agent.q_net.parameters()):
+                p.data.copy_(src_p.data)
+            for p, src_p in zip(self.v_net.parameters(), source_agent.v_net.parameters()):
+                p.data.copy_(src_p.data)
+            # We don't necessarily need to sync targets for collection agents, 
+            # but we'll do it for completeness if they are used elsewhere.
+            for p, src_p in zip(self.q_target.parameters(), source_agent.q_target.parameters()):
+                p.data.copy_(src_p.data)
+            for p, src_p in zip(self.v_target.parameters(), source_agent.v_target.parameters()):
+                p.data.copy_(src_p.data)
+
+    def train_iteration(self, online_batch, expert_batch, awbc=False, bc=False, online_rl=False, offline_rl=False, anti_bc=False, ssl=False):
+        """
+        Structural Optimization: Batches multiple RL signals into unified forward/backward passes.
+        Minimizes kernel launch overhead and intermediate CPU/GPU synchronization.
+        """
+        # 1. Prepare Data
+        # online_batch: (obs, acts, rews, next_obs, dones)
+        # expert_batch: (obs, acts, rews, next_obs, dones)
+        
+        o_obs, o_act, o_rew, o_nobs, o_done = online_batch
+        e_obs, e_act, e_rew, e_nobs, e_done = expert_batch
+        
+        # 2. Combined Forward Pass: Q-Network
+        # We need q(s,a) for TD, q(s) for CQL, q(s) for BC
+        # Combine all unique observations that need Q-logits
+        q_obs_list = []
+        if online_rl: q_obs_list.append(o_obs)
+        if offline_rl or bc or awbc or anti_bc: q_obs_list.append(e_obs)
+        
+        if not q_obs_list: return {}
+        
+        q_obs_all = torch.cat(q_obs_list)
+        q_logits_all = self.q_net(q_obs_all)
+        
+        # Split logits back to original signals
+        ptr = 0
+        q_logits_o = None; q_logits_e = None
+        if online_rl:
+            q_logits_o = q_logits_all[ptr:ptr+o_obs.shape[0]]
+            ptr += o_obs.shape[0]
+        if offline_rl or bc or awbc or anti_bc:
+            q_logits_e = q_logits_all[ptr:ptr+e_obs.shape[0]]
+
+        # 3. Combined Forward Pass: Target Q-Network
+        qn_obs_list = []
+        if online_rl: qn_obs_list.append(o_nobs)
+        if offline_rl: qn_obs_list.append(e_nobs)
+        
+        if qn_obs_list:
+            qn_obs_all = torch.cat(qn_obs_list)
+            with torch.no_grad():
+                qn_logits_all = self.q_target(qn_obs_all)
+            
+            ptr = 0
+            qn_logits_o = None; qn_logits_e = None
+            if online_rl:
+                qn_logits_o = qn_logits_all[ptr:ptr+o_nobs.shape[0]]
+                ptr += o_nobs.shape[0]
+            if offline_rl:
+                qn_logits_e = qn_logits_all[ptr:ptr+e_nobs.shape[0]]
+
+        # 4. Calculate Q-Losses
+        total_q_loss = torch.tensor(0.0, device=self.device_name)
+        metrics = {}
+
+        if online_rl:
+            current_q = q_logits_o.gather(1, o_act.unsqueeze(1)).squeeze(1)
+            next_q = qn_logits_o.max(1)[0]
+            target_q = o_rew + (1 - o_done) * self.gamma * next_q
+            td_loss_o = F.mse_loss(current_q, target_q)
+            cql_loss_o = torch.logsumexp(q_logits_o, dim=1).mean() - current_q.mean()
+            total_q_loss += td_loss_o + self.cql_alpha * cql_loss_o
+            metrics["td_o"] = td_loss_o
+
+        if offline_rl:
+            current_q = q_logits_e.gather(1, e_act.unsqueeze(1)).squeeze(1)
+            next_q = qn_logits_e.max(1)[0]
+            target_q = e_rew + (1 - e_done) * self.gamma * next_q
+            td_loss_e = F.mse_loss(current_q, target_q)
+            cql_loss_e = torch.logsumexp(q_logits_e, dim=1).mean() - current_q.mean()
+            total_q_loss += td_loss_e + self.cql_alpha * cql_loss_e
+            metrics["td_e"] = td_loss_e
+
+        if bc or awbc:
+            advantages = None
+            if awbc:
+                # We need Value for advantage. We'll do a separate V-pass or batch it too.
+                # To keep it simple for now, we'll do value separately or in V-block below.
+                # For AWBC Advantage: A = r + gamma*V(s') - V(s)
+                # This needs V(e_obs) and V(e_nobs)
+                with torch.no_grad():
+                    v_s = self.v_net(e_obs).squeeze()
+                    v_ns = self.v_target(e_nobs).squeeze()
+                    td_error = e_rew + (1 - e_done) * self.gamma * v_ns - v_s
+                    advantages = F.relu(td_error + 1.0)
+            
+            if advantages is not None:
+                log_probs = F.log_softmax(q_logits_e, dim=1)
+                selected_log_probs = log_probs.gather(1, e_act.unsqueeze(1)).squeeze()
+                bc_loss = -(advantages * selected_log_probs).mean()
+            else:
+                bc_loss = F.cross_entropy(q_logits_e, e_act)
+            total_q_loss += bc_loss
+            metrics["bc"] = bc_loss
+
+        if anti_bc:
+            # We assume anti_bc data might be different, but for now we use expert_batch
+            # or caller should provide a dedicated anti_expert_batch.
+            # Assuming e_act are 'bad' actions for anti_bc.
+            probs = F.softmax(q_logits_e, dim=1)
+            bad_action_probs = probs.gather(1, e_act.unsqueeze(1)).squeeze()
+            anti_loss = -torch.log(1 - bad_action_probs + 1e-8).mean()
+            total_q_loss += anti_loss
+            metrics["anti"] = anti_loss
+
+        # 5. Q-Optimizer Step
+        self.q_optimizer.zero_grad(set_to_none=True)
+        total_q_loss.backward()
+        self.q_optimizer.step()
+
+        # 6. Value Update
+        total_v_loss = None
+        if awbc:
+            # Value trains on both online and expert data for robustness
+            v_obs = torch.cat([o_obs, e_obs])
+            v_rews = torch.cat([o_rew, e_rew])
+            v_nobs = torch.cat([o_nobs, e_nobs])
+            v_dones = torch.cat([o_done, e_done])
+            
+            current_v = self.v_net(v_obs).squeeze()
+            with torch.no_grad():
+                next_v = self.v_target(v_nobs).squeeze()
+                target_v = v_rews + (1 - v_dones) * self.gamma * next_v
+            
+            total_v_loss = F.mse_loss(current_v, target_v)
+            self.v_optimizer.zero_grad(set_to_none=True)
+            total_v_loss.backward()
+            self.v_optimizer.step()
+            metrics["v"] = total_v_loss
+
+        # 7. Soft Sync (Single pass using lerp_)
+        with torch.no_grad():
+            for p, tp in zip(self.q_net.parameters(), self.q_target.parameters()):
+                tp.data.lerp_(p.data, self.tau)
+            if total_v_loss is not None:
+                for p, tp in zip(self.v_net.parameters(), self.v_target.parameters()):
+                    tp.data.lerp_(p.data, self.tau)
+
+        return metrics
 
     def update_value(self, obs, actions=None, rewards=None, next_obs=None, dones=None) -> dict:
         """
@@ -112,18 +276,19 @@ class CQLAgent(Agent):
         if ssl and masks:
             obs = self.ssl_augment(obs, masks)
 
-        # 1. Standard Q-Learning Loss
-        current_q = self.q_net(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # 1. Forward Pass (Unified)
+        q_logits = self.q_net(obs)
+        current_q = q_logits.gather(1, actions.unsqueeze(1)).squeeze(1)
+        
         with torch.no_grad():
             next_q = self.q_target(next_obs).max(1)[0]
             target_q = rewards + (1 - dones) * self.gamma * next_q
 
+        # Standard Q-Learning Loss
         q_loss = F.mse_loss(current_q, target_q)
 
-        # 2. CQL Regularization
-        q_logits = self.q_net(obs)
-        dataset_q = q_logits.gather(1, actions.unsqueeze(1)).squeeze()
-        cql_loss = torch.logsumexp(q_logits, dim=1).mean() - dataset_q.mean()
+        # 2. CQL Regularization (Uses same q_logits)
+        cql_loss = torch.logsumexp(q_logits, dim=1).mean() - current_q.mean()
 
         total_loss = q_loss + self.cql_alpha * cql_loss
 
@@ -131,14 +296,18 @@ class CQLAgent(Agent):
         total_loss.backward()
         self.q_optimizer.step()
 
-        for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        # 3. Optimized Soft Update (Using lerp_ is faster and uses fewer kernels)
+        with torch.no_grad():
+            for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+                target_param.data.lerp_(param.data, self.tau)
 
+        # V-RAM Efficiency: Return tensors instead of .item() to avoid synchronization
+        # The caller can .item() them later in bulk if needed.
         return {
-            "loss_td": total_loss.item(),
-            "q_loss": q_loss.item(),
-            "cql_loss": cql_loss.item(),
-            "q_mean": dataset_q.mean().item()
+            "loss_td": total_loss,
+            "q_loss": q_loss,
+            "cql_loss": cql_loss,
+            "q_mean": current_q.mean()
         }
 
     def update_supervised(self, obs, labels=None, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
@@ -172,7 +341,8 @@ class CQLAgent(Agent):
         loss.backward()
         self.q_optimizer.step()
 
-        return {"loss_supervised": loss.item()}
+        return {"loss_supervised": loss}
+
 
     def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
         return self.q_net(obs)
@@ -192,6 +362,22 @@ class CQLAgent(Agent):
         kl_loss.backward()
         self.q_optimizer.step()
         return {"loss_kl": kl_loss.item()}
+
+    def to(self, device_name):
+        self.device_name = device_name
+        self.q_net.to(device_name)
+        self.q_target.to(device_name)
+        self.v_net.to(device_name)
+        self.v_target.to(device_name)
+        # Move optimizer states as well
+        for state in self.q_optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device_name)
+        for state in self.v_optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device_name)
 
     def _save_checkpoint(self, path):
         # Save both Q and V nets

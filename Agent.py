@@ -90,6 +90,16 @@ class Agent(ABC):
         pass
 
     @abstractmethod
+    def to(self, device_name):
+        """Moves the agent's models to the specified device."""
+        pass
+
+    @abstractmethod
+    def sync_from(self, source_agent):
+        """Copies parameters from source_agent to this agent efficiently."""
+        pass
+
+    @abstractmethod
     def load_model(self, path):
         """Loads the model weights."""
         pass

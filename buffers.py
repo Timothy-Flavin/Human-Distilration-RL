@@ -231,6 +231,31 @@ class DenseTorchBuffer:
         self.ptr = 0
         self.size = 0
 
+    def add_from_buffer(self, other_buffer, num_items=None):
+        """
+        Efficiently copies data from another DenseTorchBuffer (e.g., CPU -> GPU).
+        Uses vectorized torch slices for speed.
+        """
+        if num_items is None:
+            num_items = other_buffer.size
+        if num_items == 0: return
+
+        # Target indices (this buffer)
+        indices = (torch.arange(self.ptr, self.ptr + num_items)) % self.capacity
+        # Source indices (other buffer)
+        # Note: This assumes the other buffer was filled from 0 or we want its current content
+        # For simplicity in collection, we'll assume we take the first num_items of 'other'
+        src_indices = torch.arange(0, num_items) % other_buffer.capacity
+        
+        self.obs[indices] = other_buffer.obs[src_indices].to(self.device)
+        self.next_obs[indices] = other_buffer.next_obs[src_indices].to(self.device)
+        self.actions[indices] = other_buffer.actions[src_indices].to(self.device)
+        self.rewards[indices] = other_buffer.rewards[src_indices].to(self.device)
+        self.dones[indices] = other_buffer.dones[src_indices].to(self.device)
+        
+        self.ptr = (self.ptr + num_items) % self.capacity
+        self.size = min(self.size + num_items, self.capacity)
+
     def add_transitions(self, transitions):
         """
         Ingests a list of transition dictionaries.

@@ -53,6 +53,10 @@ def pre_load_data(args, agent, buffers, metrics):
         if 'dense_example' in buffers:
             print(f"[Preload] Flushing {len(all_transitions)} transitions to DenseTorchBuffer...")
             buffers['dense_example'].add_transitions(all_transitions)
+            # Ensure sync_dense_buffers doesn't re-sync these
+            if not hasattr(sync_dense_buffers, "synced_counts"):
+                sync_dense_buffers.synced_counts = collections.defaultdict(int)
+            sync_dense_buffers.synced_counts['example'] = len(buffers['example'])
             
         print(f"[Preload] Successfully loaded {loaded_count} transitions into example_buffer.")
         metrics.log_frames(loaded_count, source="expert_preload")
@@ -60,11 +64,25 @@ def pre_load_data(args, agent, buffers, metrics):
     elif args.preload_expert_data:
         print(f"[Preload] Warning: Expert data file not found at {args.preload_expert_data}")
 
-def run_rl_collection(agent, env, num_frames, metrics, update=False):
-    """Collects experience using the current policy. Lightweight (no frames)."""
+def run_rl_collection(agent, collection_agent, env, cpu_buffer, num_frames, metrics, update=False):
+    """
+    Collects experience using a lightweight CPU agent.
+    Writes directly to a CPU DenseTorchBuffer for fast bulk GPU transfer later.
+    """
     metrics.start_timer("rl_experience")
+    
+    # Sync weights from GPU to CPU (Param Copy Only)
+    if collection_agent is not agent:
+        collection_agent.sync_from(agent)
+
+    cpu_buffer.ptr = 0 # Reset CPU buffer for this collection phase
+    cpu_buffer.size = 0
+
     episodes = []
     total_frames = 0
+    
+    all_new_transitions = []
+
     while total_frames < num_frames:
         seed = np.random.randint(0, 1000000)
         obs, info = env.reset(seed=seed)
@@ -73,11 +91,14 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
         total_reward = 0
         
         while not (terminated or truncated):
-            action = agent.predict(obs, deterministic=False)
+            action = collection_agent.predict(obs, deterministic=False)
             next_obs, reward, terminated, truncated, info = env.step(action)
             
-            # Store in agent's internal buffer for Online RL
-            agent.store_transition(obs, action, reward, next_obs, terminated, truncated)
+            # Collect in list for bulk addition
+            all_new_transitions.append({
+                'obs': obs, 'action': action, 'reward': reward, 
+                'next_obs': next_obs, 'terminated': terminated, 'truncated': truncated
+            })
             
             trajectory_lite.append({
                 "obs": obs, "action": action, "reward": reward, "next_obs": next_obs,
@@ -90,7 +111,7 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
             total_frames += 1
             if total_frames >= num_frames: break
         
-        # Add the final state
+        # Add the final state for trajectory visualization
         trajectory_lite.append({
             "obs": obs, "action": 0, "reward": 0, "next_obs": None,
             "frame_image": None, "terminated": terminated, "truncated": truncated, 
@@ -98,6 +119,11 @@ def run_rl_collection(agent, env, num_frames, metrics, update=False):
         })
             
         episodes.append({"seed": seed, "total_reward": total_reward, "trajectory": trajectory_lite})
+
+    # Bulk add to CPU buffer
+    if all_new_transitions:
+        cpu_buffer.add_transitions(all_new_transitions)
+
     metrics.stop_timer("rl_experience")
     return episodes
 
@@ -121,87 +147,90 @@ def unified_train_step(args, agent, aux_agent, buffers, metrics, active_heuristi
     dense_example = buffers.get('dense_example')
     dense_anti = buffers.get('dense_anti_example')
 
+    # Optimization: On GPU, larger batches are significantly more efficient
+    if args.batch_size:
+        batch_size = args.batch_size
+    else:
+        batch_size = 256 if agent.device_name == "cuda" else 32
+    print(f"[Train] Using batch size {batch_size} for {agent.device_name} updates.")
+
+    profiler = collections.defaultdict(float)
+
     for epoch in range(args.num_unified_epochs):
-        # --- 0. VALUE FUNCTION UPDATE (Independent Signal for AWBC) ---
-        if args.awbc:
-            obs_list, act_list, rew_list, n_obs_list, done_list = [], [], [], [], []
-            
-            # Sample from Online RL data
-            if dense_online and len(dense_online) >= 16:
-                o, a, r, no, d = dense_online.sample(16)
-                obs_list.append(o); act_list.append(a); rew_list.append(r); n_obs_list.append(no); done_list.append(d)
-            
-            # Sample from Human/Expert data
-            if dense_example and len(dense_example) >= 16:
-                o, a, r, no, d = dense_example.sample(16)
-                obs_list.append(o); act_list.append(a); rew_list.append(r); n_obs_list.append(no); done_list.append(d)
-                
-            if obs_list:
-                obs = torch.cat(obs_list)
-                actions = torch.cat(act_list)
-                rewards = torch.cat(rew_list)
-                next_obs = torch.cat(n_obs_list)
-                dones = torch.cat(done_list)
-                
-                metrics.start_timer("agent_updating_value")
-                agent.update_value(obs, actions, rewards, next_obs, dones)
-                metrics.stop_timer("agent_updating_value")
-
-        # --- 1. LOSS SIGNAL: TEMPORAL DIFFERENCE (RL) ---
+        t0 = time.perf_counter()
         
-        # Source: Online RL (Exploration Data)
-        if args.online_rl and dense_online and len(dense_online) >= 32:
-            metrics.start_timer("agent_updating_rl")
-            obs, actions, rewards, next_obs, dones = dense_online.sample(32)
-            agent.update_td(obs, actions, rewards, next_obs, dones, ssl=False) 
-            metrics.stop_timer("agent_updating_rl")
-
-        # Source: Offline RL (Human/Expert Data)
-        if args.offline_rl and dense_example and len(dense_example) >= 32:
-            metrics.start_timer("agent_updating_rl")
-            obs, actions, rewards, next_obs, dones = dense_example.sample(32)
-            # Note: SSL masks are currently not supported in dense buffer for simplicity
-            agent.update_td(obs, actions, rewards, next_obs, dones, ssl=False)
-            metrics.stop_timer("agent_updating_rl")
-
-        # --- 2. LOSS SIGNAL: SUPERVISED (BC) ---
-
-        if (args.bc or args.awbc) and dense_example and len(dense_example) >= 32:
-            metrics.start_timer("agent_updating_bc")
-            obs, actions, rewards, next_obs, dones = dense_example.sample(32)
+        # 1. Unified Sampling (Fetch all data needed for this epoch at once)
+        online_batch = None
+        if dense_online and len(dense_online) >= batch_size:
+            online_batch = dense_online.sample(batch_size)
+        
+        expert_batch = None
+        if dense_example and len(dense_example) >= batch_size:
+            expert_batch = dense_example.sample(batch_size)
             
-            advantages = None
-            if args.awbc:
-                # Calculate Advantage using TD Error: A = r + gamma*V(s') - V(s)
-                with torch.no_grad():
-                    v_s = agent.get_value(obs)
-                    v_ns = agent.get_value(next_obs)
-                    td_error = rewards + (1 - dones) * agent.gamma * v_ns - v_s
-                    # Weight w = exp(Adv / temp). Using relu as a stable proxy.
-                    advantages = F.relu(td_error + 1.0)
+        if online_batch is None and expert_batch is None:
+            continue
             
-            agent.update_supervised(obs, actions, ssl=False, advantages=advantages)
-            metrics.stop_timer("agent_updating_bc")
+        # Fallback to avoid None types in the agent method
+        if online_batch is None: online_batch = expert_batch
+        if expert_batch is None: expert_batch = online_batch
+        
+        if agent.device_name == "cuda": torch.cuda.synchronize()
+        profiler['sampling'] += time.perf_counter() - t0
+
+        # 2. Unified Training Step (Structural Parallelization)
+        t1 = time.perf_counter()
+        metrics.start_timer("agent_updating_unified")
+        
+        # Combined forward/backward for all active signals
+        agent.train_iteration(
+            online_batch, expert_batch,
+            awbc=args.awbc, bc=args.bc,
+            online_rl=args.online_rl, offline_rl=args.offline_rl,
+            anti_bc=args.anti_bc, ssl=args.ssl
+        )
+        
+        metrics.stop_timer("agent_updating_unified")
+        if agent.device_name == "cuda": torch.cuda.synchronize()
+        profiler['update_unified'] += time.perf_counter() - t1
+
+    print(f"[Profiling] Unified Train Step breakdown (Device: {agent.device_name}):")
+    total_time = sum(profiler.values())
+    if total_time > 0:
+        for k, v in profiler.items():
+            print(f"  - {k}: {v:.4f}s ({(v/total_time*100):.1f}%)")
+
+
 
         # --- 3. LOSS SIGNAL: ANTI-BC ---
-        if args.anti_bc and dense_anti and len(dense_anti) >= 32:
+        if args.anti_bc and dense_anti and len(dense_anti) >= batch_size:
             metrics.start_timer("agent_updating_anti_bc")
-            obs, actions, rewards, next_obs, dones = dense_anti.sample(32)
+            obs, actions, rewards, next_obs, dones = dense_anti.sample(batch_size)
             agent.update_supervised(obs, actions, anti=True)
             metrics.stop_timer("agent_updating_anti_bc")
 
         # --- 4. LOSS SIGNAL: CURRICULUM/KL ---
-        if args.curriculum and args.curriculum_method == 'kl' and len(buffers['kl_target']) >= 32:
-            kl_obs = buffers['kl_target'].sample(32)
+        if args.curriculum and args.curriculum_method == 'kl' and len(buffers['kl_target']) >= batch_size:
+            kl_obs = buffers['kl_target'].sample(batch_size)
             agent.kl_update(kl_obs, aux_agent)
 
 def sync_dense_buffers(buffers):
     """Syncs Pythonic list-of-dicts buffers to DenseTorchBuffers for training."""
-    if 'dense_example' in buffers and len(buffers['example']) > 0:
-        # Re-syncing ensures any human corrections/annotations are included
-        buffers['dense_example'].add_transitions(list(buffers['example'].buffer))
-    if 'dense_anti_example' in buffers and len(buffers['anti_example']) > 0:
-        buffers['dense_anti_example'].add_transitions(list(buffers['anti_example'].buffer))
+    # Use static variables to track synced counts across calls
+    if not hasattr(sync_dense_buffers, "synced_counts"):
+        sync_dense_buffers.synced_counts = collections.defaultdict(int)
+    
+    for key, dense_key in [('example', 'dense_example'), ('anti_example', 'dense_anti_example')]:
+        if dense_key in buffers and len(buffers[key]) > sync_dense_buffers.synced_counts[key]:
+            start_idx = sync_dense_buffers.synced_counts[key]
+            import itertools
+            new_transitions = list(itertools.islice(buffers[key].buffer, start_idx, len(buffers[key])))
+            
+            if len(new_transitions) > 0:
+                print(f"[Sync] Adding {len(new_transitions)} new transitions to {dense_key}...")
+                # Still using add_transitions for these as they come from Deques
+                buffers[dense_key].add_transitions(new_transitions)
+                sync_dense_buffers.synced_counts[key] = len(buffers[key])
 
 def main():
     global args
@@ -288,11 +317,23 @@ def main():
     if "football" in env_name or "gfootball" in env_name:
         action_dim = 19 # Standard gfootball action set
     
-    agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL", save_dir=results_base_dir, device_name="cpu")
+    if args.device:
+        device = args.device
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    print(f"[Main] Using device: {device}")
+    agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL", save_dir=results_base_dir, device_name=device)
+
+    # Optimization: Dedicated CPU Agent for collection to avoid GPU kernel overhead
+    collection_agent = agent
+    if device == "cuda":
+        print("[Setup] Initializing dedicated CPU collection agent...")
+        collection_agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL_CPU", save_dir=results_base_dir, device_name="cpu")
 
     aux_agent = None
     if args.curriculum and args.curriculum_method in ['separate', 'kl']:
-        aux_agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL_Aux", save_dir=results_base_dir, device_name="cpu")
+        aux_agent = CQLAgent(obs_dim=obs_dim, action_dim=action_dim, name="CQL_Aux", save_dir=results_base_dir, device_name=device)
 
     # 2. Setup Buffers & Telemetry
     buffers = {
@@ -306,6 +347,7 @@ def main():
 
     # Initialize Dense Tensors for training speed
     buffers['dense_online'] = DenseTorchBuffer(capacity=100000, obs_dim=obs_dim, device=agent.device_name)
+    buffers['dense_online_cpu'] = DenseTorchBuffer(capacity=max(args.num_rl_frames, 10000), obs_dim=obs_dim, device="cpu")
     buffers['dense_example'] = DenseTorchBuffer(capacity=100000, obs_dim=obs_dim, device=agent.device_name)
     buffers['dense_anti_example'] = DenseTorchBuffer(capacity=10000, obs_dim=obs_dim, device=agent.device_name)
 
@@ -320,7 +362,7 @@ def main():
         env_name=env_name
     )
     
-    TOTAL_ITERATIONS = 20
+    TOTAL_ITERATIONS = 10
     for iteration in range(TOTAL_ITERATIONS):
         print(f"\n=== Starting Iteration {iteration} ===")
         active_heuristics = []
@@ -328,13 +370,12 @@ def main():
         # PHASE 1: ACQUISITION
         episodes = []
         if args.num_rl_frames > 0:
-            print(f"Collecting {args.num_rl_frames} RL frames...")
-            episodes = run_rl_collection(agent, env, num_frames=args.num_rl_frames, metrics=metrics, update=args.online_rl)
+            print(f"Collecting {args.num_rl_frames} RL frames (via CPU agent)...")
+            episodes = run_rl_collection(agent, collection_agent, env, buffers['dense_online_cpu'], num_frames=args.num_rl_frames, metrics=metrics, update=args.online_rl)
             
-            # Flush new transitions to Dense Online Buffer
-            for ep in episodes:
-                # Exclude the final dummy state (last item in trajectory)
-                buffers['dense_online'].add_transitions(ep['trajectory'][:-1])
+            # Vectorized transfer: Sync entire CPU collection buffer to GPU at once
+            print(f"[Sync] Transferring {buffers['dense_online_cpu'].size} transitions to GPU...")
+            buffers['dense_online'].add_from_buffer(buffers['dense_online_cpu'])
         
         # PHASE 2: INTERACTION
         annotations = []
@@ -457,5 +498,7 @@ if __name__ == "__main__":
     parser.add_argument("--noise_scale", type=float, default=0.1)
     parser.add_argument("--num_noisy_samples", type=int, default=5)
     parser.add_argument("--preload_expert_data", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
+    parser.add_argument("--batch_size", type=int, default=None)
     args = parser.parse_args()
     main()
