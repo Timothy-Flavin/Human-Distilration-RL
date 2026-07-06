@@ -9,3 +9,4 @@ results_sr
 venv
 expert_data
 results_before_gpu
+cpu_bench
