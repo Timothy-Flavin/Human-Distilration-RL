@@ -11,43 +11,12 @@ from buffers import ReplayBuffer
 
 from compliance_metrics import get_compliance_score
 
-def evaluate_return(agent, env_name, num_episodes=25):
-    if env_name == "highway":
-        env_name = "highway-v0"
-    
+def evaluate_return(agent, env, env_name, num_episodes=25):
     # Optimization: For vector-based environments, step-by-step GPU inference is slow.
     original_device = agent.device_name
     use_cpu = (original_device == "cuda" and isinstance(agent.obs_dim, int) and agent.obs_dim < 200)
     if use_cpu:
         agent.to("cpu")
-
-    if env_name == "crafter":
-        try:
-            import crafter
-            class CrafterEvalWrapper:
-                def __init__(self):
-                    self._env = crafter.Env()
-                    self.observation_space = self._env.observation_space
-                    self.action_space = self._env.action_space
-                def reset(self, seed=None):
-                    if seed is not None: self._env.seed(seed)
-                    return self._env.reset(), {}
-                def step(self, action):
-                    obs, reward, done, info = self._env.step(action)
-                    return obs, reward, done, False, info
-                def close(self): pass
-            env = CrafterEvalWrapper()
-        except ImportError:
-            print("[!] Crafter not found for evaluation.")
-            if use_cpu: agent.to(original_device)
-            return 0, 0, 0
-    else:
-        if "highway" in env_name:
-            import highway_env
-        env = gym.make(env_name)
-        if "highway" in env_name:
-            from gymnasium.wrappers import FlattenObservation
-            env = FlattenObservation(env)
             
     total_returns = []
     compliance_scores = []
@@ -67,8 +36,6 @@ def evaluate_return(agent, env_name, num_episodes=25):
             episode_obs.append(obs)
         total_returns.append(episode_return)
         compliance_scores.append(get_compliance_score(env_name, episode_obs))
-    
-    env.close()
     
     if use_cpu:
         agent.to(original_device)
@@ -151,7 +118,8 @@ def main():
     
     # 2. Measure Return
     print(f"Evaluating return for {args.agent_path}...")
-    mean_ret, std_ret, compliance_score = evaluate_return(agent, args.env_name)
+    mean_ret, std_ret, compliance_score = evaluate_return(agent, temp_env, args.env_name)
+    temp_env.close()
     
     # 3. Measure Cross-Entropy
     bc_loss = None

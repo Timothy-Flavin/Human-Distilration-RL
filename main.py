@@ -455,7 +455,7 @@ def main():
 
         # --- PHASE 5: EVALUATION ---
         print("Evaluating Agent...")
-        mean_ret, std_ret, compliance_score = evaluate_return(agent, env_name, num_episodes=5)
+        mean_ret, std_ret, compliance_score = evaluate_return(agent, env, env_name, num_episodes=5)
         # Always calculate BC loss for Human Likeness tracking if buffer is not empty
         bc_loss = calculate_cross_entropy(agent, buffers['example'], anti=False) if len(buffers['example']) > 0 else 0.0
         metrics.log_evaluation(iteration, mean_ret, std_ret, bc_loss, compliance_score=compliance_score)
@@ -491,7 +491,7 @@ if __name__ == "__main__":
     parser.add_argument("--curriculum", action="store_true")
     parser.add_argument("--curriculum_method", type=str, default="main", choices=["main", "separate", "kl"])
     parser.add_argument("--num_rl_frames", type=int, default=2000)
-    parser.add_argument("--num_iterations", type=int, default=10, help="Number of outer loop iterations")
+    parser.add_argument("--num_iterations", type=int, default=200, help="Number of outer loop iterations")
     parser.add_argument("--num_unified_epochs", type=int, default=50)
     parser.add_argument("--num_local_epochs", type=int, default=5)
     parser.add_argument("--curriculum_traj_len", type=int, default=0)
