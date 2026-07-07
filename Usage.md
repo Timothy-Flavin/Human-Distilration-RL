@@ -39,14 +39,14 @@ These experiments use the `expert_demonstrations_LunarLander-v3.pkl` dataset to 
     python main.py --env LunarLander-v3 --algo cql --offline_rl --awbc --num_rl_frames 0 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
     ```
 
-### Exp 5: Online CQL + Offline CQL
+### Exp 5: Online RL (no conservative loss) + Offline CQL
 *   **Description**: Learns from CQL loss on both the offline expert data and the online collected rl data
 *   **Command**:
     ```bash
     python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --num_rl_frames 2000 --num_unified_epochs 200 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "baseline_awcql" --seed 42
     ```
 
-### Exp 6: Online CQL + Offline CQL + AWBC
+### Exp 6: Online RL (no conservative loss) + Offline CQL + AWBC
 *   **Description**: Learns from CQL loss on both the offline expert data and the online collected rl data and advantage weighted cross entropy loss from the human expert data
 *   **Command**:
     ```bash

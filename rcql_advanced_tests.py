@@ -91,8 +91,7 @@ def run_flicker_catch(num_episodes=1000):
     agent.cql_alpha = 0.0
     # Before the episode loop
     fast_buffer = FastGPUEpisodicBuffer(
-        max_episodes=num_episodes, 
-        max_ep_len=16, 
+        max_total_transitions=num_episodes, 
         device=device, 
         obs_shape=(3, 16, 16)  # <--- Add this
     )

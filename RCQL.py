@@ -263,6 +263,7 @@ class RCQLAgent(Agent):
 
         self.v_optimizer.zero_grad()
         v_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.v_net.parameters(), max_norm=1.0)
         self.v_optimizer.step()
 
         for param, target_param in zip(self.v_net.parameters(), self.v_target.parameters()):
@@ -317,6 +318,7 @@ class RCQLAgent(Agent):
 
         self.q_optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.q_optimizer.step()
 
         for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
@@ -368,6 +370,7 @@ class RCQLAgent(Agent):
 
         self.q_optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.q_optimizer.step()
         
         return {"loss_supervised": loss.item()}
@@ -425,6 +428,7 @@ class RCQLAgent(Agent):
                            reduction='batchmean')
         self.q_optimizer.zero_grad()
         kl_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.q_optimizer.step()
         return {"loss_kl": kl_loss.item()}
 

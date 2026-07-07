@@ -8,7 +8,8 @@ class TestCQLUpdate(unittest.TestCase):
     def setUp(self):
         self.obs_dim = 8
         self.action_dim = 4
-        self.agent = CQLAgent(obs_dim=self.obs_dim, action_dim=self.action_dim, gamma=0.9)
+        self.agent = CQLAgent(obs_dim=self.obs_dim, action_dim=self.action_dim)
+        self.agent.gamma = 0.9
 
     def test_cql_target_terminated_vs_truncated(self):
         # Mock target Q values: Q(s, a) = 10 for all a
