@@ -56,13 +56,14 @@ class CQLAgent(Agent):
         self.replay_buffer = collections.deque(maxlen=100000)
 
         # Experimental: Compile the unified iteration for kernel fusion
-        try:
-            print("[CQL] Attempting torch.compile for structural fusion...")
-            # We compile the networks to fuse their internal layers
-            self.q_net = torch.compile(self.q_net)
-            self.v_net = torch.compile(self.v_net)
-        except Exception as e:
-            print(f"[CQL] torch.compile failed or not supported: {e}")
+        if self.device_name == "cuda":
+            try:
+                print("[CQL] Attempting torch.compile for structural fusion...")
+                # We compile the networks to fuse their internal layers
+                self.q_net = torch.compile(self.q_net)
+                self.v_net = torch.compile(self.v_net)
+            except Exception as e:
+                print(f"[CQL] torch.compile failed or not supported: {e}")
 
     def act(self, observations: torch.Tensor, deterministic: bool = False):
         with torch.no_grad():
