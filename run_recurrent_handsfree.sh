@@ -52,11 +52,11 @@ do
     #     --experiment_name "baseline_awrcql" --seed $seed
     # # --- EXPERIMENT 4: Hands-Free Online RL + BC ---
     echo "[Exp 4] Hands-Free Online RL + Expert BC (Seed $seed)"
-    python3 recurrent_main.py --env $ENV --online_rl --offline_rl \
+    python3 recurrent_main.py --env $ENV --online_rl --offline_rl --awbc\
         --num_rl_frames $RL_FRAMES \
         --num_unified_epochs $UNIFIED_EPOCHS_ONLINE \
         --preload_expert_data $CLEANED_EXPERT_DATA \
-        --experiment_name "online_offline_handsfree" --seed $seed
+        --experiment_name "online_offline_awbc" --seed $seed
 done
 echo ""
 echo "=========================================================="

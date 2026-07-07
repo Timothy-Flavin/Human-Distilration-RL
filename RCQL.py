@@ -58,7 +58,7 @@ class RecurrentQNetwork(nn.Module):
         super(RecurrentQNetwork, self).__init__()
         self.encoder = RecurrentCNNEncoder(in_channels, img_size)
         self.lstm = nn.LSTM(512, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, action_dim)
+        self.fc = nn.Linear(hidden_dim, action_dim+1)
 
     def forward(self, x, hidden=None, features=None):
         # x shape: (Batch, Time, Channels, H, W)
@@ -71,8 +71,11 @@ class RecurrentQNetwork(nn.Module):
             features = features.reshape(batch_size, seq_len, -1)
         
         lstm_out, hidden = self.lstm(features, hidden)
-        q_values = self.fc(lstm_out)
-        return q_values, hidden
+        logits = self.fc(lstm_out)
+        advantages = logits[:, :, :-1]  # All but last dimension are Q-values
+        advantages -= advantages.mean(dim=-1, keepdim=True)  # Normalize Q-values
+        v = logits[:, :, -1:]  # Last dimension is the value function
+        return v, advantages, hidden
 
 class RecurrentValueNetwork(nn.Module):
     def __init__(self, in_channels=3, img_size=64, hidden_dim=512):
