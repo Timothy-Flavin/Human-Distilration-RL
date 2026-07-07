@@ -144,6 +144,15 @@ class CQLAgent(Agent):
                 log_probs = F.log_softmax(q_logits_e, dim=1)
                 selected_log_probs = log_probs.gather(1, e_act.unsqueeze(1)).squeeze()
                 bc_loss = -(awbc_adv * selected_log_probs).mean()
+                
+                if not online_rl and not offline_rl:
+                    current_q = q_logits_e.gather(1, e_act.unsqueeze(1)).squeeze(1)
+                    next_q = qn_logits_e.max(1)[0]
+                    target_q = e_rew + (1 - e_done) * self.gamma * next_q
+                    td_loss_e = F.mse_loss(current_q, target_q)
+                    total_q_loss += td_loss_e
+                    metrics["td_e_fallback"] = td_loss_e
+                    self.epsilon = 0.01
             else:
                 bc_loss = temperature_scaled_bc_loss(adv_e, e_act, epsilon=self.epsilon)
                 

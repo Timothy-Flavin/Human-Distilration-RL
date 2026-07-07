@@ -22,7 +22,10 @@ def aggregate_and_plot(experiment_dir, output_dir):
             all_data.append(json.load(f))
 
     num_seeds = len(all_data)
-    iters = [e["iteration"] for e in all_data[0]["evaluations"]]
+    iters = set()
+    for d in all_data:
+        iters.update([e["iteration"] for e in d.get("evaluations", [])])
+    iters = sorted(list(iters))
     num_iters = len(iters)
 
     # Helper to extract and aggregate a metric over iterations
@@ -62,7 +65,13 @@ def aggregate_and_plot(experiment_dir, output_dir):
         
         for i in iters:
             m_path = os.path.join(s_dir, f"metrics_{i}.json")
-            if not os.path.exists(m_path): continue
+            if not os.path.exists(m_path):
+                seed_interactions.append(np.nan)
+                seed_wallclock.append(np.nan)
+                seed_human_time.append(np.nan)
+                seed_scores.append(np.nan)
+                seed_likeness.append(np.nan)
+                continue
             with open(m_path, "r") as f:
                 d = json.load(f)
                 # Total Frames
@@ -93,18 +102,18 @@ def aggregate_and_plot(experiment_dir, output_dir):
         all_seeds_likeness.append(seed_likeness)
 
     # Convert to arrays [Seed, Iteration]
-    all_seeds_interactions = np.array(all_seeds_interactions)
-    all_seeds_wallclock = np.array(all_seeds_wallclock)
-    all_seeds_human_time = np.array(all_seeds_human_time)
-    all_seeds_scores = np.array(all_seeds_scores)
-    all_seeds_likeness = np.array(all_seeds_likeness)
+    all_seeds_interactions = np.array(all_seeds_interactions, dtype=float)
+    all_seeds_wallclock = np.array(all_seeds_wallclock, dtype=float)
+    all_seeds_human_time = np.array(all_seeds_human_time, dtype=float)
+    all_seeds_scores = np.array(all_seeds_scores, dtype=float)
+    all_seeds_likeness = np.array(all_seeds_likeness, dtype=float)
 
     # --- Plot 1: Interactions vs Eval Score ---
     plt.figure(figsize=(10, 6))
     for s in range(num_seeds):
         plt.plot(all_seeds_interactions[s], all_seeds_scores[s], alpha=0.3, color='blue')
-    mean_scores = np.mean(all_seeds_scores, axis=0)
-    mean_ints = np.mean(all_seeds_interactions, axis=0)
+    mean_scores = np.nanmean(all_seeds_scores, axis=0)
+    mean_ints = np.nanmean(all_seeds_interactions, axis=0)
     plt.plot(mean_ints, mean_scores, color='blue', linewidth=3, label="Mean")
     plt.title("Sample Efficiency")
     plt.xlabel("Total Environment Interactions")
@@ -116,7 +125,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.figure(figsize=(10, 6))
     for s in range(num_seeds):
         plt.plot(all_seeds_wallclock[s], all_seeds_scores[s], alpha=0.3, color='red')
-    mean_t = np.mean(all_seeds_wallclock, axis=0)
+    mean_t = np.nanmean(all_seeds_wallclock, axis=0)
     plt.plot(mean_t, mean_scores, color='red', linewidth=3, label="Mean")
     plt.title("Real-Time Performance")
     plt.xlabel("Total Wall-clock Time (s)")
@@ -128,7 +137,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.figure(figsize=(10, 6))
     for s in range(num_seeds):
         plt.plot(iters, all_seeds_likeness[s], alpha=0.3, color='green')
-    mean_likeness = np.mean(all_seeds_likeness, axis=0)
+    mean_likeness = np.nanmean(all_seeds_likeness, axis=0)
     plt.plot(iters, mean_likeness, color='green', linewidth=3, label="Mean")
     plt.title("Human Likeness (Policy Divergence)")
     plt.xlabel("Iteration")
@@ -138,11 +147,11 @@ def aggregate_and_plot(experiment_dir, output_dir):
 
     # --- Plot 4: Active Human Time vs Eval Score ---
     plt.figure(figsize=(10, 6))
-    active_mask = np.mean(all_seeds_human_time, axis=0) > 0
+    active_mask = np.nanmean(all_seeds_human_time, axis=0) > 0
     if active_mask.any():
         for s in range(num_seeds):
             plt.plot(all_seeds_human_time[s], all_seeds_scores[s], alpha=0.3, color='orange')
-        mean_h = np.mean(all_seeds_human_time, axis=0)
+        mean_h = np.nanmean(all_seeds_human_time, axis=0)
         plt.plot(mean_h, mean_scores, color='orange', linewidth=3, label="Mean")
     plt.title("Human Effort Efficiency")
     plt.xlabel("Total Human Effort (Seconds)")
