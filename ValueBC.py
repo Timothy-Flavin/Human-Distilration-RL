@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-def temperature_scaled_bc_loss(advantages, expert_actions, epsilon, max_bisection_iters=10):
+def temperature_scaled_bc_loss(advantages, expert_actions, epsilon, max_bisection_iters=10, weights=None):
     """
     Computes a scale-invariant Behavior Cloning loss for Dueling Architectures.
     
@@ -14,6 +14,7 @@ def temperature_scaled_bc_loss(advantages, expert_actions, epsilon, max_bisectio
         expert_actions: Tensor of shape (batch_size,), containing the offline dataset actions.
         epsilon: Float, the current exploration rate dictating the target entropy.
         max_bisection_iters: Int, number of iterations for the root-finding algorithm.
+        weights: Optional tensor of shape (batch_size,) to scale the loss per-sample (e.g., AWBC).
         
     Returns:
         loss: Scalar tensor representing the gradient-corrected KL divergence.
@@ -114,6 +115,9 @@ def temperature_scaled_bc_loss(advantages, expert_actions, epsilon, max_bisectio
     # independent of the environment's scale or how small alpha gets.
     
     protected_loss = kl_divergence * alpha_detached
+
+    if weights is not None:
+        protected_loss = protected_loss * weights.unsqueeze(1)
 
     # Return the mean loss across the batch
     return protected_loss.mean()

@@ -141,17 +141,15 @@ class CQLAgent(Agent):
                     td_error = e_rew + (1 - e_done) * self.gamma * v_ns - v_s
                     awbc_adv = F.relu(td_error + 1.0)
                 
-                log_probs = F.log_softmax(q_logits_e, dim=1)
-                selected_log_probs = log_probs.gather(1, e_act.unsqueeze(1)).squeeze()
-                bc_loss = -(awbc_adv * selected_log_probs).mean()
+                bc_loss = temperature_scaled_bc_loss(adv_e, e_act, epsilon=self.epsilon, weights=awbc_adv)
                 
                 if not online_rl and not offline_rl:
-                    current_q = q_logits_e.gather(1, e_act.unsqueeze(1)).squeeze(1)
-                    next_q = qn_logits_e.max(1)[0]
-                    target_q = e_rew + (1 - e_done) * self.gamma * next_q
-                    td_loss_e = F.mse_loss(current_q, target_q)
-                    total_q_loss += td_loss_e
-                    metrics["td_e_fallback"] = td_loss_e
+                    # Train the value function v head directly to avoid interference with the adv policy head
+                    current_v = v_e.squeeze(1)
+                    target_v = e_rew + (1 - e_done) * self.gamma * vn_e.squeeze(1)
+                    td_loss_v = F.mse_loss(current_v, target_v)
+                    total_q_loss += td_loss_v
+                    metrics["td_v_fallback"] = td_loss_v
                     self.epsilon = 0.01
             else:
                 bc_loss = temperature_scaled_bc_loss(adv_e, e_act, epsilon=self.epsilon)
