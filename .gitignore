@@ -11,3 +11,4 @@ expert_data
 results_before_gpu
 results_before_dueling
 cpu_bench
+*.npy
