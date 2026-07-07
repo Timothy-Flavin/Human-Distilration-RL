@@ -362,8 +362,7 @@ def main():
         env_name=env_name
     )
     
-    TOTAL_ITERATIONS = 10
-    for iteration in range(TOTAL_ITERATIONS):
+    for iteration in range(args.num_iterations):
         print(f"\n=== Starting Iteration {iteration} ===")
         active_heuristics = []
         
@@ -492,6 +491,7 @@ if __name__ == "__main__":
     parser.add_argument("--curriculum", action="store_true")
     parser.add_argument("--curriculum_method", type=str, default="main", choices=["main", "separate", "kl"])
     parser.add_argument("--num_rl_frames", type=int, default=2000)
+    parser.add_argument("--num_iterations", type=int, default=10, help="Number of outer loop iterations")
     parser.add_argument("--num_unified_epochs", type=int, default=50)
     parser.add_argument("--num_local_epochs", type=int, default=5)
     parser.add_argument("--curriculum_traj_len", type=int, default=0)
@@ -502,3 +502,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None)
     args = parser.parse_args()
     main()
+    
+    # Force exit to prevent background threads (e.g. from torch.compile or gym) from hanging the process
+    import os
+    os._exit(0)
+
