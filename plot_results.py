@@ -92,7 +92,7 @@ def plot_metrics(metrics_path, output_dir):
     # Detailed Breakdown (Horizontal)
     plt.figure(figsize=(12, 10))
     # Filter out keys with 0 to keep it clean
-    display_timers = {k: v for k, v in timers.items() if v > 0}
+    display_timers = {k: v for k, v in timers.items() if v > 0 and k != "training_throughput_fps"}
     # Add the estimated preload if it was calculated manually
     if "expert_preload_effort" not in display_timers and preload_time > 0:
         display_timers["expert_preload_effort"] = preload_time

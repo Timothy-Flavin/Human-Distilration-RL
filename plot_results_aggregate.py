@@ -81,7 +81,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
                 
                 # Total Wallclock
                 timers = d["timers"]
-                total_t = sum(timers.values())
+                total_t = sum(v for k, v in timers.items() if k != "training_throughput_fps")
                 seed_wallclock.append(total_t)
                 
                 # Human Effort
@@ -108,13 +108,41 @@ def aggregate_and_plot(experiment_dir, output_dir):
     all_seeds_scores = np.array(all_seeds_scores, dtype=float)
     all_seeds_likeness = np.array(all_seeds_likeness, dtype=float)
 
+    def plot_interpolated_mean(ax, x_arrays, y_arrays, color, label="Mean"):
+        # Gather all valid X data to find global min and max
+        all_x = np.concatenate([x[~np.isnan(x)] for x in x_arrays if len(x[~np.isnan(x)]) > 0])
+        if len(all_x) == 0: return
+        min_x, max_x = np.min(all_x), np.max(all_x)
+        
+        # We need a monotonically increasing grid
+        common_x = np.linspace(min_x, max_x, 300)
+        interp_y = []
+        
+        for x, y in zip(x_arrays, y_arrays):
+            valid = ~np.isnan(x) & ~np.isnan(y)
+            if valid.sum() > 1:
+                # Sort X to ensure it is strictly increasing for interpolation
+                sort_idx = np.argsort(x[valid])
+                x_val = x[valid][sort_idx]
+                y_val = y[valid][sort_idx]
+                
+                # Remove duplicates in X
+                x_val, unique_idx = np.unique(x_val, return_index=True)
+                y_val = y_val[unique_idx]
+                
+                if len(x_val) > 1:
+                    y_interp = np.interp(common_x, x_val, y_val, left=np.nan, right=np.nan)
+                    interp_y.append(y_interp)
+                    
+        if interp_y:
+            mean_y = np.nanmean(interp_y, axis=0)
+            ax.plot(common_x, mean_y, color=color, linewidth=3, label=label)
+
     # --- Plot 1: Interactions vs Eval Score ---
     plt.figure(figsize=(10, 6))
     for s in range(num_seeds):
         plt.plot(all_seeds_interactions[s], all_seeds_scores[s], alpha=0.3, color='blue')
-    mean_scores = np.nanmean(all_seeds_scores, axis=0)
-    mean_ints = np.nanmean(all_seeds_interactions, axis=0)
-    plt.plot(mean_ints, mean_scores, color='blue', linewidth=3, label="Mean")
+    plot_interpolated_mean(plt.gca(), all_seeds_interactions, all_seeds_scores, color='blue')
     plt.title("Sample Efficiency")
     plt.xlabel("Total Environment Interactions")
     plt.ylabel("Eval Return")
@@ -125,8 +153,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.figure(figsize=(10, 6))
     for s in range(num_seeds):
         plt.plot(all_seeds_wallclock[s], all_seeds_scores[s], alpha=0.3, color='red')
-    mean_t = np.nanmean(all_seeds_wallclock, axis=0)
-    plt.plot(mean_t, mean_scores, color='red', linewidth=3, label="Mean")
+    plot_interpolated_mean(plt.gca(), all_seeds_wallclock, all_seeds_scores, color='red')
     plt.title("Real-Time Performance")
     plt.xlabel("Total Wall-clock Time (s)")
     plt.ylabel("Eval Return")
@@ -137,6 +164,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.figure(figsize=(10, 6))
     for s in range(num_seeds):
         plt.plot(iters, all_seeds_likeness[s], alpha=0.3, color='green')
+    # For iters which are perfectly aligned across seeds, nanmean is perfectly fine
     mean_likeness = np.nanmean(all_seeds_likeness, axis=0)
     plt.plot(iters, mean_likeness, color='green', linewidth=3, label="Mean")
     plt.title("Human Likeness (Policy Divergence)")
@@ -151,8 +179,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     if active_mask.any():
         for s in range(num_seeds):
             plt.plot(all_seeds_human_time[s], all_seeds_scores[s], alpha=0.3, color='orange')
-        mean_h = np.nanmean(all_seeds_human_time, axis=0)
-        plt.plot(mean_h, mean_scores, color='orange', linewidth=3, label="Mean")
+        plot_interpolated_mean(plt.gca(), all_seeds_human_time, all_seeds_scores, color='orange')
     plt.title("Human Effort Efficiency")
     plt.xlabel("Total Human Effort (Seconds)")
     plt.ylabel("Eval Return")
@@ -172,7 +199,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
 
     # --- Plot 6: Bar-graph of Time by Category ---
     plt.figure(figsize=(12, 7))
-    t_labels = list(latest["timers"].keys())
+    t_labels = [k for k in latest["timers"].keys() if k != "training_throughput_fps"]
     t_means = [np.mean([d["timers"].get(l, 0) for d in all_data]) for l in t_labels]
     t_stds = [np.std([d["timers"].get(l, 0) for d in all_data]) for l in t_labels]
     plt.barh(t_labels, t_means, xerr=t_stds, color='blue', alpha=0.7, capsize=10)

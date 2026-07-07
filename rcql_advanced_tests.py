@@ -68,7 +68,7 @@ def test_pipeline_sliding_window():
     # Enable grad for the first frame specifically to track it
     obs_tensor.requires_grad = True
     
-    q_logits, _ = agent.q_net(obs_tensor[:, :-1, :]) # Current Q for s0..s15
+    q_logits, _, _, _ = agent.q_net(obs_tensor[:, :-1, :]) # Current Q for s0..s15
     # Target final Q-value
     loss = q_logits[0, -1, 0] # Dummy loss on final step action 0
     
@@ -91,7 +91,7 @@ def run_flicker_catch(num_episodes=1000):
     agent.cql_alpha = 0.0
     # Before the episode loop
     fast_buffer = FastGPUEpisodicBuffer(
-        max_total_transitions=num_episodes, 
+        max_total_transitions=20000, 
         device=device, 
         obs_shape=(3, 16, 16)  # <--- Add this
     )

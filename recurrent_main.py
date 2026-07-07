@@ -64,6 +64,9 @@ def pre_load_episodic_data(args, buffers, metrics):
                 transitions = item
                 duration = len(transitions) / 30.0
                 
+            for t in transitions:
+                t['reward'] = t.get('reward', 0.0) * 10.0
+                
             buffers['expert'].add_episode(transitions)
             loaded_count += len(transitions)
             total_duration += duration
@@ -109,13 +112,13 @@ def run_rl_collection(agent, env, buffers, num_frames, metrics, min_episodes=0):
             next_obs, reward, terminated, truncated, info = env.step(action)
             
             episode_transitions.append({
-                'obs': obs, 'action': action, 'reward': reward,
+                'obs': obs, 'action': action, 'reward': reward * 10.0,
                 'next_obs': next_obs, 'terminated': terminated, 'truncated': truncated,
                 'info': info 
             })
             
             trajectory_lite.append({
-                "obs": obs, "action": action, "reward": reward, "next_obs": next_obs,
+                "obs": obs, "action": action, "reward": reward * 10.0, "next_obs": next_obs,
                 "frame_image": None, "terminated": terminated, "truncated": truncated, 
                 "env_state": None, "source": "rl"
             })
@@ -148,12 +151,12 @@ def hydrate_trajectory(env, seed, trajectory_lite):
     return trajectory_lite
 
 def unified_train_step(args, agent, buffers, metrics):
-    batch_size = 8
-    seq_len = 48
+    batch_size = 64
+    seq_len = 64
     burn_in = 16
     
-    has_online = args.online_rl and buffers['online'].current_size >= batch_size
-    has_offline = (args.offline_rl or args.bc or args.awbc) and buffers['expert'].current_size >= batch_size
+    has_online = args.online_rl and buffers['online'].current_size >= 8
+    has_offline = (args.offline_rl or args.bc or args.awbc) and buffers['expert'].current_size > 0
     
     if not (has_online or has_offline):
         print(f"[Training] Skipping updates: Not enough episodes (Online: {buffers['online'].current_size}, Offline: {buffers['expert'].current_size})")
@@ -181,13 +184,14 @@ def unified_train_step(args, agent, buffers, metrics):
         if args.awbc:
             metrics.start_timer("agent_updating_value")
             # Update value using expert data
+            train_v = not (args.online_rl or args.offline_rl)
             if exp_batch:
-                v_results = agent.update_value(*exp_batch, burn_in=burn_in)
+                v_results = agent.update_value(*exp_batch, burn_in=burn_in, train=train_v)
                 cached_v = (v_results['current_v'], v_results['next_v'])
             
             # Update value using online data (if available)
             if on_batch:
-                agent.update_value(*on_batch, burn_in=burn_in)
+                agent.update_value(*on_batch, burn_in=burn_in, train=train_v)
             metrics.stop_timer("agent_updating_value")
 
         # 2. TD / POLICY UPDATES (CQL or Online RL)
@@ -241,7 +245,7 @@ def main():
     parser.add_argument("--awbc", action="store_true")
     parser.add_argument("--intervention", action="store_true")
     parser.add_argument("--num_rl_frames", type=int, default=2000)
-    parser.add_argument("--num_unified_epochs", type=int, default=20)
+    parser.add_argument("--num_unified_epochs", type=int, default=50)
     parser.add_argument("--preload_expert_data", type=str, default="expert_demonstrations_crafter.pkl")
     args = parser.parse_args()
 
@@ -285,6 +289,12 @@ def main():
     for iteration in range(TOTAL_ITERATIONS):
         print(f"\n=== Iteration {iteration} ===")
         
+        # Epsilon decay from 0.25 to 0.05 over the first 20k RL frames
+        total_rl_frames_collected = iteration * args.num_rl_frames
+        decay_fraction = min(1.0, total_rl_frames_collected / 20000.0)
+        agent.epsilon = 0.25 - decay_fraction * (0.25 - 0.05)
+        print(f"    Current Epsilon: {agent.epsilon:.4f}")
+        
         episodes = []
         if args.num_rl_frames > 0:
             # If online_rl is enabled and we don't have enough episodes yet, 
@@ -308,7 +318,7 @@ def main():
                 s, ns = corrected_trajectory[i], corrected_trajectory[i+1]
                 if ns.get('action') is not None:
                     human_episode.append({
-                        'obs': s['obs'], 'action': ns['action'], 'reward': ns.get('reward', 0.0),
+                        'obs': s['obs'], 'action': ns['action'], 'reward': ns.get('reward', 0.0) * 10.0,
                         'next_obs': ns['obs'], 'terminated': ns.get('terminated', False),
                         'truncated': ns.get('truncated', False)
                     })
