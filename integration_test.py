@@ -16,8 +16,9 @@ from buffers import FastGPUEpisodicBuffer
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class MinimalCQLEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, reward_scale=1.0):
         super().__init__()
+        self.reward_scale = reward_scale
         self.action_space = spaces.Discrete(3)
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
         self.state_type = 0
@@ -34,14 +35,15 @@ class MinimalCQLEnv(gym.Env):
     def step(self, action):
         reward = 0.0
         if self.state_type == 0:
-            if action in [0, 1]: reward = 1.0
+            if action in [0, 1]: reward = self.reward_scale
         else:
-            if action in [1, 2]: reward = 1.0
+            if action in [1, 2]: reward = self.reward_scale
         return np.zeros(2, dtype=np.float32), reward, True, False, {}
 
 class MinimalRCQLEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, reward_scale=1.0):
         super().__init__()
+        self.reward_scale = reward_scale
         self.action_space = spaces.Discrete(3)
         self.observation_space = spaces.Box(low=0, high=255, shape=(3, 64,64), dtype=np.uint8)
         self.max_steps = 4
@@ -66,9 +68,9 @@ class MinimalRCQLEnv(gym.Env):
         
         if terminated:
             if self.state_type == 0:
-                if action in [0, 1]: reward = 1.0
+                if action in [0, 1]: reward = self.reward_scale
             else:
-                if action in [1, 2]: reward = 1.0
+                if action in [1, 2]: reward = self.reward_scale
                 
         obs = np.zeros((3, 64, 64), dtype=np.uint8)
         return obs, reward, terminated, False, {}
@@ -93,8 +95,8 @@ class SimpleBuffer:
     def current_size(self):
         return len(self.data)
 
-def generate_cql_expert(num_episodes=200):
-    env = MinimalCQLEnv()
+def generate_cql_expert(num_episodes=200, reward_scale=1.0):
+    env = MinimalCQLEnv(reward_scale)
     buffer = SimpleBuffer()
     for _ in range(num_episodes):
         obs, _ = env.reset()
@@ -103,8 +105,8 @@ def generate_cql_expert(num_episodes=200):
         buffer.add((obs, action, reward, next_obs, term or trunc))
     return buffer
 
-def generate_rcql_expert(num_episodes=200):
-    env = MinimalRCQLEnv()
+def generate_rcql_expert(num_episodes=200, reward_scale=1.0):
+    env = MinimalRCQLEnv(reward_scale)
     buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 64, 64))
     for _ in range(num_episodes):
         obs, _ = env.reset()
@@ -152,19 +154,19 @@ def eval_rcql_kl(agent):
     kl = F.kl_div(log_probs, target_probs, reduction='batchmean')
     return kl.item()
 
-def run_cql_experiment(mode, seeds=10, iters=300):
+def run_cql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
     results = {'kl': [], 'td_loss': [], 'bc_loss': []}
     for seed in range(seeds):
         np.random.seed(seed)
         torch.manual_seed(seed)
         random.seed(seed)
         
-        env = MinimalCQLEnv()
+        env = MinimalCQLEnv(reward_scale)
         agent = CQLAgent(obs_dim=2, action_dim=3, name=f"CQL_{mode}", device_name=device)
         agent.cql_alpha = 0.0
         agent.epsilon = 0.05
         
-        expert_buffer = generate_cql_expert()
+        expert_buffer = generate_cql_expert(reward_scale=reward_scale)
         online_buffer = SimpleBuffer()
         
         online_rl = mode in ["RL", "RL_BC", "RL_Naive_BC"]
@@ -205,19 +207,19 @@ def run_cql_experiment(mode, seeds=10, iters=300):
         results['bc_loss'].append(bc_hist)
     return results
 
-def run_rcql_experiment(mode, seeds=10, iters=300):
+def run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
     results = {'kl': [], 'td_loss': [], 'bc_loss': []}
     for seed in range(seeds):
         np.random.seed(seed)
         torch.manual_seed(seed)
         random.seed(seed)
         
-        env = MinimalRCQLEnv()
+        env = MinimalRCQLEnv(reward_scale)
         agent = RCQLAgent(obs_dim=(3, 64, 64), action_dim=3, name=f"RCQL_{mode}", device_name=device, hidden_dim=64)
         agent.cql_alpha = 0.0
         agent.epsilon = 0.05
         
-        expert_buffer = generate_rcql_expert()
+        expert_buffer = generate_rcql_expert(reward_scale=reward_scale)
         online_buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 64, 64))
         
         online_rl = mode in ["RL", "RL_BC", "RL_Naive_BC"]
@@ -269,52 +271,56 @@ if __name__ == "__main__":
     modes = ["RL", "BC", "RL_BC", "RL_Naive_BC"]
     os.makedirs("test_results", exist_ok=True)
     
-    print("Running CQL tests...")
-    cql_res = {}
-    for mode in modes:
-        print(f"CQL Mode: {mode}")
-        res = run_cql_experiment(mode, seeds=10, iters=300)
-        cql_res[mode] = res
-        np.save(f"test_results/cql_{mode}_kl.npy", np.array(res['kl']))
-        np.save(f"test_results/cql_{mode}_td.npy", np.array(res['td_loss']))
-        np.save(f"test_results/cql_{mode}_bc.npy", np.array(res['bc_loss']))
-        
-    print("Running RCQL tests...")
-    rcql_res = {}
-    for mode in modes:
-        print(f"RCQL Mode: {mode}")
-        res = run_rcql_experiment(mode, seeds=10, iters=300)
-        rcql_res[mode] = res
-        np.save(f"test_results/rcql_{mode}_kl.npy", np.array(res['kl']))
-        np.save(f"test_results/rcql_{mode}_td.npy", np.array(res['td_loss']))
-        np.save(f"test_results/rcql_{mode}_bc.npy", np.array(res['bc_loss']))
-        
-    fig, axs = plt.subplots(2, 3, figsize=(15, 8))
-    for i, arch in enumerate(["cql", "rcql"]):
-        res_dict = cql_res if arch == "cql" else rcql_res
+    scales = [1.0, 100.0]
+    
+    for scale in scales:
+        print(f"\n--- Running experiments for reward scale: {scale} ---")
+        print("Running CQL tests...")
+        cql_res = {}
         for mode in modes:
-            kl_mean = np.mean(res_dict[mode]['kl'], axis=0)
-            kl_std = np.std(res_dict[mode]['kl'], axis=0)
-            axs[i, 0].plot(kl_mean, label=mode)
-            axs[i, 0].fill_between(range(len(kl_mean)), kl_mean-kl_std, kl_mean+kl_std, alpha=0.2)
+            print(f"CQL Mode: {mode}")
+            res = run_cql_experiment(mode, seeds=10, iters=300, reward_scale=scale)
+            cql_res[mode] = res
+            np.save(f"test_results/cql_{mode}_scale_{scale}_kl.npy", np.array(res['kl']))
+            np.save(f"test_results/cql_{mode}_scale_{scale}_td.npy", np.array(res['td_loss']))
+            np.save(f"test_results/cql_{mode}_scale_{scale}_bc.npy", np.array(res['bc_loss']))
             
-            td_mean = np.mean(res_dict[mode]['td_loss'], axis=0)
-            axs[i, 1].plot(td_mean, label=mode)
+        print("Running RCQL tests...")
+        rcql_res = {}
+        for mode in modes:
+            print(f"RCQL Mode: {mode}")
+            res = run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=scale)
+            rcql_res[mode] = res
+            np.save(f"test_results/rcql_{mode}_scale_{scale}_kl.npy", np.array(res['kl']))
+            np.save(f"test_results/rcql_{mode}_scale_{scale}_td.npy", np.array(res['td_loss']))
+            np.save(f"test_results/rcql_{mode}_scale_{scale}_bc.npy", np.array(res['bc_loss']))
             
-            bc_mean = np.mean(res_dict[mode]['bc_loss'], axis=0)
-            axs[i, 2].plot(bc_mean, label=mode)
+        fig, axs = plt.subplots(2, 3, figsize=(15, 8))
+        for i, arch in enumerate(["cql", "rcql"]):
+            res_dict = cql_res if arch == "cql" else rcql_res
+            for mode in modes:
+                kl_mean = np.mean(res_dict[mode]['kl'], axis=0)
+                kl_std = np.std(res_dict[mode]['kl'], axis=0)
+                axs[i, 0].plot(kl_mean, label=mode)
+                axs[i, 0].fill_between(range(len(kl_mean)), kl_mean-kl_std, kl_mean+kl_std, alpha=0.2)
+                
+                td_mean = np.mean(res_dict[mode]['td_loss'], axis=0)
+                axs[i, 1].plot(td_mean, label=mode)
+                
+                bc_mean = np.mean(res_dict[mode]['bc_loss'], axis=0)
+                axs[i, 2].plot(bc_mean, label=mode)
+                
+            axs[i, 0].set_title(f"{arch.upper()} KL Divergence (Scale: {scale})")
+            axs[i, 0].set_ylabel("KL Div")
+            axs[i, 0].set_xlabel("Iterations")
+            axs[i, 0].legend()
             
-        axs[i, 0].set_title(f"{arch.upper()} KL Divergence")
-        axs[i, 0].set_ylabel("KL Div")
-        axs[i, 0].set_xlabel("Iterations")
-        axs[i, 0].legend()
-        
-        axs[i, 1].set_title(f"{arch.upper()} TD Loss")
-        axs[i, 1].set_xlabel("Iterations")
-        
-        axs[i, 2].set_title(f"{arch.upper()} BC Loss")
-        axs[i, 2].set_xlabel("Iterations")
-        
-    plt.tight_layout()
-    plt.savefig("test_results/integration_results.png")
-    print("Saved plots to test_results/integration_results.png")
+            axs[i, 1].set_title(f"{arch.upper()} TD Loss (Scale: {scale})")
+            axs[i, 1].set_xlabel("Iterations")
+            
+            axs[i, 2].set_title(f"{arch.upper()} BC Loss (Scale: {scale})")
+            axs[i, 2].set_xlabel("Iterations")
+            
+        plt.tight_layout()
+        plt.savefig(f"test_results/integration_results_scale_{scale}.png")
+        print(f"Saved plots to test_results/integration_results_scale_{scale}.png")
