@@ -129,6 +129,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.plot(mean_t, mean_scores, color='red', linewidth=3, label="Mean")
     plt.title("Real-Time Performance")
     plt.xlabel("Total Wall-clock Time (s)")
+    plt.ylim(-400,400)
     plt.ylabel("Eval Return")
     plt.grid(True); plt.legend()
     plt.savefig(os.path.join(output_dir, "2_realtime_performance.png"))

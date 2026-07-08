@@ -24,37 +24,42 @@ for i in "${!ENVS[@]}"; do
     do
         echo ">>> Running Static Baselines (Seed $seed) for $ENV"
         
-        # Exp 1: Pure BC
-        python main.py --env $ENV --algo cql --bc --num_rl_frames 0 \
-            --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
-            --experiment_name "baseline_bc" --seed $seed
+        # # Exp 1: Pure BC
+        # python main.py --env $ENV --algo cql --bc --num_rl_frames 0 \
+        #     --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
+        #     --experiment_name "baseline_bc" --seed $seed
 
-        # Exp 2: AWBC
-        python main.py --env $ENV --algo cql --awbc --num_rl_frames 0 \
-            --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
-            --experiment_name "baseline_awbc" --seed $seed
+        # # Exp 2: AWBC
+        # python main.py --env $ENV --algo cql --awbc --num_rl_frames 0 \
+        #     --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
+        #     --experiment_name "baseline_awbc" --seed $seed
 
-        # Exp 3: Pure Offline CQL
-        python main.py --env $ENV --algo cql --offline_rl --num_rl_frames 0 \
-            --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
-            --experiment_name "baseline_cql" --seed $seed
+        # # Exp 3: Pure Offline CQL
+        # python main.py --env $ENV --algo cql --offline_rl --num_rl_frames 0 \
+        #     --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
+        #     --experiment_name "baseline_cql" --seed $seed
 
-        # Exp 4: AWBC-CQL (Offline Hybrid)
-        python main.py --env $ENV --algo cql --offline_rl --awbc --num_rl_frames 0 \
-            --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
-            --experiment_name "baseline_awcql" --seed $seed
+        # # Exp 4: AWBC-CQL (Offline Hybrid)
+        # python main.py --env $ENV --algo cql --offline_rl --awbc --num_rl_frames 0 \
+        #     --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
+        #     --experiment_name "baseline_awcql" --seed $seed
 
-        echo ">>> Running Hands-Free Online Mixed (Seed $seed) for $ENV"
+        # echo ">>> Running Hands-Free Online Mixed (Seed $seed) for $ENV"
 
-        # Exp 5: Online RL (no conservative loss) + Offline CQL
-        python main.py --env $ENV --algo cql --offline_rl --online_rl --num_rl_frames 2000 \
-            --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
-            --experiment_name "online_cql" --seed $seed
+        # # Exp 5: Online RL (no conservative loss) + Offline CQL
+        # python main.py --env $ENV --algo cql --offline_rl --online_rl --num_rl_frames 2000 \
+        #     --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
+        #     --experiment_name "online_cql" --seed $seed
 
-        # Exp 6: Online RL (no conservative loss) + Offline CQL + AWBC
-        python main.py --env $ENV --algo cql --awbc --offline_rl --online_rl --num_rl_frames 2000 \
+        # # Exp 6: Online RL (no conservative loss) + Offline CQL + AWBC
+        # python main.py --env $ENV --algo cql --awbc --offline_rl --online_rl --num_rl_frames 2000 \
+        #     --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
+        #     --experiment_name "online_awcql" --seed $seed
+
+        # Exp 7: Online RL (no conservative loss)
+        python main.py --env $ENV --algo cql --online_rl --num_rl_frames 2000 \
             --num_unified_epochs 200 --preload_expert_data $EXPERT_DATA \
-            --experiment_name "online_awcql" --seed $seed
+            --experiment_name "online" --seed $seed
     done
 done
 
