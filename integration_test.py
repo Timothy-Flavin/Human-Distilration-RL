@@ -162,13 +162,14 @@ def run_cql_experiment(mode, seeds=10, iters=300):
         env = MinimalCQLEnv()
         agent = CQLAgent(obs_dim=2, action_dim=3, name=f"CQL_{mode}", device_name=device)
         agent.cql_alpha = 0.0
+        agent.epsilon = 0.05
         
         expert_buffer = generate_cql_expert()
         online_buffer = SimpleBuffer()
         
-        online_rl = mode in ["RL", "RL_BC"]
-        bc = mode in ["BC", "RL_BC", "Naive_BC"]
-        naive_bc = mode == "Naive_BC"
+        online_rl = mode in ["RL", "RL_BC", "RL_Naive_BC"]
+        bc = mode in ["BC", "RL_BC", "RL_Naive_BC"]
+        naive_bc = mode == "RL_Naive_BC"
         
         kl_hist, td_hist, bc_hist = [], [], []
         
@@ -214,13 +215,14 @@ def run_rcql_experiment(mode, seeds=10, iters=300):
         env = MinimalRCQLEnv()
         agent = RCQLAgent(obs_dim=(3, 64, 64), action_dim=3, name=f"RCQL_{mode}", device_name=device, hidden_dim=64)
         agent.cql_alpha = 0.0
+        agent.epsilon = 0.05
         
         expert_buffer = generate_rcql_expert()
         online_buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 64, 64))
         
-        online_rl = mode in ["RL", "RL_BC"]
-        bc = mode in ["BC", "RL_BC", "Naive_BC"]
-        naive_bc = mode == "Naive_BC"
+        online_rl = mode in ["RL", "RL_BC", "RL_Naive_BC"]
+        bc = mode in ["BC", "RL_BC", "RL_Naive_BC"]
+        naive_bc = mode == "RL_Naive_BC"
         
         kl_hist, td_hist, bc_hist = [], [], []
         
@@ -264,7 +266,7 @@ def run_rcql_experiment(mode, seeds=10, iters=300):
     return results
 
 if __name__ == "__main__":
-    modes = ["RL", "BC", "RL_BC", "Naive_BC"]
+    modes = ["RL", "BC", "RL_BC", "RL_Naive_BC"]
     os.makedirs("test_results", exist_ok=True)
     
     print("Running CQL tests...")
