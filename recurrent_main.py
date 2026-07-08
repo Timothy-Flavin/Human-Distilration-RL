@@ -179,33 +179,36 @@ def unified_train_step(args, agent, buffers, metrics):
             on_batch = buffers['online'].sample_batch(batch_size, seq_len=seq_len)
             total_frames_processed += batch_size * (seq_len + 1)
 
-        # 1. VALUE FUNCTION UPDATES (for AWBC)
-        cached_v = None
-        if args.awbc:
-            metrics.start_timer("agent_updating_value")
-            # Update value using expert data
-            train_v = not (args.online_rl or args.offline_rl)
-            if exp_batch:
-                v_results = agent.update_value(*exp_batch, burn_in=burn_in, train=train_v)
-                cached_v = (v_results['current_v'], v_results['next_v'])
-            
-            # Update value using online data (if available)
-            if on_batch:
-                agent.update_value(*on_batch, burn_in=burn_in, train=train_v)
-            metrics.stop_timer("agent_updating_value")
-
-        # 2. TD / POLICY UPDATES (CQL or Online RL)
+        # 1. TD / POLICY UPDATES (CQL or Online RL)
         cached_h_q = None
+        cached_v = None
         if args.offline_rl and exp_batch:
             metrics.start_timer("agent_updating_rl")
             td_results = agent.update_td(*exp_batch, burn_in=burn_in)
             cached_h_q = td_results.get('h_q')
+            cached_v = (td_results['current_v'], td_results['next_v'])
             metrics.stop_timer("agent_updating_rl")
         
         if args.online_rl and on_batch:
             metrics.start_timer("agent_updating_rl")
             agent.update_td(*on_batch, burn_in=burn_in, use_cql=False)
             metrics.stop_timer("agent_updating_rl")
+
+        # 2. VALUE FUNCTION UPDATES (for AWBC)
+        if args.awbc:
+            train_v = not (args.online_rl or args.offline_rl)
+            
+            if exp_batch and (cached_v is None or train_v):
+                metrics.start_timer("agent_updating_value")
+                v_results = agent.update_value(*exp_batch, burn_in=burn_in, train=train_v)
+                cached_v = (v_results['current_v'], v_results['next_v'])
+                metrics.stop_timer("agent_updating_value")
+            
+            # Update value using online data (if available and training V)
+            if on_batch and train_v:
+                metrics.start_timer("agent_updating_value")
+                agent.update_value(*on_batch, burn_in=burn_in, train=True)
+                metrics.stop_timer("agent_updating_value")
 
         # 3. SUPERVISED / BC UPDATES
         if (args.awbc or args.bc) and exp_batch:
@@ -245,7 +248,7 @@ def main():
     parser.add_argument("--awbc", action="store_true")
     parser.add_argument("--intervention", action="store_true")
     parser.add_argument("--num_rl_frames", type=int, default=2000)
-    parser.add_argument("--num_unified_epochs", type=int, default=50)
+    parser.add_argument("--num_unified_epochs", type=int, default=20)
     parser.add_argument("--preload_expert_data", type=str, default="expert_demonstrations_crafter.pkl")
     args = parser.parse_args()
 

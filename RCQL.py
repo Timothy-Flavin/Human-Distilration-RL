@@ -229,13 +229,15 @@ class RCQLAgent(Agent):
         d_active = dones[:, burn_in:]
         m_active = masks[:, burn_in:]
 
-        q_logits_full, _, _, _ = self.q_net(obs_active, hidden=h_q)
+        q_logits_full, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
         q_logits = q_logits_full[:, :-1, :]
         current_q = q_logits.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
+        current_v = v_full[:, :-1, :].squeeze(-1)
 
         with torch.no_grad():
-            q_target_full, _, _, _ = self.q_target(obs_active, hidden=h_q_target)
+            q_target_full, v_target_full, _, _ = self.q_target(obs_active, hidden=h_q_target)
             next_q = q_target_full[:, 1:, :].max(2)[0]
+            next_v = v_target_full[:, 1:, :].squeeze(-1)
             target_q = r_active + (1.0 - d_active) * self.gamma * next_q
 
         q_td_loss_unmasked = F.mse_loss(current_q, target_q, reduction='none')
@@ -263,7 +265,9 @@ class RCQLAgent(Agent):
             "loss_td": total_loss.item(), 
             "q_loss": q_loss.item(), 
             "cql_loss": cql_loss.item(),
-            "h_q": h_q 
+            "h_q": h_q,
+            "current_v": current_v.detach(),
+            "next_v": next_v.detach()
         }
 
     def update_supervised(self, obs, actions, masks, burn_in=16, anti=False, advantages=None, h_q=None) -> dict:
@@ -366,7 +370,7 @@ class RCQLAgent(Agent):
             if valid_indices.numel() > 0:
                 valid_adv = adv_flat[valid_indices]
                 valid_act = a_flat[valid_indices]
-                loss = temperature_scaled_bc_loss(valid_adv, valid_act, epsilon=self.epsilon)
+                loss = F.cross_entropy(valid_adv, valid_act)
             else:
                 loss = torch.tensor(0.0).to(self.device_name)
             
