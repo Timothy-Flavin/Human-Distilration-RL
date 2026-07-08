@@ -156,7 +156,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plot_interpolated_mean(plt.gca(), all_seeds_wallclock, all_seeds_scores, color='red')
     plt.title("Real-Time Performance")
     plt.xlabel("Total Wall-clock Time (s)")
-    plt.ylim(-400,400)
+    #plt.ylim(-400,400)
     plt.ylabel("Eval Return")
     plt.grid(True); plt.legend()
     plt.savefig(os.path.join(output_dir, "2_realtime_performance.png"))

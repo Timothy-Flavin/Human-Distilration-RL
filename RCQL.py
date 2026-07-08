@@ -214,7 +214,7 @@ class RCQLAgent(Agent):
             "next_v": next_v.detach()
         }
 
-    def update_td(self, obs, actions, rewards, dones, masks, burn_in=16, use_cql=True) -> dict:
+    def update_td(self, obs, actions, rewards, dones, masks, burn_in=16, use_cql=True, td_scale=1.0) -> dict:
         with torch.no_grad():
             if burn_in > 0:
                 burn_obs = obs[:, :burn_in, :]
@@ -254,7 +254,15 @@ class RCQLAgent(Agent):
             total_loss = q_loss
 
         self.q_optimizer.zero_grad()
-        total_loss.backward()
+        (total_loss / (td_scale ** 2)).backward()
+        
+        rl_grad_norm = 0.0
+        for p in self.q_net.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                rl_grad_norm += param_norm.item() ** 2
+        rl_grad_norm = rl_grad_norm ** 0.5
+        
         torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.q_optimizer.step()
 
@@ -323,12 +331,18 @@ class RCQLAgent(Agent):
                     loss = torch.tensor(0.0).to(self.device_name)
 
                 self.q_optimizer.zero_grad()
+                grad_norm = 0.0
                 if loss.requires_grad:
                     loss.backward()
+                    for p in self.q_net.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            grad_norm += param_norm.item() ** 2
+                    grad_norm = grad_norm ** 0.5
                     torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
                     self.q_optimizer.step()
                 
-                return {"loss_supervised": loss.item() if hasattr(loss, 'item') else 0.0}
+                return {"loss_supervised": loss.item() if hasattr(loss, 'item') else 0.0, "grad_norm": grad_norm}
             else:
                 batch_size, seq_len, act_dim = adv_active.shape
                 adv_flat = adv_active.reshape(-1, act_dim)
@@ -349,12 +363,18 @@ class RCQLAgent(Agent):
                     loss = torch.tensor(0.0).to(self.device_name)
                 
                 self.q_optimizer.zero_grad()
+                grad_norm = 0.0
                 if loss.requires_grad:
                     loss.backward()
+                    for p in self.q_net.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            grad_norm += param_norm.item() ** 2
+                    grad_norm = grad_norm ** 0.5
                     torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
                     self.q_optimizer.step()
                 
-                return {"loss_supervised": loss.item() if hasattr(loss, 'item') else 0.0}
+                return {"loss_supervised": loss.item() if hasattr(loss, 'item') else 0.0, "grad_norm": grad_norm}
     
     def get_bc_loss(self, obs, actions, masks, burn_in=16) -> float:
         self.q_net.eval()

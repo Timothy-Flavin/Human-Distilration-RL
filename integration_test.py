@@ -155,7 +155,7 @@ def eval_rcql_kl(agent):
     return kl.item()
 
 def run_cql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
-    results = {'kl': [], 'td_loss': [], 'bc_loss': []}
+    results = {'kl': [], 'td_loss': [], 'bc_loss': [], 'grad_norm': [], 'rl_grad_norm': []}
     for seed in range(seeds):
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -173,7 +173,7 @@ def run_cql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
         bc = mode in ["BC", "RL_BC", "RL_Naive_BC"]
         naive_bc = mode == "RL_Naive_BC"
         
-        kl_hist, td_hist, bc_hist = [], [], []
+        kl_hist, td_hist, bc_hist, grad_hist, rl_grad_hist = [], [], [], [], []
         
         for i in range(iters):
             if online_rl:
@@ -187,7 +187,7 @@ def run_cql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
             
             metrics = {}
             if o_batch is not None:
-                metrics1 = agent.update_td(obs=o_batch[0], actions=o_batch[1], rewards=o_batch[2], next_obs=o_batch[3], dones=o_batch[4], use_cql=False)
+                metrics1 = agent.update_td(obs=o_batch[0], actions=o_batch[1], rewards=o_batch[2], next_obs=o_batch[3], dones=o_batch[4], use_cql=False, td_scale=reward_scale)
                 metrics.update(metrics1)
             if e_batch is not None:
                 metrics2 = agent.update_supervised(obs=e_batch[0], labels=e_batch[1], naive=naive_bc)
@@ -197,18 +197,26 @@ def run_cql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
             if isinstance(td_loss, torch.Tensor): td_loss = td_loss.item()
             bc_loss = metrics.get('bc', metrics.get('loss_supervised', 0.0))
             if isinstance(bc_loss, torch.Tensor): bc_loss = bc_loss.item()
+            grad_norm = metrics.get('grad_norm', 0.0)
+            if isinstance(grad_norm, torch.Tensor): grad_norm = grad_norm.item()
+            rl_grad_norm = metrics.get('rl_grad_norm', 0.0)
+            if isinstance(rl_grad_norm, torch.Tensor): rl_grad_norm = rl_grad_norm.item()
             
             td_hist.append(td_loss)
             bc_hist.append(bc_loss)
+            grad_hist.append(grad_norm)
+            rl_grad_hist.append(rl_grad_norm)
             kl_hist.append(eval_cql_kl(agent))
             
         results['kl'].append(kl_hist)
         results['td_loss'].append(td_hist)
         results['bc_loss'].append(bc_hist)
+        results['grad_norm'].append(grad_hist)
+        results['rl_grad_norm'].append(rl_grad_hist)
     return results
 
 def run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
-    results = {'kl': [], 'td_loss': [], 'bc_loss': []}
+    results = {'kl': [], 'td_loss': [], 'bc_loss': [], 'grad_norm': [], 'rl_grad_norm': []}
     for seed in range(seeds):
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -226,7 +234,7 @@ def run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
         bc = mode in ["BC", "RL_BC", "RL_Naive_BC"]
         naive_bc = mode == "RL_Naive_BC"
         
-        kl_hist, td_hist, bc_hist = [], [], []
+        kl_hist, td_hist, bc_hist, grad_hist = [], [], [], []
         
         for i in range(iters):
             if online_rl:
@@ -247,7 +255,7 @@ def run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
             
             metrics = {}
             if o_batch is not None:
-                metrics1 = agent.update_td(o_batch[0], o_batch[1], o_batch[2], o_batch[3], o_batch[4], burn_in=0, use_cql=False)
+                metrics1 = agent.update_td(o_batch[0], o_batch[1], o_batch[2], o_batch[3], o_batch[4], burn_in=0, use_cql=False, td_scale=reward_scale)
                 metrics.update(metrics1)
             if e_batch is not None:
                 metrics2 = agent.update_supervised(e_batch[0], e_batch[1], e_batch[4], burn_in=0, naive=naive_bc)
@@ -257,14 +265,22 @@ def run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
             if isinstance(td_loss, torch.Tensor): td_loss = td_loss.item()
             bc_loss = metrics.get('loss_supervised', 0.0)
             if isinstance(bc_loss, torch.Tensor): bc_loss = bc_loss.item()
+            grad_norm = metrics.get('grad_norm', 0.0)
+            if isinstance(grad_norm, torch.Tensor): grad_norm = grad_norm.item()
+            rl_grad_norm = metrics.get('rl_grad_norm', 0.0)
+            if isinstance(rl_grad_norm, torch.Tensor): rl_grad_norm = rl_grad_norm.item()
             
             td_hist.append(td_loss)
             bc_hist.append(bc_loss)
+            grad_hist.append(grad_norm)
+            rl_grad_hist.append(rl_grad_norm)
             kl_hist.append(eval_rcql_kl(agent))
             
         results['kl'].append(kl_hist)
         results['td_loss'].append(td_hist)
         results['bc_loss'].append(bc_hist)
+        results['grad_norm'].append(grad_hist)
+        results['rl_grad_norm'].append(rl_grad_hist)
     return results
 
 if __name__ == "__main__":
@@ -284,6 +300,8 @@ if __name__ == "__main__":
             np.save(f"test_results/cql_{mode}_scale_{scale}_kl.npy", np.array(res['kl']))
             np.save(f"test_results/cql_{mode}_scale_{scale}_td.npy", np.array(res['td_loss']))
             np.save(f"test_results/cql_{mode}_scale_{scale}_bc.npy", np.array(res['bc_loss']))
+            np.save(f"test_results/cql_{mode}_scale_{scale}_grad.npy", np.array(res['grad_norm']))
+            np.save(f"test_results/cql_{mode}_scale_{scale}_rl_grad.npy", np.array(res['rl_grad_norm']))
             
         print("Running RCQL tests...")
         rcql_res = {}
@@ -294,8 +312,10 @@ if __name__ == "__main__":
             np.save(f"test_results/rcql_{mode}_scale_{scale}_kl.npy", np.array(res['kl']))
             np.save(f"test_results/rcql_{mode}_scale_{scale}_td.npy", np.array(res['td_loss']))
             np.save(f"test_results/rcql_{mode}_scale_{scale}_bc.npy", np.array(res['bc_loss']))
+            np.save(f"test_results/rcql_{mode}_scale_{scale}_grad.npy", np.array(res['grad_norm']))
+            np.save(f"test_results/rcql_{mode}_scale_{scale}_rl_grad.npy", np.array(res['rl_grad_norm']))
             
-        fig, axs = plt.subplots(2, 3, figsize=(15, 8))
+        fig, axs = plt.subplots(2, 5, figsize=(25, 8))
         for i, arch in enumerate(["cql", "rcql"]):
             res_dict = cql_res if arch == "cql" else rcql_res
             for mode in modes:
@@ -310,6 +330,12 @@ if __name__ == "__main__":
                 bc_mean = np.mean(res_dict[mode]['bc_loss'], axis=0)
                 axs[i, 2].plot(bc_mean, label=mode)
                 
+                grad_mean = np.mean(res_dict[mode]['grad_norm'], axis=0)
+                axs[i, 3].plot(grad_mean, label=mode)
+                
+                rl_grad_mean = np.mean(res_dict[mode]['rl_grad_norm'], axis=0)
+                axs[i, 4].plot(rl_grad_mean, label=mode)
+                
             axs[i, 0].set_title(f"{arch.upper()} KL Divergence (Scale: {scale})")
             axs[i, 0].set_ylabel("KL Div")
             axs[i, 0].set_xlabel("Iterations")
@@ -320,6 +346,14 @@ if __name__ == "__main__":
             
             axs[i, 2].set_title(f"{arch.upper()} BC Loss (Scale: {scale})")
             axs[i, 2].set_xlabel("Iterations")
+            
+            axs[i, 3].set_title(f"{arch.upper()} BC Grad Norm (Scale: {scale})")
+            axs[i, 3].set_xlabel("Iterations")
+            axs[i, 3].set_yscale('log')
+            
+            axs[i, 4].set_title(f"{arch.upper()} RL Grad Norm (Scale: {scale})")
+            axs[i, 4].set_xlabel("Iterations")
+            axs[i, 4].set_yscale('log')
             
         plt.tight_layout()
         plt.savefig(f"test_results/integration_results_scale_{scale}.png")

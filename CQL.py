@@ -177,7 +177,7 @@ class CQLAgent(Agent):
     def update_value(self, obs, actions=None, rewards=None, next_obs=None, dones=None) -> dict:
         return {"loss_v": 0.0, "v_mean": 0.0}
 
-    def update_td(self, obs, actions=None, rewards=None, next_obs=None, dones=None, ssl: bool = False, masks: list = None, use_cql=True) -> dict:
+    def update_td(self, obs, actions=None, rewards=None, next_obs=None, dones=None, ssl: bool = False, masks: list = None, use_cql=True, td_scale=1.0) -> dict:
         if isinstance(obs, (list, collections.deque)):
             batch = obs
             obs_np, actions_np, rewards_np, next_obs_np, terminated, truncated = zip(*batch)
@@ -207,7 +207,15 @@ class CQLAgent(Agent):
         total_loss = q_loss + self.cql_alpha * cql_loss
 
         self.q_optimizer.zero_grad()
-        total_loss.backward()
+        (total_loss / (td_scale ** 2)).backward()
+        
+        rl_grad_norm = 0.0
+        for p in self.q_net.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                rl_grad_norm += param_norm.item() ** 2
+        rl_grad_norm = rl_grad_norm ** 0.5
+        
         self.q_optimizer.step()
 
         with torch.no_grad():
@@ -218,6 +226,7 @@ class CQLAgent(Agent):
             "loss_td": total_loss,
             "q_loss": q_loss,
             "cql_loss": cql_loss,
+            "rl_grad_norm": rl_grad_norm,
             "q_mean": current_q.mean()
         }
 
@@ -251,9 +260,17 @@ class CQLAgent(Agent):
 
         self.q_optimizer.zero_grad()
         loss.backward()
+        
+        grad_norm = 0.0
+        for p in self.q_net.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                grad_norm += param_norm.item() ** 2
+        grad_norm = grad_norm ** 0.5
+        
         self.q_optimizer.step()
 
-        return {"loss_supervised": loss}
+        return {"loss_supervised": loss, "grad_norm": grad_norm}
 
     def get_logits(self, obs: torch.Tensor) -> torch.Tensor:
         q, _, _ = self.q_net(obs)
