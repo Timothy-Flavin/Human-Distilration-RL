@@ -234,7 +234,7 @@ def run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
         bc = mode in ["BC", "RL_BC", "RL_Naive_BC"]
         naive_bc = mode == "RL_Naive_BC"
         
-        kl_hist, td_hist, bc_hist, grad_hist = [], [], [], []
+        kl_hist, td_hist, bc_hist, grad_hist, rl_grad_hist = [], [], [], [], []
         
         for i in range(iters):
             if online_rl:
