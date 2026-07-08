@@ -13,8 +13,8 @@ ENV="crafter"
 RAW_EXPERT_DATA="expert_demonstrations_crafter.pkl"
 CLEANED_EXPERT_DATA="expert_demonstrations_crafter_cleaned.pkl"
 ITERATIONS=50
-UNIFIED_EPOCHS_OFFLINE=500
-UNIFIED_EPOCHS_ONLINE=500
+UNIFIED_EPOCHS_OFFLINE=100
+UNIFIED_EPOCHS_ONLINE=100
 RL_FRAMES=2000
 
 echo "=========================================================="
@@ -23,7 +23,7 @@ echo "Applying drop_bottom 0.1 to expert data..."
 python3 analyze_expert_data.py --path $RAW_EXPERT_DATA --drop_bottom 0.1
 echo "=========================================================="
 
-for seed in {2..3}
+for seed in {0..1}
 do
     echo ""
     echo ">>> STARTING SEED: $seed"
@@ -51,7 +51,7 @@ do
     #     --preload_expert_data $CLEANED_EXPERT_DATA \
     #     --experiment_name "baseline_awrcql" --seed $seed
     # # --- EXPERIMENT 4: Hands-Free Online RL + BC ---
-    echo "[Exp 4] Hands-Free Online RL + Expert BC (Seed $seed)"
+    # echo "[Exp 4] Hands-Free Online RL + Expert BC (Seed $seed)"
     python3 recurrent_main.py --env $ENV --online_rl --offline_rl --awbc\
         --num_rl_frames $RL_FRAMES \
         --num_unified_epochs $UNIFIED_EPOCHS_ONLINE \

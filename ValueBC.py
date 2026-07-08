@@ -1,6 +1,32 @@
 import torch
 import torch.nn.functional as F
 
+@torch.compile
+def _bisection_search_alpha(advantages, target_entropy, max_bisection_iters: int):
+    batch_size = advantages.shape[0]
+    device = advantages.device
+    
+    alpha_low = torch.full((batch_size, 1), 1e-4, device=device)
+    alpha_high = torch.full((batch_size, 1), 1e3, device=device)
+    
+    for _ in range(max_bisection_iters):
+        alpha_mid = (alpha_low + alpha_high) / 2.0
+        
+        logits = advantages / alpha_mid
+        
+        # Replace softmax with logsumexp for numerical stability
+        lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+        log_probs = logits - lse
+        probs = torch.exp(log_probs)
+        
+        # Entropy: -sum(p * log(p)) = lse - sum(p * logits)
+        entropy = lse - torch.sum(probs * logits, dim=-1, keepdim=True)
+        
+        alpha_high = torch.where(entropy > target_entropy, alpha_mid, alpha_high)
+        alpha_low = torch.where(entropy <= target_entropy, alpha_mid, alpha_low)
+        
+    return (alpha_low + alpha_high) / 2.0
+
 def temperature_scaled_bc_loss(advantages, expert_actions, epsilon, max_bisection_iters=10, weights=None):
     """
     Computes a scale-invariant Behavior Cloning loss for Dueling Architectures.
@@ -48,28 +74,9 @@ def temperature_scaled_bc_loss(advantages, expert_actions, epsilon, max_bisectio
     # Because entropy is monotonically increasing with alpha, bisection is guaranteed
     # to find the unique root rapidly and safely.
     
-    alpha_low = torch.full((batch_size, 1), 1e-4, device=device)
-    alpha_high = torch.full((batch_size, 1), 1e3, device=device)
-    
     # We don't want gradients flowing through the root-finding process.
     with torch.no_grad():
-        for _ in range(max_bisection_iters):
-            alpha_mid = (alpha_low + alpha_high) / 2.0
-            
-            # Compute current logit probabilities
-            probs = F.softmax(advantages / alpha_mid, dim=-1)
-            
-            # Compute current entropy: -sum(p * log(p))
-            # Added 1e-8 for numerical stability against log(0)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1, keepdim=True)
-            
-            # If entropy is too high, the temperature (alpha) is too high.
-            # If entropy is too low, the temperature (alpha) is too low.
-            alpha_high = torch.where(entropy > target_entropy, alpha_mid, alpha_high)
-            alpha_low = torch.where(entropy <= target_entropy, alpha_mid, alpha_low)
-
-        # The final alpha is the midpoint of our narrow bounds.
-        alpha_final = (alpha_low + alpha_high) / 2.0
+        alpha_final = _bisection_search_alpha(advantages, target_entropy, max_bisection_iters)
 
     # STEP 3: Detach Alpha
     # This ensures PyTorch treats our computed temperatures as static scalars,
@@ -130,7 +137,7 @@ if __name__ == "__main__":
     num_actions = 5
     
     # Simulate small environment advantages (e.g., natural scale of 0.05)
-    mock_advantages = torch.randn(batch_size, num_actions, requires_grad=True) * 0.05
+    mock_advantages = (torch.randn(batch_size, num_actions) * 0.05).requires_grad_(True)
     
     # Simulate offline expert actions
     mock_expert_actions = torch.randint(0, num_actions, (batch_size,))

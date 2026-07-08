@@ -28,54 +28,60 @@ import random
 from Agent import Agent
 from ValueBC import temperature_scaled_bc_loss
 
-class RecurrentCNNEncoder(nn.Module):
+class NatureCNNEncoder(nn.Module):
     def __init__(self, in_channels=3, img_size=64):
-        super(RecurrentCNNEncoder, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
-        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        super(NatureCNNEncoder, self).__init__()
+        # Standard Nature CNN convolutional stack
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         
-        # Calculate flatten size
+        # Calculate flatten size dynamically (1024 for 64x64 inputs)
         dummy_input = torch.zeros(1, in_channels, img_size, img_size)
         with torch.no_grad():
-            dummy_out = self.conv4(self.conv3(self.conv2(self.conv1(dummy_input))))
+            dummy_out = self.conv3(self.conv2(self.conv1(dummy_input)))
             flatten_size = dummy_out.numel()
             
         self.flatten = nn.Flatten()
         self.fc = nn.Linear(flatten_size, 512)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
+        # Swapped from ReLU to ELU to prevent dead units during BPTT
+        x = F.elu(self.conv1(x))
+        x = F.elu(self.conv2(x))
+        x = F.elu(self.conv3(x))
         x = self.flatten(x)
-        x = F.relu(self.fc(x))
+        x = F.elu(self.fc(x))
         return x
 
 class RecurrentQNetwork(nn.Module):
     def __init__(self, action_dim, in_channels=3, img_size=64, hidden_dim=512):
         super(RecurrentQNetwork, self).__init__()
-        self.encoder = RecurrentCNNEncoder(in_channels, img_size)
+        # Injecting the Nature CNN encoder
+        self.encoder = NatureCNNEncoder(in_channels, img_size)
         self.lstm = nn.LSTM(512, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, action_dim+1)
+        self.fc = nn.Linear(hidden_dim, action_dim + 1)
 
     def forward(self, x, hidden=None, features=None):
         batch_size, seq_len, c, h, w = x.size()
         
         if features is None:
+            # Flatten batch and sequence for the CNN forward pass
             x_flat = x.reshape(batch_size * seq_len, c, h, w)
             features = self.encoder(x_flat)
             features = features.reshape(batch_size, seq_len, -1)
         
         lstm_out, hidden = self.lstm(features, hidden)
         out = self.fc(lstm_out)
+        
+        # Dueling Q-Network stream extraction
         adv = out[:, :, :-1]
         adv = adv - adv.mean(dim=-1, keepdim=True)
         v = out[:, :, -1:]
         q = v + adv
+        
         return q, v, adv, hidden
+
 
 class RCQLAgent(Agent):
     def __init__(self, obs_dim, action_dim, name="RCQL", save_dir="results", device_name="cpu", hidden_dim=512, lr=3e-4, epsilon=0.1):
@@ -93,7 +99,7 @@ class RCQLAgent(Agent):
         
         self.gamma = 0.99
         self.tau = 0.005
-        self.cql_alpha = 1.0 
+        self.cql_alpha = 0.5 
         
         self.q_hidden = None
         self.replay_buffer = collections.deque(maxlen=1000)
@@ -153,24 +159,56 @@ class RCQLAgent(Agent):
     def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         pass
 
-    def update_value(self, obs, actions, rewards, dones, masks, burn_in=16) -> dict:
-        with torch.no_grad():
-            if burn_in > 0:
+    def update_value(self, obs, actions, rewards, dones, masks, burn_in=16, train=False) -> dict:
+        if burn_in > 0:
+            with torch.no_grad():
                 burn_obs = obs[:, :burn_in, :]
                 _, _, _, h_q = self.q_net(burn_obs)
                 _, _, _, h_q_target = self.q_target(burn_obs)
-            else:
-                h_q, h_q_target = None, None
+        else:
+            h_q, h_q_target = None, None
 
-            obs_active = obs[:, burn_in:, :]
+        obs_active = obs[:, burn_in:, :]
+        
+        if train:
             _, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
             current_v = v_full[:, :-1, :].squeeze(-1)
             
-            _, v_target_full, _, _ = self.q_target(obs_active, hidden=h_q_target)
-            next_v = v_target_full[:, 1:, :].squeeze(-1)
+            with torch.no_grad():
+                _, v_target_full, _, _ = self.q_target(obs_active, hidden=h_q_target)
+                next_v = v_target_full[:, 1:, :].squeeze(-1)
+            
+            r_active = rewards[:, burn_in:]
+            d_active = dones[:, burn_in:]
+            m_active = masks[:, burn_in:]
+            
+            target_v = r_active + (1.0 - d_active) * self.gamma * next_v
+            loss_v_unmasked = F.mse_loss(current_v, target_v, reduction='none')
+            
+            valid_steps = m_active.sum() + 1e-8
+            loss_v = (loss_v_unmasked * m_active).sum() / valid_steps
+            
+            self.q_optimizer.zero_grad()
+            loss_v.backward()
+            torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
+            self.q_optimizer.step()
+            
+            for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+                
+            loss_v_val = loss_v.item()
+            self.epsilon = 0.01
+        else:
+            with torch.no_grad():
+                _, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
+                current_v = v_full[:, :-1, :].squeeze(-1)
+                
+                _, v_target_full, _, _ = self.q_target(obs_active, hidden=h_q_target)
+                next_v = v_target_full[:, 1:, :].squeeze(-1)
+            loss_v_val = 0.0
 
         return {
-            "loss_v": 0.0, 
+            "loss_v": loss_v_val, 
             "v_mean": current_v.mean().item(),
             "current_v": current_v.detach(),
             "next_v": next_v.detach()
@@ -260,19 +298,28 @@ class RCQLAgent(Agent):
         else:
             if advantages is not None:
                 adv = advantages.to(self.device_name)
-                log_probs = F.log_softmax(q_logits, dim=2)
-                selected_log_probs = log_probs.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
-                loss_unmasked = -(adv * selected_log_probs)
+                batch_size, seq_len, act_dim = adv_active.shape
+                adv_flat = adv_active.reshape(-1, act_dim)
+                a_flat = a_active.reshape(-1)
+                m_flat = m_active.reshape(-1)
+                adv_weight_flat = adv.reshape(-1)
                 
-                valid_steps = m_active.sum() + 1e-8
-                loss = (loss_unmasked * m_active).sum() / valid_steps
+                valid_indices = torch.nonzero(m_flat).squeeze(-1)
+                if valid_indices.numel() > 0:
+                    valid_adv = adv_flat[valid_indices]
+                    valid_act = a_flat[valid_indices]
+                    valid_weights = adv_weight_flat[valid_indices]
+                    loss = temperature_scaled_bc_loss(valid_adv, valid_act, epsilon=self.epsilon, weights=valid_weights)
+                else:
+                    loss = torch.tensor(0.0).to(self.device_name)
 
                 self.q_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
-                self.q_optimizer.step()
+                if loss.requires_grad:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
+                    self.q_optimizer.step()
                 
-                return {"loss_supervised": loss.item()}
+                return {"loss_supervised": loss.item() if hasattr(loss, 'item') else 0.0}
             else:
                 batch_size, seq_len, act_dim = adv_active.shape
                 adv_flat = adv_active.reshape(-1, act_dim)
