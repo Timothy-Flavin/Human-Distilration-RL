@@ -167,7 +167,8 @@ def run_cql_experiment(mode, seeds=10, iters=300):
         online_buffer = SimpleBuffer()
         
         online_rl = mode in ["RL", "RL_BC"]
-        bc = mode in ["BC", "RL_BC"]
+        bc = mode in ["BC", "RL_BC", "Naive_BC"]
+        naive_bc = mode == "Naive_BC"
         
         kl_hist, td_hist, bc_hist = [], [], []
         
@@ -186,7 +187,7 @@ def run_cql_experiment(mode, seeds=10, iters=300):
                 metrics1 = agent.update_td(obs=o_batch[0], actions=o_batch[1], rewards=o_batch[2], next_obs=o_batch[3], dones=o_batch[4], use_cql=False)
                 metrics.update(metrics1)
             if e_batch is not None:
-                metrics2 = agent.update_supervised(obs=e_batch[0], labels=e_batch[1])
+                metrics2 = agent.update_supervised(obs=e_batch[0], labels=e_batch[1], naive=naive_bc)
                 metrics.update(metrics2)
 
             td_loss = metrics.get('td_o', metrics.get('loss_td', 0.0))
@@ -218,7 +219,8 @@ def run_rcql_experiment(mode, seeds=10, iters=300):
         online_buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 16, 16))
         
         online_rl = mode in ["RL", "RL_BC"]
-        bc = mode in ["BC", "RL_BC"]
+        bc = mode in ["BC", "RL_BC", "Naive_BC"]
+        naive_bc = mode == "Naive_BC"
         
         kl_hist, td_hist, bc_hist = [], [], []
         
@@ -244,7 +246,7 @@ def run_rcql_experiment(mode, seeds=10, iters=300):
                 metrics1 = agent.update_td(o_batch[0], o_batch[1], o_batch[2], o_batch[3], o_batch[4], burn_in=0, use_cql=False)
                 metrics.update(metrics1)
             if e_batch is not None:
-                metrics2 = agent.update_supervised(e_batch[0], e_batch[1], e_batch[4], burn_in=0)
+                metrics2 = agent.update_supervised(e_batch[0], e_batch[1], e_batch[4], burn_in=0, naive=naive_bc)
                 metrics.update(metrics2)
 
             td_loss = metrics.get('loss_td', 0.0)
@@ -262,7 +264,7 @@ def run_rcql_experiment(mode, seeds=10, iters=300):
     return results
 
 if __name__ == "__main__":
-    modes = ["RL", "BC", "RL_BC"]
+    modes = ["RL", "BC", "RL_BC", "Naive_BC"]
     os.makedirs("test_results", exist_ok=True)
     
     print("Running CQL tests...")

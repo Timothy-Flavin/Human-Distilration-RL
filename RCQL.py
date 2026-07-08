@@ -270,7 +270,7 @@ class RCQLAgent(Agent):
             "next_v": next_v.detach()
         }
 
-    def update_supervised(self, obs, actions, masks, burn_in=16, anti=False, advantages=None, h_q=None) -> dict:
+    def update_supervised(self, obs, actions, masks, burn_in=16, anti=False, advantages=None, h_q=None, naive=False) -> dict:
         if h_q is None:
             with torch.no_grad():
                 if burn_in > 0:
@@ -310,10 +310,15 @@ class RCQLAgent(Agent):
                 
                 valid_indices = torch.nonzero(m_flat).squeeze(-1)
                 if valid_indices.numel() > 0:
-                    valid_adv = adv_flat[valid_indices]
                     valid_act = a_flat[valid_indices]
-                    valid_weights = adv_weight_flat[valid_indices]
-                    loss = temperature_scaled_bc_loss(valid_adv, valid_act, epsilon=self.epsilon, weights=valid_weights)
+                    if naive:
+                        q_logits_flat = q_logits.reshape(-1, act_dim)
+                        valid_q = q_logits_flat[valid_indices]
+                        loss = F.cross_entropy(valid_q, valid_act)
+                    else:
+                        valid_adv = adv_flat[valid_indices]
+                        valid_weights = adv_weight_flat[valid_indices]
+                        loss = temperature_scaled_bc_loss(valid_adv, valid_act, epsilon=self.epsilon, weights=valid_weights)
                 else:
                     loss = torch.tensor(0.0).to(self.device_name)
 
@@ -332,9 +337,14 @@ class RCQLAgent(Agent):
                 
                 valid_indices = torch.nonzero(m_flat).squeeze(-1)
                 if valid_indices.numel() > 0:
-                    valid_adv = adv_flat[valid_indices]
                     valid_act = a_flat[valid_indices]
-                    loss = temperature_scaled_bc_loss(valid_adv, valid_act, epsilon=self.epsilon)
+                    if naive:
+                        q_logits_flat = q_logits.reshape(-1, act_dim)
+                        valid_q = q_logits_flat[valid_indices]
+                        loss = F.cross_entropy(valid_q, valid_act)
+                    else:
+                        valid_adv = adv_flat[valid_indices]
+                        loss = temperature_scaled_bc_loss(valid_adv, valid_act, epsilon=self.epsilon)
                 else:
                     loss = torch.tensor(0.0).to(self.device_name)
                 

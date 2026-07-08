@@ -221,7 +221,7 @@ class CQLAgent(Agent):
             "q_mean": current_q.mean()
         }
 
-    def update_supervised(self, obs, labels=None, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None) -> dict:
+    def update_supervised(self, obs, labels=None, ssl: bool = False, masks: list = None, anti: bool = False, advantages: torch.Tensor = None, naive: bool = False) -> dict:
         if isinstance(obs, (list, collections.deque)):
             batch = obs
             obs_np, labels_np = zip(*batch)
@@ -244,7 +244,10 @@ class CQLAgent(Agent):
                 selected_log_probs = log_probs.gather(1, labels.unsqueeze(1)).squeeze()
                 loss = -(adv_tensor * selected_log_probs).mean()
             else:
-                loss = temperature_scaled_bc_loss(adv, labels, epsilon=self.epsilon)
+                if naive:
+                    loss = F.cross_entropy(q_logits, labels)
+                else:
+                    loss = temperature_scaled_bc_loss(adv, labels, epsilon=self.epsilon)
 
         self.q_optimizer.zero_grad()
         loss.backward()
