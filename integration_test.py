@@ -43,7 +43,7 @@ class MinimalRCQLEnv(gym.Env):
     def __init__(self):
         super().__init__()
         self.action_space = spaces.Discrete(3)
-        self.observation_space = spaces.Box(low=0, high=255, shape=(3, 16, 16), dtype=np.uint8)
+        self.observation_space = spaces.Box(low=0, high=255, shape=(3, 64,64), dtype=np.uint8)
         self.max_steps = 4
         self.current_step = 0
         self.state_type = 0
@@ -52,7 +52,7 @@ class MinimalRCQLEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = 0
         self.state_type = self.np_random.integers(0, 2)
-        obs = np.zeros((3, 16, 16), dtype=np.uint8)
+        obs = np.zeros((3, 64, 64), dtype=np.uint8)
         if self.state_type == 0:
             obs[0, :, :].fill(255) # Red
         else:
@@ -70,7 +70,7 @@ class MinimalRCQLEnv(gym.Env):
             else:
                 if action in [1, 2]: reward = 1.0
                 
-        obs = np.zeros((3, 16, 16), dtype=np.uint8)
+        obs = np.zeros((3, 64, 64), dtype=np.uint8)
         return obs, reward, terminated, False, {}
 
 class SimpleBuffer:
@@ -105,7 +105,7 @@ def generate_cql_expert(num_episodes=200):
 
 def generate_rcql_expert(num_episodes=200):
     env = MinimalRCQLEnv()
-    buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 16, 16))
+    buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 64, 64))
     for _ in range(num_episodes):
         obs, _ = env.reset()
         term = False
@@ -135,10 +135,10 @@ def eval_cql_kl(agent):
     return kl.item()
 
 def eval_rcql_kl(agent):
-    obs0 = np.zeros((4, 3, 16, 16), dtype=np.uint8)
+    obs0 = np.zeros((4, 3, 64, 64), dtype=np.uint8)
     obs0[0, 0, :, :].fill(255)
     
-    obs1 = np.zeros((4, 3, 16, 16), dtype=np.uint8)
+    obs1 = np.zeros((4, 3, 64, 64), dtype=np.uint8)
     obs1[0, 2, :, :].fill(255)
     
     obs_batch = torch.tensor(np.stack([obs0, obs1]), dtype=torch.float32).to(device)
@@ -212,11 +212,11 @@ def run_rcql_experiment(mode, seeds=10, iters=300):
         random.seed(seed)
         
         env = MinimalRCQLEnv()
-        agent = RCQLAgent(obs_dim=(3, 16, 16), action_dim=3, name=f"RCQL_{mode}", device_name=device, hidden_dim=64)
+        agent = RCQLAgent(obs_dim=(3, 64, 64), action_dim=3, name=f"RCQL_{mode}", device_name=device, hidden_dim=64)
         agent.cql_alpha = 0.0
         
         expert_buffer = generate_rcql_expert()
-        online_buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 16, 16))
+        online_buffer = FastGPUEpisodicBuffer(max_total_transitions=2000, device=device, obs_shape=(3, 64, 64))
         
         online_rl = mode in ["RL", "RL_BC"]
         bc = mode in ["BC", "RL_BC", "Naive_BC"]
