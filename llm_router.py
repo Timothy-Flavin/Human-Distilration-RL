@@ -110,11 +110,22 @@ class LLMRouter:
                         
                         # Augmentation: push noisy variations to example buffer for BC
                         for _ in range(self.num_noisy_samples):
+                            noisy_obs = step['obs'].copy()
+                            noisy_next = step.get('next_obs')
+                            if noisy_next is not None:
+                                noisy_next = noisy_next.copy()
+                            for feat_idx, spec in unimportant_mask.items():
+                                if spec.get('dist') == 'gaussian':
+                                    noise = np.random.normal(0, spec.get('scale', self.noise_scale))
+                                    noisy_obs[feat_idx] += noise
+                                    if noisy_next is not None:
+                                        noisy_next[feat_idx] += noise
+
                             # We use example_buffer for BC updates
                             self.example_buffer.push(
-                                step['obs'], step['action'], reward=step.get('reward', 0.0),
-                                next_obs=step.get('next_obs'), terminated=step.get('terminated', False),
-                                truncated=step.get('truncated', False), mask=unimportant_mask
+                                noisy_obs, step['action'], reward=step.get('reward', 0.0),
+                                next_obs=noisy_next, terminated=step.get('terminated', False),
+                                truncated=step.get('truncated', False), mask=None
                             )
                         
                         if self.metrics: self.metrics.log_frames(1 + self.num_noisy_samples, source="ssl")
@@ -143,10 +154,21 @@ class LLMRouter:
                 
                 # 2. Augmentation: Push N noisy variations
                 for _ in range(self.num_noisy_samples):
+                    noisy_obs = step['obs'].copy()
+                    noisy_next = step.get('next_obs')
+                    if noisy_next is not None:
+                        noisy_next = noisy_next.copy()
+                    for feat_idx, spec in noise_specs.items():
+                        if spec.get('dist') == 'gaussian':
+                            noise = np.random.normal(0, spec.get('scale', self.noise_scale))
+                            noisy_obs[feat_idx] += noise
+                            if noisy_next is not None:
+                                noisy_next[feat_idx] += noise
+                    
                     self.example_buffer.push(
-                        step['obs'], step['action'], reward=step.get('reward', 0.0),
-                        next_obs=step.get('next_obs'), terminated=step.get('terminated', False),
-                        truncated=step.get('truncated', False), mask=noise_specs
+                        noisy_obs, step['action'], reward=step.get('reward', 0.0),
+                        next_obs=noisy_next, terminated=step.get('terminated', False),
+                        truncated=step.get('truncated', False), mask=None
                     )
                 
                 if self.metrics: self.metrics.log_frames(1 + self.num_noisy_samples, source="human")

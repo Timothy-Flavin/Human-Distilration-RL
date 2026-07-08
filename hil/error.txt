@@ -1,0 +1,58 @@
+timothyflavin@Timothys-MacBook-Pro Human-Distilration-RL % python main.py --env LunarLander-v3 --algo cql --offline_rl --online_rl --awbc --intervention --num_rl_frames 2000 --num_unified_epochs 500 --preload_expert_data "expert_demonstrations_LunarLander-v3.pkl" --experiment_name "2_interactive_hil" --num_iterations 20
+
+[Main] Using device: cpu
+[DenseBuffer] Pre-allocating 100000 transitions (Obs Dim: 8) on cpu...
+[DenseBuffer] Pre-allocating 10000 transitions (Obs Dim: 8) on cpu...
+[DenseBuffer] Pre-allocating 100000 transitions (Obs Dim: 8) on cpu...
+[DenseBuffer] Pre-allocating 10000 transitions (Obs Dim: 8) on cpu...
+[Preload] Flushing 7506 transitions to DenseTorchBuffer...
+[Preload] Successfully loaded 7506 transitions into example_buffer.
+
+=== Starting Iteration 0 ===
+Collecting 2000 RL frames (via CPU agent)...
+[Sync] Transferring 2000 transitions to GPU...
+Starting Human Interactive Review...
+[Hydration] Re-simulating episode for review (Seed: 881505)...
+
+[Timeline] Branching at frame 0 (Source: realtime)...
+✅ [Override] Accepted realtime segment.
+Processing 0 annotations from LLM Buffer...
+Processed 0 annotations.
+[Sync] Adding 225 new transitions to dense_example...
+[Sync] Adding 100 new transitions to dense_anti_example...
+Traceback (most recent call last):
+  File "/Users/timothyflavin/Desktop/NRL/Human-Distilration-RL/main.py", line 504, in <module>
+    main()
+  File "/Users/timothyflavin/Desktop/NRL/Human-Distilration-RL/main.py", line 453, in main
+    sync_dense_buffers(buffers)
+  File "/Users/timothyflavin/Desktop/NRL/Human-Distilration-RL/main.py", line 232, in sync_dense_buffers
+    buffers[dense_key].add_transitions(new_transitions)
+  File "/Users/timothyflavin/Desktop/NRL/Human-Distilration-RL/buffers.py", line 277, in add_transitions
+    self.next_obs[indices] = torch.from_numpy(next_obs_np).to(self.device)
+    ~~~~~~~~~~~~~^^^^^^^^^
+RuntimeError: shape mismatch: value tensor of shape [100] cannot be broadcast to indexing result of shape [100, 8]
+(.venv) timothyflavin@Timothys-MacBook-Pro Human-Distilration-RL % git status
+On branch main
+Your branch is ahead of 'origin/main' by 2 commits.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+        modified:   hil/run_commands.sh
+
+no changes added to commit (use "git add" and/or "git commit -a")
+(.venv) timothyflavin@Timothys-MacBook-Pro Human-Distilration-RL % git add -A
+(.venv) timothyflavin@Timothys-MacBook-Pro Human-Distilration-RL % git commit -m"run update"
+[main 898248c] run update
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+(.venv) timothyflavin@Timothys-MacBook-Pro Human-Distilration-RL % git push origin main
+Enumerating objects: 22, done.
+Counting objects: 100% (20/20), done.
+Delta compression using up to 16 threads
+Compressing objects: 100% (11/11), done.
+Writing objects: 100% (12/12), 1.35 KiB | 1.35 MiB/s, done.
+Total 12 (delta 8), reused 0 (delta 0), pack-reused 0
+remote: Resolving deltas: 100% (8/8), completed with 7 local objects.
+To https://github.com/Timothy-Flavin/Human-Distilration-RL
+   1d17f67..898248c  main -> main

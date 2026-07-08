@@ -172,15 +172,22 @@ class InteractiveGymWrapper:
             print(f"✅ [Override] Accepted {self.override_source} segment.")
             if self.buffers:
                 for step in self.discarded_trajectory[:100]:
-                    if step.get('next_obs') is not None:
-                        self.buffers['anti_example'].push(step['obs'], step['action'])
+                    if step.get('next_obs') is not None and step.get('source') == 'rl':
+                        self.buffers['anti_example'].push(
+                            obs=step['obs'], 
+                            action=step['action'], 
+                            reward=step.get('reward', 0.0), 
+                            next_obs=step['next_obs'], 
+                            terminated=step.get('terminated', False), 
+                            truncated=step.get('truncated', False)
+                        )
 
                 if self.override_source == "realtime":
                     # Correct Causal pairing: obs_t -> action_t
                     # The frames from override_start_frame to end are the new behavior.
                     new_part = self.trajectory[self.override_start_frame:]
                     for step in new_part:
-                        if step.get('next_obs') is not None:
+                        if step.get('next_obs') is not None and step.get('source') == 'human':
                             self.buffers['example'].push(
                                 step['obs'], step['action'], reward=step['reward'],
                                 next_obs=step['next_obs'], terminated=step['terminated'],
