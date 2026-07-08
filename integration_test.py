@@ -183,7 +183,7 @@ def run_cql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
                 online_buffer.add((obs, action, reward, next_obs, term or trunc))
             
             o_batch = online_buffer.sample_batch(32) if online_rl and online_buffer.current_size >= 32 else None
-            e_batch = expert_buffer.sample_batch(32) if bc else None
+            e_batch = expert_buffer.sample_batch(32) if bc and (o_batch is not None or not online_rl) else None
             
             metrics = {}
             if o_batch is not None:
@@ -243,7 +243,7 @@ def run_rcql_experiment(mode, seeds=10, iters=300, reward_scale=1.0):
                 online_buffer.add_episode(ep)
                 
             o_batch = online_buffer.sample_batch(16, seq_len=4) if online_rl and online_buffer.current_size > 16 else None
-            e_batch = expert_buffer.sample_batch(16, seq_len=4) if bc and expert_buffer.current_size > 16 else None
+            e_batch = expert_buffer.sample_batch(16, seq_len=4) if bc and expert_buffer.current_size > 16 and (o_batch is not None or not online_rl) else None
             
             metrics = {}
             if o_batch is not None:
