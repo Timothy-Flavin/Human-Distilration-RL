@@ -75,7 +75,7 @@ def pre_load_episodic_data(args, buffers, metrics):
                 duration = len(transitions) / 30.0
 
             for t in transitions:
-                t["reward"] = t.get("reward", 0.0) * 10.0
+                t["reward"] = t.get("reward", 0.0) #* 10.0
 
             buffers["expert"].add_episode(transitions)
             loaded_count += len(transitions)
@@ -143,7 +143,7 @@ def run_rl_collection(agent, env, buffers, num_frames, metrics, min_episodes=0):
                 {
                     "obs": obs,
                     "action": action,
-                    "reward": reward * 10.0,
+                    "reward": reward, # * 10.0,
                     "next_obs": next_obs,
                     "terminated": terminated,
                     "truncated": truncated,
@@ -156,7 +156,7 @@ def run_rl_collection(agent, env, buffers, num_frames, metrics, min_episodes=0):
                 {
                     "obs": obs,
                     "action": action,
-                    "reward": reward * 10.0,
+                    "reward": reward, # * 10.0,
                     "next_obs": next_obs,
                     "frame_image": None,
                     "terminated": terminated,
@@ -235,7 +235,7 @@ def run_rl_collection_parallel(agent, penvs, buffers, num_frames, metrics, min_e
                 {
                     "obs": obs_list[i],
                     "action": int(actions[i]),
-                    "reward": reward * 10.0,
+                    "reward": reward, # * 10.0,
                     "next_obs": next_obs,
                     "terminated": done,
                     "truncated": False,
@@ -525,7 +525,7 @@ def main():
                         {
                             "obs": s["obs"],
                             "action": ns["action"],
-                            "reward": ns.get("reward", 0.0) * 10.0,
+                            "reward": ns.get("reward", 0.0), #* 10.0,
                             "next_obs": ns["obs"],
                             "terminated": ns.get("terminated", False),
                             "truncated": ns.get("truncated", False),
