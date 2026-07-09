@@ -8,18 +8,22 @@ class FastGPUEpisodicBuffer:
     Optimized Flat Buffer: Stores transitions consecutively to save VRAM.
     Eliminates the (max_episodes, max_ep_len) zero-padding.
     """
-    def __init__(self, max_total_transitions=200000, device="cuda", obs_shape=(3, 64, 64)):
+    def __init__(self, max_total_transitions=200000, device="cuda", obs_shape=(3, 64, 64), hidden_dim=512):
         self.max_transitions = max_total_transitions
         self.device = device
         self.obs_shape = obs_shape
-        
+        self.hidden_dim = hidden_dim
+
         print(f"[Buffer] Allocating Flat GPU memory for {max_total_transitions} transitions...")
-        
+
         # 350,000 * 3 * 64 * 64 * 1 byte = ~4.3 GB
         self.obs = torch.zeros((max_total_transitions, *obs_shape), dtype=torch.uint8, device=device)
         self.actions = torch.zeros(max_total_transitions, dtype=torch.long, device=device)
         self.rewards = torch.zeros(max_total_transitions, dtype=torch.float32, device=device)
         self.dones = torch.zeros(max_total_transitions, dtype=torch.float32, device=device)
+        # R2D2-style stored recurrent state: (h, c) BEFORE processing obs[i].
+        # fp16 halves the footprint (~200MB at 200k transitions for hidden_dim=512).
+        self.hiddens = torch.zeros((max_total_transitions, 2, hidden_dim), dtype=torch.float16, device=device)
         
         self.ptr = 0
         self.full = False
@@ -84,6 +88,15 @@ class FastGPUEpisodicBuffer:
         self.actions[start_ptr:end_ptr] = torch.tensor(act_np, device=self.device)
         self.rewards[start_ptr:end_ptr] = torch.tensor(rew_np, device=self.device)
         self.dones[start_ptr:end_ptr] = torch.tensor(done_np, device=self.device)
+
+        # Actor hidden states captured at collection time (state BEFORE processing obs).
+        # Episodes without them (e.g. expert demos) get zeros; refresh_hidden_states fills them in.
+        hid_stack = torch.zeros((ep_len, 2, self.hidden_dim), dtype=torch.float16, device=self.device)
+        for i, t in enumerate(transitions):
+            hid = t.get('hidden') if isinstance(t, dict) else None
+            if hid is not None:
+                hid_stack[i] = hid.to(self.device, dtype=torch.float16)
+        self.hiddens[start_ptr:end_ptr] = hid_stack
         
         # Store metadata
         self.episode_metadata.append((start_ptr, ep_len, next_obs_final))
@@ -101,7 +114,8 @@ class FastGPUEpisodicBuffer:
         batch_rews = []
         batch_dones = []
         batch_masks = []
-        
+        batch_hiddens = []
+
         for idx in ep_indices:
             start_ptr, ep_len, next_obs_final = self.episode_metadata[idx]
             
@@ -153,15 +167,56 @@ class FastGPUEpisodicBuffer:
             batch_rews.append(rews)
             batch_dones.append(dones)
             batch_masks.append(masks)
-            
+            batch_hiddens.append(self.hiddens[sample_start])
+
         # Stack into tensors
         obs_tensor = torch.stack(batch_obs).float() / 255.0
         acts_tensor = torch.stack(batch_acts)
         rews_tensor = torch.stack(batch_rews)
         dones_tensor = torch.stack(batch_dones)
         masks_tensor = torch.stack(batch_masks)
-        
-        return obs_tensor, acts_tensor, rews_tensor, dones_tensor, masks_tensor
+        hiddens_tensor = torch.stack(batch_hiddens).float()  # (B, 2, hidden_dim)
+
+        return obs_tensor, acts_tensor, rews_tensor, dones_tensor, masks_tensor, hiddens_tensor
+
+    @torch.no_grad()
+    def refresh_hidden_states(self, q_net, cnn_chunk=2048):
+        """Recomputes stored (h, c) for every transition by replaying episodes
+        through the current network. Used for episodes that have no actor states
+        (expert demos) or to wash out staleness. hiddens[i] = state BEFORE obs[i]."""
+        if not self.episode_metadata:
+            return
+        was_training = q_net.training
+        q_net.eval()
+
+        metas = self.episode_metadata
+        n = len(metas)
+        max_len = max(m[1] for m in metas)
+        lens = torch.tensor([m[1] for m in metas], device=self.device)
+        starts = torch.tensor([m[0] for m in metas], device=self.device)
+
+        # 1. Encode all frames (chunked CNN forward), padded to (n, max_len, 512)
+        feats = torch.zeros((n, max_len, 512), device=self.device)
+        for i, (start, ep_len, _) in enumerate(metas):
+            obs = self.obs[start:start + ep_len].float() / 255.0
+            for j in range(0, ep_len, cnn_chunk):
+                end = min(j + cnn_chunk, ep_len)
+                feats[i, j:end] = q_net.encoder(obs[j:end])
+
+        # 2. Step the LSTM across all episodes in parallel, writing pre-step states
+        h = torch.zeros((1, n, self.hidden_dim), device=self.device)
+        c = torch.zeros((1, n, self.hidden_dim), device=self.device)
+        for t in range(max_len):
+            active = lens > t
+            if not active.any():
+                break
+            idxs = (starts + t)[active]
+            self.hiddens[idxs, 0] = h[0, active].half()
+            self.hiddens[idxs, 1] = c[0, active].half()
+            _, (h, c) = q_net.lstm(feats[:, t:t + 1, :], (h, c))
+
+        if was_training:
+            q_net.train()
 
 class ReplayBuffer:
     def __init__(self, capacity):

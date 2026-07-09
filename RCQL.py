@@ -107,6 +107,30 @@ class RCQLAgent(Agent):
     def reset_hidden(self):
         self.q_hidden = None
 
+    def get_hidden_snapshot(self, idx=0):
+        """Returns the current actor LSTM state for batch slot idx as a
+        (2, hidden_dim) fp16 tensor (state BEFORE the next observation is
+        processed), or None at episode start."""
+        if self.q_hidden is None:
+            return None
+        h, c = self.q_hidden
+        return torch.stack([h[0, idx], c[0, idx]]).detach().to(torch.float16)
+
+    def reset_hidden_index(self, idx):
+        """Zeroes the recurrent state of one batch slot (one parallel env)."""
+        if self.q_hidden is not None:
+            h, c = self.q_hidden
+            h[:, idx, :] = 0.0
+            c[:, idx, :] = 0.0
+
+    def _make_hidden(self, init_hidden):
+        """Converts a (B, 2, hidden_dim) stored-state tensor into an LSTM (h0, c0) tuple."""
+        if init_hidden is None:
+            return None
+        h = init_hidden[:, 0, :].unsqueeze(0).contiguous().float()
+        c = init_hidden[:, 1, :].unsqueeze(0).contiguous().float()
+        return (h, c)
+
     def _normalize(self, obs):
         if obs.dtype == torch.uint8 or obs.max() > 1.0:
             return obs.float() / 255.0
@@ -139,10 +163,11 @@ class RCQLAgent(Agent):
             if deterministic:
                 action = q_values.argmax(dim=1)
             else:
-                if random.random() < self.epsilon:
-                    action = torch.randint(0, self.action_dim, (batch_size,)).to(self.device_name)
-                else:
-                    action = q_values.argmax(dim=1)
+                # Per-row epsilon-greedy so parallel envs explore independently
+                greedy = q_values.argmax(dim=1)
+                rand_actions = torch.randint(0, self.action_dim, (batch_size,), device=greedy.device)
+                explore = torch.rand(batch_size, device=greedy.device) < self.epsilon
+                action = torch.where(explore, rand_actions, greedy)
         self.q_net.train()
         return action
 
@@ -159,14 +184,15 @@ class RCQLAgent(Agent):
     def store_transition(self, obs, action, reward, next_obs, terminated, truncated):
         pass
 
-    def update_value(self, obs, actions, rewards, dones, masks, burn_in=16, train=False) -> dict:
+    def update_value(self, obs, actions, rewards, dones, masks, init_hidden=None, burn_in=16, train=False) -> dict:
+        h0 = self._make_hidden(init_hidden)
         if burn_in > 0:
             with torch.no_grad():
                 burn_obs = obs[:, :burn_in, :]
-                _, _, _, h_q = self.q_net(burn_obs)
-                _, _, _, h_q_target = self.q_target(burn_obs)
+                _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
+                _, _, _, h_q_target = self.q_target(burn_obs, hidden=h0)
         else:
-            h_q, h_q_target = None, None
+            h_q, h_q_target = h0, h0
 
         obs_active = obs[:, burn_in:, :]
         
@@ -214,14 +240,15 @@ class RCQLAgent(Agent):
             "next_v": next_v.detach()
         }
 
-    def update_td(self, obs, actions, rewards, dones, masks, burn_in=16, use_cql=True) -> dict:
+    def update_td(self, obs, actions, rewards, dones, masks, init_hidden=None, burn_in=16, use_cql=True) -> dict:
         with torch.no_grad():
+            h0 = self._make_hidden(init_hidden)
             if burn_in > 0:
                 burn_obs = obs[:, :burn_in, :]
-                _, _, _, h_q = self.q_net(burn_obs)
-                _, _, _, h_q_target = self.q_target(burn_obs)
+                _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
+                _, _, _, h_q_target = self.q_target(burn_obs, hidden=h0)
             else:
-                h_q, h_q_target = None, None
+                h_q, h_q_target = h0, h0
 
         obs_active = obs[:, burn_in:, :]
         a_active = actions[:, burn_in:]
@@ -236,7 +263,9 @@ class RCQLAgent(Agent):
 
         with torch.no_grad():
             q_target_full, v_target_full, _, _ = self.q_target(obs_active, hidden=h_q_target)
-            next_q = q_target_full[:, 1:, :].max(2)[0]
+            # Double DQN: action selection by the online net, evaluation by the target net
+            next_actions = q_logits_full[:, 1:, :].argmax(dim=2, keepdim=True)
+            next_q = q_target_full[:, 1:, :].gather(2, next_actions).squeeze(-1)
             next_v = v_target_full[:, 1:, :].squeeze(-1)
             target_q = r_active + (1.0 - d_active) * self.gamma * next_q
 
@@ -270,14 +299,15 @@ class RCQLAgent(Agent):
             "next_v": next_v.detach()
         }
 
-    def update_supervised(self, obs, actions, masks, burn_in=16, anti=False, advantages=None, h_q=None, naive=False) -> dict:
+    def update_supervised(self, obs, actions, masks, init_hidden=None, burn_in=16, anti=False, advantages=None, h_q=None, naive=False) -> dict:
         if h_q is None:
             with torch.no_grad():
+                h0 = self._make_hidden(init_hidden)
                 if burn_in > 0:
                     burn_obs = obs[:, :burn_in, :]
-                    _, _, _, h_q = self.q_net(burn_obs)
+                    _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
                 else:
-                    h_q = None
+                    h_q = h0
 
         obs_active = obs[:, burn_in:-1, :]
         a_active = actions[:, burn_in:]
@@ -356,14 +386,15 @@ class RCQLAgent(Agent):
                 
                 return {"loss_supervised": loss.item() if hasattr(loss, 'item') else 0.0}
     
-    def get_bc_loss(self, obs, actions, masks, burn_in=16) -> float:
+    def get_bc_loss(self, obs, actions, masks, init_hidden=None, burn_in=16) -> float:
         self.q_net.eval()
         with torch.no_grad():
+            h0 = self._make_hidden(init_hidden)
             if burn_in > 0:
                 burn_obs = obs[:, :burn_in, :]
-                _, _, _, h_q = self.q_net(burn_obs)
+                _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
             else:
-                h_q = None
+                h_q = h0
 
             obs_active = obs[:, burn_in:-1, :]
             a_active = actions[:, burn_in:]

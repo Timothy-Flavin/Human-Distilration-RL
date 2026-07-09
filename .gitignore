@@ -12,3 +12,4 @@ results_before_gpu
 results_before_dueling
 cpu_bench
 *.npy
+previous_results
