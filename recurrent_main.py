@@ -62,6 +62,15 @@ def pre_load_episodic_data(args, buffers, metrics):
         with open(args.preload_expert_data, "rb") as f:
             expert_dataset = pickle.load(f)
 
+        # Data-scaling probe: train on a random subset of the expert episodes
+        if getattr(args, "expert_fraction", 1.0) < 1.0:
+            rng = random.Random(args.seed)
+            keep = max(1, int(len(expert_dataset) * args.expert_fraction))
+            expert_dataset = rng.sample(expert_dataset, keep)
+            print(
+                f"[Preload] Subsampled expert data to {keep} episodes (fraction {args.expert_fraction})."
+            )
+
         loaded_count = 0
         total_duration = 0.0
 
@@ -281,7 +290,7 @@ def unified_train_step(args, agent, buffers, metrics):
     burn_in = 16
 
     has_online = args.online_rl and buffers["online"].current_size >= 8
-    has_offline = (args.offline_rl or args.bc or args.awbc) and buffers[
+    has_offline = (args.offline_rl or args.bc or args.awbc or args.r2d3) and buffers[
         "expert"
     ].current_size > 0
 
@@ -295,7 +304,8 @@ def unified_train_step(args, agent, buffers, metrics):
 
     # Expert demos carry no actor hidden states, and any stored states go stale as
     # weights move: replay episodes through the current network to refresh them.
-    if has_offline:
+    # --zero_state skips this (ablation: demo windows then train from zero hiddens).
+    if has_offline and not args.zero_state:
         metrics.start_timer("hidden_refresh")
         buffers["expert"].refresh_hidden_states(agent.q_net)
         metrics.stop_timer("hidden_refresh")
@@ -307,8 +317,11 @@ def unified_train_step(args, agent, buffers, metrics):
 
         exp_batch = None
         if has_offline:
-            exp_batch = buffers["expert"].sample_batch(batch_size, seq_len=seq_len)
-            total_frames_processed += batch_size * (seq_len + 1)
+            # R2D3-style demo ratio: demos are plain replay sampled once every
+            # 16 epochs instead of a per-epoch CQL anchor.
+            if not args.r2d3 or epoch % 16 == 0:
+                exp_batch = buffers["expert"].sample_batch(batch_size, seq_len=seq_len)
+                total_frames_processed += batch_size * (seq_len + 1)
 
         on_batch = None
         if has_online:
@@ -318,16 +331,23 @@ def unified_train_step(args, agent, buffers, metrics):
         # 1. TD / POLICY UPDATES (CQL or Online RL)
         cached_h_q = None
         cached_v = None
-        if args.offline_rl and exp_batch:
+        if (args.offline_rl or args.r2d3) and exp_batch:
             metrics.start_timer("agent_updating_rl")
-            td_results = agent.update_td(*exp_batch, burn_in=burn_in)
+            expert_n = (
+                args.n_step_expert if args.n_step_expert is not None else args.n_step
+            )
+            td_results = agent.update_td(
+                *exp_batch, burn_in=burn_in, use_cql=not args.r2d3, n_step=expert_n
+            )
             cached_h_q = td_results.get("h_q")
             cached_v = (td_results["current_v"], td_results["next_v"])
             metrics.stop_timer("agent_updating_rl")
 
         if args.online_rl and on_batch:
             metrics.start_timer("agent_updating_rl")
-            agent.update_td(*on_batch, burn_in=burn_in, use_cql=False)
+            agent.update_td(
+                *on_batch, burn_in=burn_in, use_cql=False, n_step=args.n_step
+            )
             metrics.stop_timer("agent_updating_rl")
 
         # 2. VALUE FUNCTION UPDATES (for AWBC)
@@ -368,6 +388,7 @@ def unified_train_step(args, agent, buffers, metrics):
                 burn_in=burn_in,
                 advantages=advantages,
                 h_q=cached_h_q,
+                bc_epsilon=args.bc_epsilon if args.bc_epsilon >= 0 else None,
             )
             metrics.stop_timer("agent_updating_bc")
 
@@ -382,6 +403,67 @@ def unified_train_step(args, agent, buffers, metrics):
     total_fps = total_frames_processed / (total_elapsed + 1e-6)
     print(f"[Benchmark] Training step complete. Total FPS: {total_fps:.2f}")
     metrics.timers["training_throughput_fps"] = total_fps
+
+
+def run_eval(agent, env, num_episodes=5, epsilon=0.0, hidden_reset=0):
+    """Evaluation with diagnostics. Two probe knobs isolate deployment failures:
+    epsilon > 0 uses epsilon-greedy instead of argmax (stuck-in-a-loop probe);
+    hidden_reset = N zeroes the LSTM state every N steps (recurrent-drift probe).
+    Returns per-episode returns/lengths, achievement rates, action distribution,
+    and mean |Q| at deployment."""
+    rewards = []
+    lengths = []
+    action_counts = collections.defaultdict(int)
+    achievement_counts = collections.defaultdict(int)
+    q_mag_sum, q_mag_n = 0.0, 0
+
+    old_epsilon = agent.epsilon
+    if epsilon > 0:
+        agent.epsilon = epsilon
+    for _ in range(num_episodes):
+        e_obs, _ = env.reset()
+        agent.reset_hidden()
+        e_term = False
+        e_trunc = False
+        e_total = 0.0
+        steps = 0
+        last_info = {}
+        while not (e_term or e_trunc):
+            e_act = agent.predict(e_obs, deterministic=(epsilon <= 0))
+            action_counts[int(e_act)] += 1
+            if agent.last_q is not None:
+                q_mag_sum += agent.last_q.abs().mean().item()
+                q_mag_n += 1
+            e_obs, e_rew, e_term, e_trunc, e_info = env.step(e_act)
+            e_total += e_rew
+            steps += 1
+            if isinstance(e_info, dict):
+                last_info = e_info
+            if hidden_reset > 0 and steps % hidden_reset == 0:
+                agent.reset_hidden()
+        rewards.append(float(e_total))
+        lengths.append(steps)
+        # Crafter reports cumulative achievement counts in info
+        for ach, val in (last_info.get("achievements") or {}).items():
+            if val > 0:
+                achievement_counts[ach] += 1
+    agent.epsilon = old_epsilon
+
+    return {
+        "num_episodes": num_episodes,
+        "eval_epsilon": epsilon,
+        "hidden_reset": hidden_reset,
+        "return_mean": float(np.mean(rewards)),
+        "return_std": float(np.std(rewards)),
+        "returns": rewards,
+        "length_mean": float(np.mean(lengths)),
+        "q_abs_mean": q_mag_sum / max(q_mag_n, 1),
+        "action_dist": {int(a): c for a, c in sorted(action_counts.items())},
+        "achievement_rates": {
+            a: achievement_counts[a] / num_episodes
+            for a in sorted(achievement_counts)
+        },
+    }
 
 
 def main():
@@ -404,12 +486,50 @@ def main():
     parser.add_argument(
         "--preload_expert_data", type=str, default="expert_demonstrations_crafter.pkl"
     )
+    # --- Diagnostic probes (see run_recurrent_handsfree.sh decision guide) ---
+    parser.add_argument("--eval_episodes", type=int, default=5,
+                        help="Evaluation episodes per iteration")
+    parser.add_argument("--eval_epsilon", type=float, default=0.0,
+                        help="Eval-time epsilon-greedy noise; 0 = deterministic argmax")
+    parser.add_argument("--eval_hidden_reset", type=int, default=0,
+                        help="Zero the LSTM state every N eval steps; 0 = never")
+    parser.add_argument("--expert_fraction", type=float, default=1.0,
+                        help="Train on a random fraction of expert episodes")
+    parser.add_argument("--zero_state", action="store_true",
+                        help="Skip refresh_hidden_states: train demo windows from zero hiddens")
+    parser.add_argument("--bc_epsilon", type=float, default=-1.0,
+                        help="Fixed BC target entropy epsilon; <0 = coupled to exploration epsilon")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Load a checkpoint, run eval diagnostics, and exit (no training)")
+    parser.add_argument("--load_checkpoint", type=str, default="",
+                        help="Checkpoint path for --eval_only, or to warm-start training weights")
+    parser.add_argument("--r2d3", action="store_true",
+                        help="R2D3 mode: expert demos are plain TD replay (no CQL) sampled "
+                             "1/16 epochs; overrides CQL even if --offline_rl is set")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from RCQL_latest.pt + metrics_latest.json in this run's "
+                             "results dir; raise --total_iterations to train further "
+                             "(online replay buffer restarts empty)")
+    parser.add_argument("--n_step", type=int, default=1,
+                        help="n-step TD returns for ONLINE batches. Uncorrected n-step is "
+                             "biased by epsilon-greedy/stale replay; >1 sped up early "
+                             "learning but plateaued low in crafter")
+    parser.add_argument("--n_step_expert", type=int, default=None,
+                        help="n-step TD returns for EXPERT batches (default: same as "
+                             "--n_step). Demo returns carry no exploration noise, so "
+                             "large n is safe and propagates expert reward fast")
+    parser.add_argument("--cql_alpha", type=float, default=1.0,
+                        help="CQL anchor weight at the start of training")
+    parser.add_argument("--cql_alpha_end", type=float, default=None,
+                        help="CQL weight after annealing; default = no annealing")
+    parser.add_argument("--cql_alpha_decay_frames", type=int, default=500000,
+                        help="RL frames over which cql_alpha anneals to cql_alpha_end")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Use awbc in folder name if passed, as it implies a different training mode
-    hparam_str = f"rcql_on{int(args.online_rl)}_off{int(args.offline_rl)}_bc{int(args.bc or args.awbc)}_aw{int(args.awbc)}_seed{args.seed}"
+    hparam_str = f"rcql_on{int(args.online_rl)}_off{int(args.offline_rl)}_bc{int(args.bc or args.awbc)}_aw{int(args.awbc)}{'_r2d3' if args.r2d3 else ''}_seed{args.seed}"
     results_base_dir = os.path.join(
         "results", args.env, args.experiment_name, hparam_str
     )
@@ -433,6 +553,31 @@ def main():
         device_name=device,
     )
 
+    # Eval-only probe: no buffers, no training — evaluate a checkpoint and exit.
+    if args.eval_only:
+        if args.load_checkpoint:
+            agent.load_model(args.load_checkpoint)
+            print(f"[EvalProbe] Loaded checkpoint: {args.load_checkpoint}")
+        stats = run_eval(
+            agent,
+            env,
+            num_episodes=args.eval_episodes,
+            epsilon=args.eval_epsilon,
+            hidden_reset=args.eval_hidden_reset,
+        )
+        print(f"\n[EvalProbe] eps={args.eval_epsilon} hidden_reset={args.eval_hidden_reset} "
+              f"({args.eval_episodes} episodes)")
+        print(f"    Return: {stats['return_mean']:.2f} +/- {stats['return_std']:.2f}")
+        print(f"    Ep Length: {stats['length_mean']:.0f} | Eval |Q|: {stats['q_abs_mean']:.3f}")
+        print(f"    Action Distribution: {stats['action_dist']}")
+        print(f"    Achievement Rates: {stats['achievement_rates']}")
+        probe_name = f"eval_probe_eps{args.eval_epsilon}_hr{args.eval_hidden_reset}.json"
+        with open(os.path.join(results_base_dir, probe_name), "w") as f:
+            json.dump(stats, f, indent=4)
+        print(f"[EvalProbe] Saved to {os.path.join(results_base_dir, probe_name)}")
+        env.close()
+        return
+
     # 2. Setup Fast GPU Buffers
     # Total transitions: 200,000 (~2.4 GB)
     buffers = {
@@ -449,6 +594,35 @@ def main():
     }
 
     metrics = MetricsLogger()
+
+    start_iteration = 0
+    if args.resume:
+        ckpt_path = os.path.join(results_base_dir, "RCQL_latest.pt")
+        metrics_path = os.path.join(results_base_dir, "metrics_latest.json")
+        if os.path.exists(ckpt_path):
+            agent.load_model(ckpt_path)
+            if metrics.load_from_json(metrics_path) and metrics.evaluations:
+                start_iteration = metrics.evaluations[-1]["iteration"] + 1
+                # pre_load re-logs these below; don't double count across resumes
+                metrics.frames["expert_preload"] = 0
+            print(
+                f"[Resume] Loaded {ckpt_path}; continuing at iteration {start_iteration} "
+                f"of {args.total_iterations} (online buffer restarts empty)."
+            )
+        else:
+            print(f"[Resume] No checkpoint at {ckpt_path}; starting fresh.")
+    elif args.load_checkpoint:
+        agent.load_model(args.load_checkpoint)
+        print(f"[Init] Warm-started weights from {args.load_checkpoint}")
+
+    if start_iteration >= args.total_iterations:
+        print(
+            f"[Resume] Nothing to do: iteration {start_iteration} >= "
+            f"--total_iterations {args.total_iterations}."
+        )
+        env.close()
+        return
+
     pre_load_episodic_data(args, buffers, metrics)
 
     router = LLMRouter(buffers["curriculum"], buffers["ssl"], env_name=args.env)
@@ -460,7 +634,7 @@ def main():
         from parallel_envs import ParallelCrafterEnvs
         penvs = ParallelCrafterEnvs(args.num_envs)
 
-    for iteration in range(args.total_iterations):
+    for iteration in range(start_iteration, args.total_iterations):
         print(f"\n=== Iteration {iteration} ===")
 
         # Epsilon gate: configs that collect online experience need exploration and
@@ -475,11 +649,26 @@ def main():
             agent.epsilon = 0.02
         print(f"    Current Epsilon: {agent.epsilon:.4f}")
 
+        # CQL anchor annealing: strong imitation prior early, free policy late.
+        # Driven by cumulative RL frames so it survives --resume.
+        if args.cql_alpha_end is not None:
+            alpha_frac = min(
+                1.0, metrics.frames["rl"] / max(args.cql_alpha_decay_frames, 1)
+            )
+            agent.cql_alpha = args.cql_alpha + alpha_frac * (
+                args.cql_alpha_end - args.cql_alpha
+            )
+        else:
+            agent.cql_alpha = args.cql_alpha
+        if args.offline_rl:
+            print(f"    Current CQL alpha: {agent.cql_alpha:.4f}")
+
         episodes = []
         if args.num_rl_frames > 0:
             # If online_rl is enabled and we don't have enough episodes yet,
-            # ensure we collect at least 8 to start training.
-            min_episodes = 8 if args.online_rl and iteration == 0 else 0
+            # ensure we collect at least 8 to start training (also refills the
+            # empty online buffer on the first iteration after a resume).
+            min_episodes = 8 if args.online_rl and iteration == start_iteration else 0
             if penvs is not None:
                 episodes = run_rl_collection_parallel(
                     agent,
@@ -539,23 +728,15 @@ def main():
 
         # Eval
         print("Evaluating...")
-        eval_rewards = []
-        action_counts = collections.defaultdict(int)
-        for _ in range(5):
-            e_obs, _ = env.reset()
-            agent.reset_hidden()
-            e_term = False
-            e_trunc = False
-            e_total = 0
-            while not (e_term or e_trunc):
-                e_act = agent.predict(e_obs, deterministic=True)
-                action_counts[int(e_act)] += 1
-                e_obs, e_rew, e_term, e_trunc, _ = env.step(e_act)
-                e_total += e_rew
-            eval_rewards.append(e_total)
-
-        mean_ret = np.mean(eval_rewards)
-        std_ret = np.std(eval_rewards)
+        eval_stats = run_eval(
+            agent,
+            env,
+            num_episodes=args.eval_episodes,
+            epsilon=args.eval_epsilon,
+            hidden_reset=args.eval_hidden_reset,
+        )
+        mean_ret = eval_stats["return_mean"]
+        std_ret = eval_stats["return_std"]
 
         bc_loss = 0.0
         if buffers["expert"].current_size > 0:
@@ -566,9 +747,20 @@ def main():
 
         print(f"    Eval Return: {mean_ret:.2f}")
         print(f"    Validation BC Loss: {bc_loss:.4f}")
-        print(f"    Action Distribution: {dict(action_counts)}")
+        print(f"    Ep Length: {eval_stats['length_mean']:.0f} | Eval |Q|: {eval_stats['q_abs_mean']:.3f}")
+        print(f"    Action Distribution: {eval_stats['action_dist']}")
+        print(f"    Achievement Rates: {eval_stats['achievement_rates']}")
 
-        metrics.log_evaluation(iteration, mean_ret, std_ret, bc_loss)
+        metrics.log_evaluation(
+            iteration,
+            mean_ret,
+            std_ret,
+            bc_loss,
+            length_mean=eval_stats["length_mean"],
+            q_abs_mean=eval_stats["q_abs_mean"],
+            action_dist=eval_stats["action_dist"],
+            achievement_rates=eval_stats["achievement_rates"],
+        )
         metrics.log_iteration()
         metrics.save_to_json(os.path.join(results_base_dir, "metrics_latest.json"))
         metrics.save_to_json(

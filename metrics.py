@@ -60,14 +60,15 @@ class MetricsLogger:
         if source in self.frames:
             self.frames[source] += count
 
-    def log_evaluation(self, iteration, return_mean, return_std, bc_loss=None, anti_bc_loss=None, compliance_score=None):
+    def log_evaluation(self, iteration, return_mean, return_std, bc_loss=None, anti_bc_loss=None, compliance_score=None, **extra):
         self.evaluations.append({
             "iteration": iteration,
             "return_mean": return_mean,
             "return_std": return_std,
             "bc_loss": bc_loss,
             "anti_bc_loss": anti_bc_loss,
-            "compliance_score": compliance_score
+            "compliance_score": compliance_score,
+            **extra
         })
 
     def get_summary(self):
@@ -81,6 +82,17 @@ class MetricsLogger:
         with open(path, "w") as f:
             json.dump(self.get_summary(), f, indent=4, cls=MetricsEncoder)
         print(f"[Metrics] Saved to {path}")
+
+    def load_from_json(self, path):
+        """Restores timers/frames/evaluations from a saved summary (for --resume)."""
+        if not os.path.exists(path):
+            return False
+        with open(path) as f:
+            summary = json.load(f)
+        self.timers.update(summary.get("timers", {}))
+        self.frames.update(summary.get("frames", {}))
+        self.evaluations = summary.get("evaluations", [])
+        return True
 
     def log_iteration(self):
         summary = self.get_summary()

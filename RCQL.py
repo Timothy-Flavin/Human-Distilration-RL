@@ -117,6 +117,7 @@ class RCQLAgent(Agent):
         self.cql_alpha = 1.0
 
         self.q_hidden = None
+        self.last_q = None
         self.replay_buffer = collections.deque(maxlen=1000)
 
     def reset_hidden(self):
@@ -177,6 +178,8 @@ class RCQLAgent(Agent):
             q_values, _, _, self.q_hidden = self.q_net(obs, self.q_hidden)
 
             q_values = q_values.squeeze(1)
+            # Kept for eval diagnostics: magnitude of Q at deployment time
+            self.last_q = q_values
 
             if deterministic:
                 action = q_values.argmax(dim=1)
@@ -286,6 +289,7 @@ class RCQLAgent(Agent):
         init_hidden=None,
         burn_in=16,
         use_cql=True,
+        n_step=1,
     ) -> dict:
         with torch.no_grad():
             h0 = self._make_hidden(init_hidden)
@@ -316,6 +320,15 @@ class RCQLAgent(Agent):
             next_q = q_target_full[:, 1:, :].gather(2, next_actions).squeeze(-1)
             next_v = v_target_full[:, 1:, :].squeeze(-1)
             target_q = r_active + (1.0 - d_active) * self.gamma * next_q
+            # Uncorrected n-step returns (Rainbow/R2D2 style). Each pass deepens
+            # every position's return by one step via its right neighbor,
+            # truncating at episode ends (dones) and at the window end (the
+            # last column keeps its shallower return).
+            for _ in range(n_step - 1):
+                shifted = torch.cat([target_q[:, 1:], target_q[:, -1:]], dim=1)
+                extended = r_active + (1.0 - d_active) * self.gamma * shifted
+                extended[:, -1] = target_q[:, -1]
+                target_q = extended
 
         q_td_loss_unmasked = F.mse_loss(current_q, target_q, reduction="none")
 
@@ -362,7 +375,11 @@ class RCQLAgent(Agent):
         advantages=None,
         h_q=None,
         naive=False,
+        bc_epsilon=None,
     ) -> dict:
+        # bc_epsilon decouples the BC target entropy from the exploration schedule;
+        # None preserves the coupled behavior (self.epsilon).
+        eps = self.epsilon if bc_epsilon is None else bc_epsilon
         if h_q is None:
             with torch.no_grad():
                 h0 = self._make_hidden(init_hidden)
@@ -414,7 +431,7 @@ class RCQLAgent(Agent):
                         loss = temperature_scaled_bc_loss(
                             valid_adv,
                             valid_act,
-                            epsilon=self.epsilon,
+                            epsilon=eps,
                             weights=valid_weights,
                         )
                 else:
@@ -447,7 +464,7 @@ class RCQLAgent(Agent):
                     else:
                         valid_adv = adv_flat[valid_indices]
                         loss = temperature_scaled_bc_loss(
-                            valid_adv, valid_act, epsilon=self.epsilon
+                            valid_adv, valid_act, epsilon=eps
                         )
                 else:
                     loss = torch.tensor(0.0).to(self.device_name)
@@ -551,13 +568,24 @@ class RCQLAgent(Agent):
                 p.data.copy_(src_p.data)
 
     def _save_checkpoint(self, path):
-        state = {"q_net": self.q_net.state_dict()}
+        # Full training state so runs can be resumed, not just evaluated
+        state = {
+            "q_net": self.q_net.state_dict(),
+            "q_target": self.q_target.state_dict(),
+            "optimizer": self.q_optimizer.state_dict(),
+        }
         torch.save(state, path)
 
     def load_model(self, path):
         checkpoint = torch.load(path, map_location=self.device_name)
         if isinstance(checkpoint, dict) and "q_net" in checkpoint:
             self.q_net.load_state_dict(checkpoint["q_net"])
+            if "q_target" in checkpoint:
+                self.q_target.load_state_dict(checkpoint["q_target"])
+            else:
+                self.q_target = copy.deepcopy(self.q_net)
+            if "optimizer" in checkpoint:
+                self.q_optimizer.load_state_dict(checkpoint["optimizer"])
         else:
             self.q_net.load_state_dict(checkpoint)
-        self.q_target = copy.deepcopy(self.q_net)
+            self.q_target = copy.deepcopy(self.q_net)
