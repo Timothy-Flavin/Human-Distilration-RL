@@ -21,8 +21,8 @@ CLEANED_EXPERT_DATA="expert_demonstrations_crafter_cleaned.pkl"
 # 3 epochs x 64 seqs x 48 steps ~= 9.2k samples per 2k collected frames (~4.6x).
 ITERATIONS_BC=15
 EPOCHS_BC=100
-ITERATIONS_ONLINE=600
-EPOCHS_ONLINE=40
+ITERATIONS_ONLINE=400
+EPOCHS_ONLINE=60
 RL_FRAMES=2000
 
 echo "=========================================================="

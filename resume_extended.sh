@@ -17,6 +17,13 @@
 #
 # NOTE: run this only after run_recurrent_handsfree.sh has finished — it
 # targets the same results dirs.
+#
+# ENCODER COMPAT (2026-07-10): the default encoder is now the IMPALA ResNet.
+# Checkpoints trained before that (everything up to and including the Exp 9
+# runs) used the Nature CNN — resuming or eval-probing them REQUIRES
+# --encoder nature or load_model will fail on a state_dict mismatch. Also
+# note PER + the combined single-backward update change training dynamics:
+# resuming an old run under the new code mixes implementations mid-curve.
 # ============================================================================
 
 if [ -f "./venv/bin/activate" ]; then

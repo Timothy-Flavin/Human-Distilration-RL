@@ -57,11 +57,78 @@ class NatureCNNEncoder(nn.Module):
         return x
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        out = F.relu(x)
+        out = self.conv1(out)
+        out = F.relu(out)
+        out = self.conv2(out)
+        return x + out
+
+
+class ImpalaBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=1, padding=1
+        )
+        self.max_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.res1 = ResidualBlock(out_channels)
+        self.res2 = ResidualBlock(out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.max_pool(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
+
+
+class ImpalaCNN(nn.Module):
+    def __init__(self, in_channels=3, img_size=64, depths=[16, 32, 32], out_size=256):
+        super().__init__()
+        blocks = []
+        ch = in_channels
+        for out_channels in depths:
+            blocks.append(ImpalaBlock(ch, out_channels))
+            ch = out_channels
+        self.blocks = nn.Sequential(*blocks)
+
+        # For a 64x64 input, 3 max pools of stride 2 yield an 8x8 spatial resolution.
+        # 8 * 8 * 32 (final depth) = 2048. Computed dynamically for other sizes.
+        dummy = torch.zeros(1, in_channels, img_size, img_size)
+        with torch.no_grad():
+            flatten_size = self.blocks(dummy).numel()
+        self.fc = nn.Sequential(
+            nn.Flatten(), nn.ReLU(), nn.Linear(flatten_size, out_size), nn.ReLU()
+        )
+
+    def forward(self, x):
+        # Ensure input is scaled to [0, 1] if passing raw pixels
+        x = self.blocks(x)
+        x = self.fc(x)
+        return x
+
+
 class RecurrentQNetwork(nn.Module):
-    def __init__(self, action_dim, in_channels=3, img_size=64, hidden_dim=512):
+    def __init__(self, action_dim, in_channels=3, img_size=64, hidden_dim=512,
+                 encoder="impala"):
         super(RecurrentQNetwork, self).__init__()
-        # Injecting the Nature CNN encoder
-        self.encoder = NatureCNNEncoder(in_channels, img_size)
+        # IMPALA ResNet encoder by default; "nature" keeps the old Nature CNN
+        # (needed to load pre-impala checkpoints). Both emit 512-d features —
+        # buffer replay code (refresh_hidden_states / compute_td_errors)
+        # depends on that width.
+        if encoder == "impala":
+            self.encoder = ImpalaCNN(in_channels, img_size, out_size=512)
+        elif encoder == "nature":
+            self.encoder = NatureCNNEncoder(in_channels, img_size)
+        else:
+            raise ValueError(f"Unknown encoder: {encoder}")
         self.lstm = nn.LSTM(512, hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, action_dim + 1)
 
@@ -97,6 +164,7 @@ class RCQLAgent(Agent):
         hidden_dim=512,
         lr=3e-4,
         epsilon=0.1,
+        encoder="impala",
     ):
         super().__init__(obs_dim, action_dim, name, save_dir, device_name)
 
@@ -107,7 +175,7 @@ class RCQLAgent(Agent):
         self.epsilon = epsilon
 
         self.q_net = RecurrentQNetwork(
-            action_dim, in_channels, img_size, hidden_dim
+            action_dim, in_channels, img_size, hidden_dim, encoder=encoder
         ).to(self.device_name)
         self.q_target = copy.deepcopy(self.q_net)
         self.q_optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
@@ -282,7 +350,7 @@ class RCQLAgent(Agent):
             "next_v": next_v.detach(),
         }
 
-    def update_td(
+    def td_loss(
         self,
         obs,
         actions,
@@ -293,7 +361,13 @@ class RCQLAgent(Agent):
         burn_in=16,
         use_cql=True,
         n_step=1,
-    ) -> dict:
+        is_weights=None,
+    ):
+        """Builds the (CQL-)TD loss without stepping the optimizer, so it can
+        be combined with other terms into one backward pass. is_weights: (B,)
+        PER importance-sampling corrections applied to the TD term. Returns
+        (loss, aux) where aux includes per-step |TD error| ("td_abs", detached,
+        active region only) for priority updates."""
         with torch.no_grad():
             h0 = self._make_hidden(init_hidden)
             if burn_in > 0:
@@ -309,7 +383,7 @@ class RCQLAgent(Agent):
         d_active = dones[:, burn_in:]
         m_active = masks[:, burn_in:]
 
-        q_logits_full, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
+        q_logits_full, v_full, adv_full, _ = self.q_net(obs_active, hidden=h_q)
         q_logits = q_logits_full[:, :-1, :]
         current_q = q_logits.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
         current_v = v_full[:, :-1, :].squeeze(-1)
@@ -334,6 +408,8 @@ class RCQLAgent(Agent):
                 target_q = extended
 
         q_td_loss_unmasked = F.mse_loss(current_q, target_q, reduction="none")
+        if is_weights is not None:
+            q_td_loss_unmasked = q_td_loss_unmasked * is_weights.unsqueeze(1)
 
         valid_steps = m_active.sum() + 1e-8
         q_loss = (q_td_loss_unmasked * m_active).sum() / valid_steps
@@ -346,11 +422,23 @@ class RCQLAgent(Agent):
         else:
             total_loss = q_loss
 
-        self.q_optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
-        self.q_optimizer.step()
+        aux = {
+            "q_loss": q_loss.item(),
+            "cql_loss": cql_loss.item(),
+            "h_q": h_q,
+            "current_v": current_v.detach(),
+            "next_v": next_v.detach(),
+            "td_abs": (current_q - target_q).abs().detach(),
+            "m_active": m_active,
+            # Grad-attached outputs over the active steps, so an imitation
+            # term on the same batch can reuse this forward instead of
+            # building a second activation graph (IMPALA graphs are ~GBs).
+            "q_logits": q_logits,
+            "adv_active": adv_full[:, :-1, :],
+        }
+        return total_loss, aux
 
+    def soft_update_target(self):
         for param, target_param in zip(
             self.q_net.parameters(), self.q_target.parameters()
         ):
@@ -358,28 +446,51 @@ class RCQLAgent(Agent):
                 self.tau * param.data + (1 - self.tau) * target_param.data
             )
 
+    def update_td(
+        self,
+        obs,
+        actions,
+        rewards,
+        dones,
+        masks,
+        init_hidden=None,
+        burn_in=16,
+        use_cql=True,
+        n_step=1,
+        is_weights=None,
+    ) -> dict:
+        total_loss, aux = self.td_loss(
+            obs, actions, rewards, dones, masks,
+            init_hidden=init_hidden, burn_in=burn_in,
+            use_cql=use_cql, n_step=n_step, is_weights=is_weights,
+        )
+
+        self.q_optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
+        self.q_optimizer.step()
+        self.soft_update_target()
+
         return {
             "loss_td": total_loss.item(),
-            "q_loss": q_loss.item(),
-            "cql_loss": cql_loss.item(),
-            "h_q": h_q,
-            "current_v": current_v.detach(),
-            "next_v": next_v.detach(),
+            **aux,
         }
 
-    def update_supervised(
+    def supervised_loss(
         self,
         obs,
         actions,
         masks,
         init_hidden=None,
         burn_in=16,
-        anti=False,
         advantages=None,
         h_q=None,
         naive=False,
         bc_epsilon=None,
-    ) -> dict:
+    ):
+        """Builds the imitation (BC / AWBC) loss without stepping the
+        optimizer, so it can be combined with other terms into one backward
+        pass. Returns (loss, h_q)."""
         # bc_epsilon decouples the BC target entropy from the exploration schedule;
         # None preserves the coupled behavior (self.epsilon).
         eps = self.epsilon if bc_epsilon is None else bc_epsilon
@@ -397,8 +508,69 @@ class RCQLAgent(Agent):
         m_active = masks[:, burn_in:]
 
         q_logits, _, adv_active, _ = self.q_net(obs_active, hidden=h_q)
+        loss = self._imitation_loss_core(
+            q_logits, adv_active, a_active, m_active,
+            advantages=advantages, naive=naive, eps=eps,
+        )
+        return loss, h_q
 
+    def _imitation_loss_core(self, q_logits, adv_active, a_active, m_active,
+                             advantages=None, naive=False, eps=0.02):
+        """Imitation loss from already-computed network outputs, so callers
+        holding a live forward (e.g. the demo TD term) can reuse it."""
+        act_dim = adv_active.shape[-1]
+        adv_flat = adv_active.reshape(-1, act_dim)
+        a_flat = a_active.reshape(-1)
+        m_flat = m_active.reshape(-1)
+
+        valid_indices = torch.nonzero(m_flat).squeeze(-1)
+        if valid_indices.numel() == 0:
+            return torch.tensor(0.0).to(self.device_name)
+
+        valid_act = a_flat[valid_indices]
+        if naive:
+            q_logits_flat = q_logits.reshape(-1, act_dim)
+            return F.cross_entropy(q_logits_flat[valid_indices], valid_act)
+        if advantages is not None:
+            adv_weight_flat = advantages.to(self.device_name).reshape(-1)
+            return temperature_scaled_bc_loss(
+                adv_flat[valid_indices],
+                valid_act,
+                epsilon=eps,
+                weights=adv_weight_flat[valid_indices],
+            )
+        return temperature_scaled_bc_loss(
+            adv_flat[valid_indices], valid_act, epsilon=eps
+        )
+
+    def update_supervised(
+        self,
+        obs,
+        actions,
+        masks,
+        init_hidden=None,
+        burn_in=16,
+        anti=False,
+        advantages=None,
+        h_q=None,
+        naive=False,
+        bc_epsilon=None,
+    ) -> dict:
         if anti:
+            if h_q is None:
+                with torch.no_grad():
+                    h0 = self._make_hidden(init_hidden)
+                    if burn_in > 0:
+                        burn_obs = obs[:, :burn_in, :]
+                        _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
+                    else:
+                        h_q = h0
+
+            obs_active = obs[:, burn_in:-1, :]
+            a_active = actions[:, burn_in:]
+            m_active = masks[:, burn_in:]
+
+            q_logits, _, _, _ = self.q_net(obs_active, hidden=h_q)
             probs = F.softmax(q_logits, dim=2)
             bad_action_probs = probs.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
             loss_unmasked = -torch.log(1 - bad_action_probs + 1e-8)
@@ -412,77 +584,107 @@ class RCQLAgent(Agent):
             self.q_optimizer.step()
 
             return {"loss_supervised": loss.item()}
-        else:
-            if advantages is not None:
-                adv = advantages.to(self.device_name)
-                batch_size, seq_len, act_dim = adv_active.shape
-                adv_flat = adv_active.reshape(-1, act_dim)
-                a_flat = a_active.reshape(-1)
-                m_flat = m_active.reshape(-1)
-                adv_weight_flat = adv.reshape(-1)
 
-                valid_indices = torch.nonzero(m_flat).squeeze(-1)
-                if valid_indices.numel() > 0:
-                    valid_act = a_flat[valid_indices]
-                    if naive:
-                        q_logits_flat = q_logits.reshape(-1, act_dim)
-                        valid_q = q_logits_flat[valid_indices]
-                        loss = F.cross_entropy(valid_q, valid_act)
-                    else:
-                        valid_adv = adv_flat[valid_indices]
-                        valid_weights = adv_weight_flat[valid_indices]
-                        loss = temperature_scaled_bc_loss(
-                            valid_adv,
-                            valid_act,
-                            epsilon=eps,
-                            weights=valid_weights,
-                        )
-                else:
-                    loss = torch.tensor(0.0).to(self.device_name)
+        loss, _ = self.supervised_loss(
+            obs, actions, masks,
+            init_hidden=init_hidden, burn_in=burn_in,
+            advantages=advantages, h_q=h_q, naive=naive, bc_epsilon=bc_epsilon,
+        )
 
-                self.q_optimizer.zero_grad()
-                if loss.requires_grad:
-                    (self.bc_weight * loss).backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        self.q_net.parameters(), max_norm=1.0
-                    )
-                    self.q_optimizer.step()
+        self.q_optimizer.zero_grad()
+        if loss.requires_grad:
+            (self.bc_weight * loss).backward()
+            torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
+            self.q_optimizer.step()
 
-                return {
-                    "loss_supervised": loss.item() if hasattr(loss, "item") else 0.0
-                }
+        return {"loss_supervised": loss.item() if hasattr(loss, "item") else 0.0}
+
+    def unified_update(
+        self,
+        online_batch=None,
+        expert_batch=None,
+        burn_in=16,
+        online_n_step=1,
+        expert_n_step=1,
+        demo_td=False,
+        use_cql=True,
+        bc=False,
+        awbc=False,
+        bc_epsilon=None,
+        is_weights=None,
+        expert_advantages_fn=None,
+    ) -> dict:
+        """One combined loss over all active terms and a SINGLE backward /
+        clip / optimizer step, so the demo TD, online TD, and imitation
+        gradients stop thrashing each other through separate steps.
+
+        online_batch / expert_batch: 6-tuples from sample_batch.
+        is_weights: (B,) PER corrections for the online TD term.
+        expert_advantages_fn: callable(aux) -> advantages for AWBC, given the
+        demo TD aux dict (current_v / next_v); used only when awbc and demo_td.
+        """
+        total = None
+        out = {}
+
+        if expert_batch is not None and demo_td:
+            loss_e, aux_e = self.td_loss(
+                *expert_batch, burn_in=burn_in,
+                use_cql=use_cql, n_step=expert_n_step,
+            )
+            total = loss_e
+            out["loss_td_expert"] = loss_e.item()
+            out["cql_loss"] = aux_e["cql_loss"]
+            out["h_q_expert"] = aux_e["h_q"]
+            out["expert_aux"] = aux_e
+
+        if expert_batch is not None and (bc or awbc) and self.bc_weight > 0:
+            advantages = None
+            if awbc and expert_advantages_fn is not None:
+                # fn receives the demo TD aux (with current_v/next_v) when the
+                # demo TD term ran this epoch, else None and may fall back to a
+                # compute-only value forward.
+                advantages = expert_advantages_fn(out.get("expert_aux"))
+            if "expert_aux" in out:
+                # Reuse the demo TD forward's outputs — its q_logits/adv cover
+                # exactly the imitation term's active region, so no second
+                # activation graph is built for the expert batch.
+                aux_e = out["expert_aux"]
+                eps = self.epsilon if bc_epsilon is None else bc_epsilon
+                loss_bc = self._imitation_loss_core(
+                    aux_e["q_logits"], aux_e["adv_active"],
+                    expert_batch[1][:, burn_in:], expert_batch[4][:, burn_in:],
+                    advantages=advantages, eps=eps,
+                )
             else:
-                batch_size, seq_len, act_dim = adv_active.shape
-                adv_flat = adv_active.reshape(-1, act_dim)
-                a_flat = a_active.reshape(-1)
-                m_flat = m_active.reshape(-1)
+                loss_bc, _ = self.supervised_loss(
+                    expert_batch[0], expert_batch[1], expert_batch[4],
+                    init_hidden=expert_batch[5], burn_in=burn_in,
+                    advantages=advantages,
+                    bc_epsilon=bc_epsilon,
+                )
+            total = loss_bc * self.bc_weight if total is None else total + loss_bc * self.bc_weight
+            out["loss_supervised"] = loss_bc.item()
 
-                valid_indices = torch.nonzero(m_flat).squeeze(-1)
-                if valid_indices.numel() > 0:
-                    valid_act = a_flat[valid_indices]
-                    if naive:
-                        q_logits_flat = q_logits.reshape(-1, act_dim)
-                        valid_q = q_logits_flat[valid_indices]
-                        loss = F.cross_entropy(valid_q, valid_act)
-                    else:
-                        valid_adv = adv_flat[valid_indices]
-                        loss = temperature_scaled_bc_loss(
-                            valid_adv, valid_act, epsilon=eps
-                        )
-                else:
-                    loss = torch.tensor(0.0).to(self.device_name)
+        if online_batch is not None:
+            loss_o, aux_o = self.td_loss(
+                *online_batch, burn_in=burn_in,
+                use_cql=False, n_step=online_n_step, is_weights=is_weights,
+            )
+            total = loss_o if total is None else total + loss_o
+            out["loss_td_online"] = loss_o.item()
+            out["td_abs_online"] = aux_o["td_abs"]
+            out["m_active_online"] = aux_o["m_active"]
 
-                self.q_optimizer.zero_grad()
-                if loss.requires_grad:
-                    (self.bc_weight * loss).backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        self.q_net.parameters(), max_norm=1.0
-                    )
-                    self.q_optimizer.step()
+        if total is None or not total.requires_grad:
+            return out
 
-                return {
-                    "loss_supervised": loss.item() if hasattr(loss, "item") else 0.0
-                }
+        self.q_optimizer.zero_grad()
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
+        self.q_optimizer.step()
+        self.soft_update_target()
+        out["loss_total"] = total.item()
+        return out
 
     def get_bc_loss(self, obs, actions, masks, init_hidden=None, burn_in=16) -> float:
         self.q_net.eval()

@@ -327,87 +327,100 @@ def unified_train_step(args, agent, buffers, metrics):
     start_time = time.time()
     total_frames_processed = 0
 
+    online_per = getattr(buffers["online"], "prioritized", False)
+
     for epoch in range(args.num_unified_epochs):
 
         # R2D3 demo TD stays at a 1/16 ratio (bootstrapping at OOD demo states
         # is the risky term), but the supervised BC term is safe to run every
         # epoch — so with --bc/--awbc demos are sampled every epoch and only
-        # the demo TD step is gated.
+        # the demo TD term is gated.
         demo_td_epoch = not args.r2d3 or epoch % 16 == 0
         exp_batch = None
+        exp_flat_idx = None
         if has_offline:
             if demo_td_epoch or args.bc or args.awbc:
-                exp_batch = buffers["expert"].sample_batch(batch_size, seq_len=seq_len)
+                # return_info=True keeps uniform sampling (expert buffer is not
+                # prioritized) but yields flat indices so the demo TD errors
+                # computed below can be remembered for demo-start priorities.
+                *exp_batch, _, exp_flat_idx = buffers["expert"].sample_batch(
+                    batch_size, seq_len=seq_len, return_info=True
+                )
+                exp_batch = tuple(exp_batch)
                 total_frames_processed += batch_size * (seq_len + 1)
 
         on_batch = None
+        is_weights = None
+        on_flat_idx = None
         if has_online:
-            on_batch = buffers["online"].sample_batch(batch_size, seq_len=seq_len)
+            if online_per:
+                *on_batch, is_weights, on_flat_idx = buffers["online"].sample_batch(
+                    batch_size, seq_len=seq_len, return_info=True,
+                    per_beta=args.per_beta, burn_in=burn_in,
+                )
+                on_batch = tuple(on_batch)
+            else:
+                on_batch = buffers["online"].sample_batch(batch_size, seq_len=seq_len)
             total_frames_processed += batch_size * (seq_len + 1)
 
-        # 1. TD / POLICY UPDATES (CQL or Online RL)
-        cached_h_q = None
-        cached_v = None
-        if (args.offline_rl or args.r2d3) and exp_batch and demo_td_epoch:
-            metrics.start_timer("agent_updating_rl")
-            expert_n = (
+        # AWBC advantages: A = r + gamma*V(s') - V(s). V comes from the demo
+        # TD forward when it ran this epoch, else from a value forward
+        # (trained only in offline-only mode, as before).
+        train_v = args.awbc and not (args.online_rl or args.offline_rl)
+
+        def expert_advantages(td_aux, _exp=exp_batch):
+            if td_aux is not None:
+                v_s, v_ns = td_aux["current_v"], td_aux["next_v"]
+            else:
+                v_results = agent.update_value(*_exp, burn_in=burn_in, train=train_v)
+                v_s, v_ns = v_results["current_v"], v_results["next_v"]
+            r_active = _exp[2][:, burn_in:]  # rewards
+            d_active = _exp[3][:, burn_in:]  # dones
+            td_error = r_active + (1.0 - d_active) * agent.gamma * v_ns - v_s
+            return F.relu(td_error + 1.0)
+
+        if args.awbc and train_v and on_batch:
+            metrics.start_timer("agent_updating_value")
+            agent.update_value(*on_batch, burn_in=burn_in, train=True)
+            metrics.stop_timer("agent_updating_value")
+
+        # Single combined loss + one backward/step for every active term
+        # (demo CQL/TD, online TD with PER corrections, BC/AWBC imitation) —
+        # separate sequential steps let the gradients thrash each other.
+        metrics.start_timer("agent_updating_rl")
+        results = agent.unified_update(
+            online_batch=on_batch if args.online_rl else None,
+            expert_batch=exp_batch,
+            burn_in=burn_in,
+            online_n_step=args.n_step,
+            expert_n_step=(
                 args.n_step_expert if args.n_step_expert is not None else args.n_step
+            ),
+            demo_td=bool((args.offline_rl or args.r2d3) and exp_batch and demo_td_epoch),
+            use_cql=not args.r2d3,
+            bc=args.bc,
+            awbc=args.awbc,
+            bc_epsilon=args.bc_epsilon if args.bc_epsilon >= 0 else None,
+            is_weights=is_weights,
+            expert_advantages_fn=expert_advantages if args.awbc else None,
+        )
+        metrics.stop_timer("agent_updating_rl")
+
+        # Feed the TD errors we just computed back into the sample priorities.
+        if online_per and on_flat_idx is not None and "td_abs_online" in results:
+            buffers["online"].update_priorities(
+                on_flat_idx[:, burn_in:],
+                results["td_abs_online"],
+                results["m_active_online"],
             )
-            td_results = agent.update_td(
-                *exp_batch, burn_in=burn_in, use_cql=not args.r2d3, n_step=expert_n
+
+        # Remember demo TD errors for demo-start priorities (replaces the
+        # per-iteration full sweep).
+        if exp_flat_idx is not None and "expert_aux" in results:
+            aux_e = results["expert_aux"]
+            buffers["expert"].record_td(
+                exp_flat_idx[:, burn_in:], aux_e["td_abs"], aux_e["m_active"]
             )
-            cached_h_q = td_results.get("h_q")
-            cached_v = (td_results["current_v"], td_results["next_v"])
-            metrics.stop_timer("agent_updating_rl")
-
-        if args.online_rl and on_batch:
-            metrics.start_timer("agent_updating_rl")
-            agent.update_td(
-                *on_batch, burn_in=burn_in, use_cql=False, n_step=args.n_step
-            )
-            metrics.stop_timer("agent_updating_rl")
-
-        # 2. VALUE FUNCTION UPDATES (for AWBC)
-        if args.awbc:
-            train_v = not (args.online_rl or args.offline_rl)
-
-            if exp_batch and (cached_v is None or train_v):
-                metrics.start_timer("agent_updating_value")
-                v_results = agent.update_value(
-                    *exp_batch, burn_in=burn_in, train=train_v
-                )
-                cached_v = (v_results["current_v"], v_results["next_v"])
-                metrics.stop_timer("agent_updating_value")
-
-            # Update value using online data (if available and training V)
-            if on_batch and train_v:
-                metrics.start_timer("agent_updating_value")
-                agent.update_value(*on_batch, burn_in=burn_in, train=True)
-                metrics.stop_timer("agent_updating_value")
-
-        # 3. SUPERVISED / BC UPDATES (skipped once bc_weight anneals to 0)
-        if (args.awbc or args.bc) and exp_batch and agent.bc_weight > 0:
-            metrics.start_timer("agent_updating_bc")
-            advantages = None
-            if args.awbc and cached_v is not None:
-                # Calculate Advantage using Value Network: A = r + gamma*V(s') - V(s)
-                v_s, v_ns = cached_v
-                r_active = exp_batch[2][:, burn_in:]  # rewards
-                d_active = exp_batch[3][:, burn_in:]  # dones
-                td_error = r_active + (1.0 - d_active) * agent.gamma * v_ns - v_s
-                advantages = F.relu(td_error + 1.0)
-
-            agent.update_supervised(
-                exp_batch[0],
-                exp_batch[1],
-                exp_batch[4],
-                init_hidden=exp_batch[5],
-                burn_in=burn_in,
-                advantages=advantages,
-                h_q=cached_h_q,
-                bc_epsilon=args.bc_epsilon if args.bc_epsilon >= 0 else None,
-            )
-            metrics.stop_timer("agent_updating_bc")
 
         if (epoch + 1) % 50 == 0 or epoch == 0:
             elapsed = time.time() - start_time
@@ -562,6 +575,26 @@ def main():
     parser.add_argument("--demo_start_lookahead", type=int, default=50,
                         help="TD-error lookahead window (demo steps) when scoring a "
                              "restart point")
+    parser.add_argument("--demo_priority_sweep_every", type=int, default=20,
+                        help="Every N iterations, refresh demo-start priorities with a "
+                             "full TD-error sweep; between sweeps they update from the "
+                             "TD errors already computed during demo TD training "
+                             "updates (0 = sweep every iteration, the old behavior)")
+    parser.add_argument("--encoder", type=str, default="impala",
+                        choices=["impala", "nature"],
+                        help="CNN encoder: IMPALA ResNet (default) or the old Nature "
+                             "CNN (required to load pre-impala checkpoints)")
+    parser.add_argument("--no_per", action="store_true",
+                        help="Disable prioritized replay on the online buffer "
+                             "(PER is on by default; expert buffer stays uniform)")
+    parser.add_argument("--per_alpha", type=float, default=0.6,
+                        help="PER priority exponent")
+    parser.add_argument("--per_beta", type=float, default=0.4,
+                        help="PER importance-sampling correction exponent")
+    parser.add_argument("--per_sweep_every", type=int, default=0,
+                        help="Every N iterations, recompute ALL online-buffer priorities "
+                             "with a full TD-error sweep (0 = never; priorities normally "
+                             "refresh from the errors computed during training updates)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -589,6 +622,7 @@ def main():
         name="RCQL",
         save_dir=results_base_dir,
         device_name=device,
+        encoder=args.encoder,
     )
 
     # Eval-only probe: no buffers, no training — evaluate a checkpoint and exit.
@@ -620,10 +654,12 @@ def main():
     # Total transitions: 200,000 (~2.4 GB)
     buffers = {
         "expert": FastGPUEpisodicBuffer(
-            max_total_transitions=50000, device=device, obs_shape=obs_dim
+            max_total_transitions=50000, device=device, obs_shape=obs_dim,
+            track_td=True,
         ),
         "online": FastGPUEpisodicBuffer(
-            max_total_transitions=150000, device=device, obs_shape=obs_dim
+            max_total_transitions=150000, device=device, obs_shape=obs_dim,
+            prioritized=not args.no_per, per_alpha=args.per_alpha,
         ),
         "llm": LLMBuffer(),
         "curriculum": CurriculumBuffer(),
@@ -754,14 +790,39 @@ def main():
         if args.bc or args.awbc:
             print(f"    Current BC weight: {agent.bc_weight:.4f}")
 
+        # Optional PER sweep: recompute every online-buffer priority from a
+        # full TD-error pass (normally priorities refresh incrementally from
+        # the errors computed during training updates).
+        if (
+            args.per_sweep_every > 0
+            and getattr(buffers["online"], "prioritized", False)
+            and iteration > start_iteration
+            and iteration % args.per_sweep_every == 0
+        ):
+            print("    [PER] Full priority sweep...")
+            buffers["online"].refresh_priorities(
+                agent.q_net, agent.q_target, gamma=agent.gamma
+            )
+
         # Re-score demo restart points against the current value function:
         # priority goes to starts just before large TD errors on the demos.
+        # Between full sweeps (which cost two whole-dataset network passes),
+        # priorities are read from the TD errors the demo TD term already
+        # computed during training updates (expert buffer's track_td store).
         if demo_sampler is not None and args.demo_start_priority > 0:
             metrics.timers.setdefault("demo_priority", 0.0)
             metrics.start_timer("demo_priority")
-            td_errs = buffers["expert"].compute_td_errors(
-                agent.q_net, agent.q_target, gamma=agent.gamma
+            sweep = (
+                args.demo_priority_sweep_every <= 0
+                or iteration % args.demo_priority_sweep_every == 0
             )
+            if sweep:
+                td_errs = buffers["expert"].compute_td_errors(
+                    agent.q_net, agent.q_target, gamma=agent.gamma
+                )
+                buffers["expert"].store_td_sweep(td_errs)
+            else:
+                td_errs = buffers["expert"].td_errors_per_episode()
             demo_sampler.set_td_errors(td_errs)
             metrics.stop_timer("demo_priority")
 

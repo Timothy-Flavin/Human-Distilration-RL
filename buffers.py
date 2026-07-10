@@ -8,7 +8,8 @@ class FastGPUEpisodicBuffer:
     Optimized Flat Buffer: Stores transitions consecutively to save VRAM.
     Eliminates the (max_episodes, max_ep_len) zero-padding.
     """
-    def __init__(self, max_total_transitions=200000, device="cuda", obs_shape=(3, 64, 64), hidden_dim=512):
+    def __init__(self, max_total_transitions=200000, device="cuda", obs_shape=(3, 64, 64), hidden_dim=512,
+                 prioritized=False, per_alpha=0.6, per_eps=1e-3, track_td=False):
         self.max_transitions = max_total_transitions
         self.device = device
         self.obs_shape = obs_shape
@@ -24,13 +25,39 @@ class FastGPUEpisodicBuffer:
         # R2D2-style stored recurrent state: (h, c) BEFORE processing obs[i].
         # fp16 halves the footprint (~200MB at 200k transitions for hidden_dim=512).
         self.hiddens = torch.zeros((max_total_transitions, 2, hidden_dim), dtype=torch.float16, device=device)
-        
+
         self.ptr = 0
         self.full = False
-        
+
         # Episode management: stores (start_idx, length)
         self.episode_metadata = []
         self.current_size_episodes = 0
+
+        # --- Prioritized replay (per-transition) ---
+        # priorities holds raw |TD error| + eps; 0 marks slots with no live
+        # episode (never sampled). New episodes enter at max_priority so they
+        # are seen at least once before their real TD error takes over.
+        self.prioritized = prioritized
+        self.per_alpha = per_alpha
+        self.per_eps = per_eps
+        self.max_priority = 1.0
+        if prioritized:
+            self.priorities = torch.zeros(max_total_transitions, dtype=torch.float32, device=device)
+            # per-transition episode bounds, for clamping sampled windows
+            self.ep_start_map = torch.full((max_total_transitions,), -1, dtype=torch.long, device=device)
+            self.ep_len_map = torch.zeros(max_total_transitions, dtype=torch.long, device=device)
+            self._meta_by_start = {}  # start_ptr -> (ep_len, next_obs_final)
+
+        # --- Passive per-transition TD-error store (track_td=True) ---
+        # Unlike PER this never changes sampling; it just remembers the last
+        # |TD error| seen for each transition during training updates, so
+        # consumers (demo-start priorities) don't need a full sweep. -1 marks
+        # "never measured".
+        self.track_td = track_td
+        if track_td:
+            self.td_store = torch.full(
+                (max_total_transitions,), -1.0, dtype=torch.float32, device=device
+            )
 
     @property
     def current_size(self):
@@ -60,6 +87,18 @@ class FastGPUEpisodicBuffer:
             end_ptr = ep_len
 
         # Remove any metadata entries that overlap with our new range
+        if self.prioritized or self.track_td:
+            # Clear the FULL range of every overwritten episode so its
+            # leftover transitions can never be sampled or read again.
+            for m in self.episode_metadata:
+                if m[0] < end_ptr and (m[0] + m[1]) > start_ptr:
+                    if self.prioritized:
+                        self.priorities[m[0]:m[0] + m[1]] = 0.0
+                        self.ep_start_map[m[0]:m[0] + m[1]] = -1
+                        self.ep_len_map[m[0]:m[0] + m[1]] = 0
+                        self._meta_by_start.pop(m[0], None)
+                    if self.track_td:
+                        self.td_store[m[0]:m[0] + m[1]] = -1.0
         self.episode_metadata = [m for m in self.episode_metadata if not (m[0] < end_ptr and (m[0] + m[1]) > start_ptr)]
 
         # Extract numpy data
@@ -100,35 +139,32 @@ class FastGPUEpisodicBuffer:
         
         # Store metadata
         self.episode_metadata.append((start_ptr, ep_len, next_obs_final))
+        if self.prioritized:
+            self.priorities[start_ptr:end_ptr] = self.max_priority
+            self.ep_start_map[start_ptr:end_ptr] = start_ptr
+            self.ep_len_map[start_ptr:end_ptr] = ep_len
+            self._meta_by_start[start_ptr] = (ep_len, next_obs_final)
+        if self.track_td:
+            self.td_store[start_ptr:end_ptr] = -1.0
         self.ptr = end_ptr
 
-    def sample_batch(self, batch_size, seq_len=48):
-        if len(self.episode_metadata) < batch_size:
-            # Not enough data yet
-            ep_indices = random.choices(range(len(self.episode_metadata)), k=batch_size)
-        else:
-            ep_indices = random.sample(range(len(self.episode_metadata)), batch_size)
-            
+    def _gather_windows(self, window_specs, seq_len, return_flat_idx=False):
+        """window_specs: list of (start_ptr, ep_len, next_obs_final, sample_start).
+        Assembles the padded (B, seq_len) batch tensors; optionally also the
+        flat buffer index of every window step (-1 where padded), so callers
+        can write per-transition priorities back."""
         batch_obs = []
         batch_acts = []
         batch_rews = []
         batch_dones = []
         batch_masks = []
         batch_hiddens = []
+        batch_flat_idx = []
 
-        for idx in ep_indices:
-            start_ptr, ep_len, next_obs_final = self.episode_metadata[idx]
-            
-            if ep_len <= seq_len:
-                # Pad if episode is shorter than seq_len
-                sample_start = start_ptr
-                actual_len = ep_len
-                pad_len = seq_len - ep_len
-            else:
-                sample_start = start_ptr + random.randint(0, ep_len - seq_len)
-                actual_len = seq_len
-                pad_len = 0
-            
+        for start_ptr, ep_len, next_obs_final, sample_start in window_specs:
+            actual_len = min(seq_len, ep_len)
+            pad_len = seq_len - actual_len
+
             # Observations (need actual_len + 1)
             # If we are at the end of the episode, the last next_obs is next_obs_final
             if sample_start + actual_len == start_ptr + ep_len:
@@ -139,35 +175,42 @@ class FastGPUEpisodicBuffer:
                 obs = torch.cat([obs, next_obs_t], dim=0)
             else:
                 obs = self.obs[sample_start : sample_start + actual_len + 1]
-                
+
             acts = self.actions[sample_start : sample_start + actual_len]
             rews = self.rewards[sample_start : sample_start + actual_len]
             dones = self.dones[sample_start : sample_start + actual_len]
             masks = torch.ones(actual_len, device=self.device)
-            
+            flat_idx = torch.arange(sample_start, sample_start + actual_len, device=self.device)
+
             if pad_len > 0:
                 # Padding
                 obs_pad = torch.zeros((pad_len, *self.obs_shape), dtype=torch.uint8, device=self.device)
                 obs = torch.cat([obs, obs_pad], dim=0)
-                
+
                 acts_pad = torch.zeros(pad_len, dtype=torch.long, device=self.device)
                 acts = torch.cat([acts, acts_pad], dim=0)
-                
+
                 rews_pad = torch.zeros(pad_len, dtype=torch.float32, device=self.device)
                 rews = torch.cat([rews, rews_pad], dim=0)
-                
+
                 dones_pad = torch.ones(pad_len, dtype=torch.float32, device=self.device) # Pad with 'done'
                 dones = torch.cat([dones, dones_pad], dim=0)
-                
+
                 masks_pad = torch.zeros(pad_len, dtype=torch.float32, device=self.device)
                 masks = torch.cat([masks, masks_pad], dim=0)
-                
+
+                flat_idx = torch.cat([
+                    flat_idx,
+                    torch.full((pad_len,), -1, dtype=torch.long, device=self.device),
+                ], dim=0)
+
             batch_obs.append(obs)
             batch_acts.append(acts)
             batch_rews.append(rews)
             batch_dones.append(dones)
             batch_masks.append(masks)
             batch_hiddens.append(self.hiddens[sample_start])
+            batch_flat_idx.append(flat_idx)
 
         # Stack into tensors
         obs_tensor = torch.stack(batch_obs).float() / 255.0
@@ -177,7 +220,149 @@ class FastGPUEpisodicBuffer:
         masks_tensor = torch.stack(batch_masks)
         hiddens_tensor = torch.stack(batch_hiddens).float()  # (B, 2, hidden_dim)
 
-        return obs_tensor, acts_tensor, rews_tensor, dones_tensor, masks_tensor, hiddens_tensor
+        batch = (obs_tensor, acts_tensor, rews_tensor, dones_tensor, masks_tensor, hiddens_tensor)
+        if return_flat_idx:
+            return batch, torch.stack(batch_flat_idx)
+        return batch
+
+    def sample_batch(self, batch_size, seq_len=48, return_info=False, per_beta=0.4, burn_in=16):
+        """Uniform episode/window sampling (default), or — on a prioritized
+        buffer with return_info=True — PER anchor sampling: transitions are
+        drawn proportional to priority^alpha, each window is placed so its
+        anchor lands in the post-burn-in region, and importance-sampling
+        weights (N * P)^-beta (normalized by the batch max) correct the bias.
+
+        Returns the usual 6-tuple, or with return_info=True:
+        (*6-tuple, is_weights (B,), flat_idx (B, seq_len) with -1 at padding).
+        """
+        if self.prioritized and return_info:
+            return self._sample_batch_per(batch_size, seq_len, per_beta, burn_in)
+
+        if len(self.episode_metadata) < batch_size:
+            # Not enough data yet
+            ep_indices = random.choices(range(len(self.episode_metadata)), k=batch_size)
+        else:
+            ep_indices = random.sample(range(len(self.episode_metadata)), batch_size)
+
+        specs = []
+        for idx in ep_indices:
+            start_ptr, ep_len, next_obs_final = self.episode_metadata[idx]
+            if ep_len <= seq_len:
+                sample_start = start_ptr
+            else:
+                sample_start = start_ptr + random.randint(0, ep_len - seq_len)
+            specs.append((start_ptr, ep_len, next_obs_final, sample_start))
+
+        if return_info:
+            batch, flat_idx = self._gather_windows(specs, seq_len, return_flat_idx=True)
+            weights = torch.ones(batch_size, device=self.device)
+            return (*batch, weights, flat_idx)
+        return self._gather_windows(specs, seq_len)
+
+    def _sample_batch_per(self, batch_size, seq_len, per_beta, burn_in):
+        # 0-priority slots hold no live episode; keep them at exactly 0 even
+        # for per_alpha=0 (0**0 == 1 would resurrect them).
+        probs_raw = torch.where(
+            self.priorities > 0,
+            self.priorities ** self.per_alpha,
+            torch.zeros((), device=self.device),
+        )
+        probs = probs_raw / probs_raw.sum()
+        anchors = torch.multinomial(probs, batch_size, replacement=True)
+
+        specs = []
+        for a in anchors.tolist():
+            start_ptr = int(self.ep_start_map[a].item())
+            ep_len = int(self.ep_len_map[a].item())
+            _, next_obs_final = self._meta_by_start[start_ptr]
+            if ep_len <= seq_len:
+                sample_start = start_ptr
+            else:
+                # Place the window so the anchor falls inside it, preferring
+                # the post-burn-in region so its priority gets refreshed by
+                # the very update it was sampled for.
+                lo = max(start_ptr, a - seq_len + 1)
+                hi = min(a - burn_in, start_ptr + ep_len - seq_len)
+                if hi < lo:
+                    hi = lo  # anchor too close to the episode head
+                sample_start = random.randint(lo, hi)
+            specs.append((start_ptr, ep_len, next_obs_final, sample_start))
+
+        batch, flat_idx = self._gather_windows(specs, seq_len, return_flat_idx=True)
+
+        # Importance-sampling correction for the sampling bias.
+        n_valid = (self.priorities > 0).sum().clamp(min=1)
+        weights = (n_valid.float() * probs[anchors]) ** (-per_beta)
+        weights = weights / weights.max().clamp(min=1e-8)
+        return (*batch, weights, flat_idx)
+
+    def update_priorities(self, flat_idx, td_abs, masks=None):
+        """Write |TD error| priorities for the transitions just trained on.
+        flat_idx / td_abs: (B, L) aligned tensors (pass the post-burn-in
+        slices); masks zeroes out padded steps. Call after each update — this
+        replaces any full-sweep recomputation."""
+        if not self.prioritized:
+            return
+        valid = flat_idx >= 0
+        if masks is not None:
+            valid = valid & (masks > 0)
+        idx = flat_idx[valid]
+        if idx.numel() == 0:
+            return
+        pri = td_abs[valid].float() + self.per_eps
+        self.priorities[idx] = pri
+        self.max_priority = max(self.max_priority, float(pri.max().item()))
+
+    def refresh_priorities(self, q_net, q_target, gamma=0.99):
+        """Optional full sweep: recompute every stored transition's priority
+        via compute_td_errors (e.g. every N iterations to wash out staleness)."""
+        if not self.prioritized:
+            return
+        deltas = self.compute_td_errors(q_net, q_target, gamma=gamma)
+        for (start_ptr, ep_len, _), d in zip(self.episode_metadata, deltas):
+            self.priorities[start_ptr:start_ptr + ep_len] = (
+                torch.as_tensor(d, device=self.device) + self.per_eps
+            )
+
+    def record_td(self, flat_idx, td_abs, masks=None):
+        """Remember |TD error| for the transitions a training update just
+        touched (track_td store; does not affect sampling). Same alignment
+        contract as update_priorities: pass the post-burn-in slices."""
+        if not self.track_td:
+            return
+        valid = flat_idx >= 0
+        if masks is not None:
+            valid = valid & (masks > 0)
+        idx = flat_idx[valid]
+        if idx.numel() == 0:
+            return
+        self.td_store[idx] = td_abs[valid].float()
+
+    def store_td_sweep(self, deltas):
+        """Seed the track_td store from a compute_td_errors sweep result."""
+        if not self.track_td:
+            return
+        for (start_ptr, ep_len, _), d in zip(self.episode_metadata, deltas):
+            self.td_store[start_ptr:start_ptr + ep_len] = torch.as_tensor(
+                d, device=self.device
+            )
+
+    def td_errors_per_episode(self, fill=None):
+        """Read the track_td store as per-episode |TD error| arrays (insertion
+        order, matching compute_td_errors). Never-measured transitions (-1)
+        are replaced with `fill`, defaulting to the mean of measured values
+        (neutral weight), or 1.0 if nothing has been measured yet."""
+        if not self.track_td:
+            return []
+        if fill is None:
+            known = self.td_store[self.td_store >= 0]
+            fill = float(known.mean().item()) if known.numel() > 0 else 1.0
+        result = []
+        for start_ptr, ep_len, _ in self.episode_metadata:
+            d = self.td_store[start_ptr:start_ptr + ep_len].clone()
+            d[d < 0] = fill
+            result.append(d.cpu().numpy())
+        return result
 
     @torch.no_grad()
     def refresh_hidden_states(self, q_net, cnn_chunk=2048):
