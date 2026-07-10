@@ -218,6 +218,68 @@ class FastGPUEpisodicBuffer:
         if was_training:
             q_net.train()
 
+    @torch.no_grad()
+    def compute_td_errors(self, q_net, q_target, gamma=0.99, cnn_chunk=2048):
+        """|1-step double-DQN TD error| for every stored transition, replayed
+        from zero hiddens (like refresh_hidden_states). Returns a list of 1-D
+        float32 numpy arrays, one per episode in insertion order. Used to
+        prioritize demo restart points."""
+        if not self.episode_metadata:
+            return []
+        was_training = q_net.training
+        q_net.eval()
+        q_target.eval()
+
+        metas = self.episode_metadata
+        n = len(metas)
+        # +1 column for the final next_obs of each episode
+        max_len = max(m[1] for m in metas) + 1
+        lens = torch.tensor([m[1] for m in metas], device=self.device)
+        action_dim = q_net.fc.out_features - 1
+
+        q_all = {}
+        for name, net in (("online", q_net), ("target", q_target)):
+            feats = torch.zeros((n, max_len, 512), device=self.device)
+            for i, (start, ep_len, next_obs_final) in enumerate(metas):
+                obs = self.obs[start:start + ep_len].float() / 255.0
+                for j in range(0, ep_len, cnn_chunk):
+                    end = min(j + cnn_chunk, ep_len)
+                    feats[i, j:end] = net.encoder(obs[j:end])
+                nof = torch.as_tensor(
+                    np.ascontiguousarray(next_obs_final),
+                    dtype=torch.float32, device=self.device) / 255.0
+                feats[i, ep_len] = net.encoder(nof.unsqueeze(0))[0]
+
+            q = torch.zeros((n, max_len, action_dim), device=self.device)
+            h = torch.zeros((1, n, self.hidden_dim), device=self.device)
+            c = torch.zeros((1, n, self.hidden_dim), device=self.device)
+            for t in range(max_len):
+                if not (lens + 1 > t).any():
+                    break
+                out, (h, c) = net.lstm(feats[:, t:t + 1, :], (h, c))
+                head = net.fc(out[:, 0])
+                adv = head[:, :-1]
+                adv = adv - adv.mean(dim=-1, keepdim=True)
+                q[:, t] = head[:, -1:] + adv
+            q_all[name] = q
+            del feats
+
+        result = []
+        for i, (start, ep_len, _) in enumerate(metas):
+            a = self.actions[start:start + ep_len]
+            r = self.rewards[start:start + ep_len]
+            d = self.dones[start:start + ep_len]
+            q_sa = q_all["online"][i, :ep_len].gather(1, a.unsqueeze(1)).squeeze(1)
+            a_star = q_all["online"][i, 1:ep_len + 1].argmax(dim=-1)
+            q_next = q_all["target"][i, 1:ep_len + 1].gather(
+                1, a_star.unsqueeze(1)).squeeze(1)
+            delta = r + gamma * (1.0 - d) * q_next - q_sa
+            result.append(delta.abs().float().cpu().numpy())
+
+        if was_training:
+            q_net.train()
+        return result
+
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = collections.deque(maxlen=capacity)

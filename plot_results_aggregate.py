@@ -21,8 +21,15 @@ def aggregate_and_plot(experiment_dir, output_dir):
 
     all_data = []
     for f_path in metrics_files:
-        with open(f_path, "r") as f:
-            all_data.append(json.load(f))
+        try:
+            with open(f_path, "r") as f:
+                all_data.append(json.load(f))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Warning: skipping invalid metrics file {f_path}: {e}")
+
+    if not all_data:
+        print(f"No valid metrics files found in {experiment_dir}")
+        return
 
     num_seeds = len(all_data)
     iters = set()
@@ -75,35 +82,45 @@ def aggregate_and_plot(experiment_dir, output_dir):
                 seed_scores.append(np.nan)
                 seed_likeness.append(np.nan)
                 continue
-            with open(m_path, "r") as f:
-                d = json.load(f)
-                # Total Frames
-                f_counts = d["frames"]
-                total_f = sum(f_counts.values())
-                seed_interactions.append(total_f)
+            try:
+                with open(m_path, "r") as f:
+                    d = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"Warning: skipping invalid metrics file {m_path}: {e}")
+                seed_interactions.append(np.nan)
+                seed_wallclock.append(np.nan)
+                seed_human_time.append(np.nan)
+                seed_scores.append(np.nan)
+                seed_likeness.append(np.nan)
+                continue
 
-                # Total Wallclock
-                timers = d["timers"]
-                total_t = sum(
-                    v for k, v in timers.items() if k != "training_throughput_fps"
-                )
-                seed_wallclock.append(total_t)
+            # Total Frames
+            f_counts = d["frames"]
+            total_f = sum(f_counts.values())
+            seed_interactions.append(total_f)
 
-                # Human Effort
-                h_t = (
-                    timers.get("human_overriding", 0)
-                    + timers.get("human_annotating", 0)
-                    + timers.get("human_reviewing", 0)
-                    + timers.get("expert_preload_effort", 0)
-                )
-                seed_human_time.append(h_t)
+            # Total Wallclock
+            timers = d["timers"]
+            total_t = sum(
+                v for k, v in timers.items() if k != "training_throughput_fps"
+            )
+            seed_wallclock.append(total_t)
 
-                # Score
-                eval_last = d["evaluations"][-1]
-                seed_scores.append(eval_last["return_mean"])
-                # Handle None in bc_loss
-                bcl = eval_last.get("bc_loss", 0.0)
-                seed_likeness.append(bcl if bcl is not None else 0.0)
+            # Human Effort
+            h_t = (
+                timers.get("human_overriding", 0)
+                + timers.get("human_annotating", 0)
+                + timers.get("human_reviewing", 0)
+                + timers.get("expert_preload_effort", 0)
+            )
+            seed_human_time.append(h_t)
+
+            # Score
+            eval_last = d["evaluations"][-1]
+            seed_scores.append(eval_last["return_mean"])
+            # Handle None in bc_loss
+            bcl = eval_last.get("bc_loss", 0.0)
+            seed_likeness.append(bcl if bcl is not None else 0.0)
 
         all_seeds_interactions.append(seed_interactions)
         all_seeds_wallclock.append(seed_wallclock)
@@ -151,7 +168,15 @@ def aggregate_and_plot(experiment_dir, output_dir):
 
         if interp_y:
             mean_y = np.nanmean(interp_y, axis=0)
+            smoothed = np.convolve(mean_y, np.ones(10) / 10, mode="same")
             ax.plot(common_x, mean_y, color=color, linewidth=3, label=label)
+            ax.plot(
+                common_x,
+                smoothed,
+                color=(0.2, 0.6, 0.4),
+                linewidth=3,
+                label=label + " (smoothed)",
+            )
 
     # --- Plot 1: Interactions vs Eval Score ---
     plt.figure(figsize=(10, 6))

@@ -57,7 +57,9 @@ class CrafterGymnasiumWrapper:
 
 # --- Sub-functions ---
 def pre_load_episodic_data(args, buffers, metrics):
-    """Loads expert episodic demonstrations straight into VRAM."""
+    """Loads expert episodic demonstrations straight into VRAM.
+    Returns the loaded dataset (list of episodes, buffer insertion order) so
+    callers can build a DemoStartSampler from it, or None."""
     if args.preload_expert_data and os.path.exists(args.preload_expert_data):
         with open(args.preload_expert_data, "rb") as f:
             expert_dataset = pickle.load(f)
@@ -95,10 +97,12 @@ def pre_load_episodic_data(args, buffers, metrics):
         )
         metrics.log_frames(loaded_count, source="expert_preload")
         metrics.timers["expert_preload_effort"] = total_duration
+        return expert_dataset
     elif args.preload_expert_data:
         print(
             f"[Preload] Warning: Expert data file not found at {args.preload_expert_data}"
         )
+    return None
 
 
 def run_rl_collection(agent, env, buffers, num_frames, metrics, min_episodes=0):
@@ -199,21 +203,31 @@ def run_rl_collection(agent, env, buffers, num_frames, metrics, min_episodes=0):
     return episodes
 
 
-def run_rl_collection_parallel(agent, penvs, buffers, num_frames, metrics, min_episodes=0):
+def run_rl_collection_parallel(agent, penvs, buffers, num_frames, metrics, min_episodes=0,
+                               demo_sampler=None, demo_start_envs=0):
     """Parallel version of run_rl_collection: envs step in worker processes,
     one batched GPU forward drives all of them. Stores only whole episodes.
     Once the frame budget is met, in-flight episodes run to completion but
-    finished envs are not reset."""
+    finished envs are not reset.
+
+    With demo_start_envs > 0, the first demo_start_envs envs reset from
+    mid-demo states sampled by demo_sampler instead of fresh worlds."""
     metrics.start_timer("rl_experience")
     n = penvs.num_envs
     episodes = []
     total_frames = 0
 
+    def start_payload(i):
+        if demo_sampler is not None and i < demo_start_envs:
+            return demo_sampler.sample()
+        return None
+
     current_episodes = buffers["online"].current_size
     effective_min = min_episodes if current_episodes < min_episodes else 0
-    print(f"Collecting {num_frames} RL frames across {n} parallel envs...")
+    print(f"Collecting {num_frames} RL frames across {n} parallel envs"
+          + (f" ({demo_start_envs} from demo states)..." if demo_start_envs else "..."))
 
-    obs_list = penvs.reset_all()
+    obs_list = penvs.reset_all({i: start_payload(i) for i in range(n)})
     agent.reset_hidden()
     ep_transitions = [[] for _ in range(n)]
     ep_rewards = [0.0] * n
@@ -266,7 +280,7 @@ def run_rl_collection_parallel(agent, penvs, buffers, num_frames, metrics, min_e
                 ep_rewards[i] = 0.0
                 running.discard(i)
                 if total_frames < num_frames or len(episodes) < effective_min:
-                    penvs.reset_async(i)
+                    penvs.reset_async(i, payload=start_payload(i))
                     resetting.add(i)
 
     metrics.stop_timer("rl_experience")
@@ -315,11 +329,14 @@ def unified_train_step(args, agent, buffers, metrics):
 
     for epoch in range(args.num_unified_epochs):
 
+        # R2D3 demo TD stays at a 1/16 ratio (bootstrapping at OOD demo states
+        # is the risky term), but the supervised BC term is safe to run every
+        # epoch — so with --bc/--awbc demos are sampled every epoch and only
+        # the demo TD step is gated.
+        demo_td_epoch = not args.r2d3 or epoch % 16 == 0
         exp_batch = None
         if has_offline:
-            # R2D3-style demo ratio: demos are plain replay sampled once every
-            # 16 epochs instead of a per-epoch CQL anchor.
-            if not args.r2d3 or epoch % 16 == 0:
+            if demo_td_epoch or args.bc or args.awbc:
                 exp_batch = buffers["expert"].sample_batch(batch_size, seq_len=seq_len)
                 total_frames_processed += batch_size * (seq_len + 1)
 
@@ -331,7 +348,7 @@ def unified_train_step(args, agent, buffers, metrics):
         # 1. TD / POLICY UPDATES (CQL or Online RL)
         cached_h_q = None
         cached_v = None
-        if (args.offline_rl or args.r2d3) and exp_batch:
+        if (args.offline_rl or args.r2d3) and exp_batch and demo_td_epoch:
             metrics.start_timer("agent_updating_rl")
             expert_n = (
                 args.n_step_expert if args.n_step_expert is not None else args.n_step
@@ -368,8 +385,8 @@ def unified_train_step(args, agent, buffers, metrics):
                 agent.update_value(*on_batch, burn_in=burn_in, train=True)
                 metrics.stop_timer("agent_updating_value")
 
-        # 3. SUPERVISED / BC UPDATES
-        if (args.awbc or args.bc) and exp_batch:
+        # 3. SUPERVISED / BC UPDATES (skipped once bc_weight anneals to 0)
+        if (args.awbc or args.bc) and exp_batch and agent.bc_weight > 0:
             metrics.start_timer("agent_updating_bc")
             advantages = None
             if args.awbc and cached_v is not None:
@@ -514,6 +531,10 @@ def main():
                         help="n-step TD returns for ONLINE batches. Uncorrected n-step is "
                              "biased by epsilon-greedy/stale replay; >1 sped up early "
                              "learning but plateaued low in crafter")
+    parser.add_argument("--resume_warmup_frames", type=int, default=20000,
+                        help="On --resume with online RL: frames of update-free collection "
+                             "to refill the empty online buffer with on-policy data before "
+                             "training restarts (0 disables)")
     parser.add_argument("--n_step_expert", type=int, default=None,
                         help="n-step TD returns for EXPERT batches (default: same as "
                              "--n_step). Demo returns carry no exploration noise, so "
@@ -524,6 +545,23 @@ def main():
                         help="CQL weight after annealing; default = no annealing")
     parser.add_argument("--cql_alpha_decay_frames", type=int, default=500000,
                         help="RL frames over which cql_alpha anneals to cql_alpha_end")
+    parser.add_argument("--bc_weight", type=float, default=1.0,
+                        help="Demo imitation (BC) loss weight at the start of training")
+    parser.add_argument("--bc_weight_end", type=float, default=None,
+                        help="BC weight after annealing; default = no annealing. Use a "
+                             "floor > 0 to pin likeness after the imitation jumpstart")
+    parser.add_argument("--bc_weight_decay_frames", type=int, default=500000,
+                        help="RL frames over which bc_weight anneals to bc_weight_end")
+    parser.add_argument("--demo_start_envs", type=int, default=0,
+                        help="Number of parallel envs (the first N) that reset from "
+                             "mid-demo states instead of fresh worlds (Backplay-style; "
+                             "needs --preload_expert_data and parallel collection)")
+    parser.add_argument("--demo_start_priority", type=float, default=0.6,
+                        help="Priority exponent for demo restart sampling toward states "
+                             "before large TD error; 0 = uniform over restart points")
+    parser.add_argument("--demo_start_lookahead", type=int, default=50,
+                        help="TD-error lookahead window (demo steps) when scoring a "
+                             "restart point")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -623,7 +661,20 @@ def main():
         env.close()
         return
 
-    pre_load_episodic_data(args, buffers, metrics)
+    expert_dataset = pre_load_episodic_data(args, buffers, metrics)
+
+    demo_sampler = None
+    if args.demo_start_envs > 0:
+        assert expert_dataset, "--demo_start_envs needs --preload_expert_data"
+        from demo_starts import DemoStartSampler
+
+        demo_sampler = DemoStartSampler(
+            expert_dataset,
+            alpha=args.demo_start_priority,
+            lookahead=args.demo_start_lookahead,
+            seed=args.seed,
+        )
+    del expert_dataset  # buffer + sampler hold what they need
 
     router = LLMRouter(buffers["curriculum"], buffers["ssl"], env_name=args.env)
 
@@ -633,6 +684,32 @@ def main():
     if args.env == "crafter" and args.num_envs > 1 and not args.intervention and args.num_rl_frames > 0:
         from parallel_envs import ParallelCrafterEnvs
         penvs = ParallelCrafterEnvs(args.num_envs)
+
+    # Resuming restarts the online buffer empty; training 30 epochs against a
+    # handful of fresh episodes can wreck a good policy. Refill it with
+    # update-free on-policy collection from the loaded weights first.
+    if (
+        args.resume
+        and start_iteration > 0
+        and args.online_rl
+        and args.num_rl_frames > 0
+        and args.resume_warmup_frames > 0
+    ):
+        warmup_decay = min(1.0, (start_iteration * args.num_rl_frames) / 50000.0)
+        agent.epsilon = 0.25 - warmup_decay * (0.25 - 0.05)
+        print(
+            f"[Resume] Warmup: collecting {args.resume_warmup_frames} frames "
+            f"(no updates, epsilon {agent.epsilon:.3f})..."
+        )
+        if penvs is not None:
+            run_rl_collection_parallel(
+                agent, penvs, buffers, args.resume_warmup_frames, metrics, min_episodes=8,
+                demo_sampler=demo_sampler, demo_start_envs=args.demo_start_envs
+            )
+        else:
+            run_rl_collection(
+                agent, env, buffers, args.resume_warmup_frames, metrics, min_episodes=8
+            )
 
     for iteration in range(start_iteration, args.total_iterations):
         print(f"\n=== Iteration {iteration} ===")
@@ -663,6 +740,31 @@ def main():
         if args.offline_rl:
             print(f"    Current CQL alpha: {agent.cql_alpha:.4f}")
 
+        # BC weight annealing: imitation jumpstart early, weaker (or floored)
+        # anchor late. Driven by cumulative RL frames so it survives --resume.
+        if args.bc_weight_end is not None:
+            bcw_frac = min(
+                1.0, metrics.frames["rl"] / max(args.bc_weight_decay_frames, 1)
+            )
+            agent.bc_weight = args.bc_weight + bcw_frac * (
+                args.bc_weight_end - args.bc_weight
+            )
+        else:
+            agent.bc_weight = args.bc_weight
+        if args.bc or args.awbc:
+            print(f"    Current BC weight: {agent.bc_weight:.4f}")
+
+        # Re-score demo restart points against the current value function:
+        # priority goes to starts just before large TD errors on the demos.
+        if demo_sampler is not None and args.demo_start_priority > 0:
+            metrics.timers.setdefault("demo_priority", 0.0)
+            metrics.start_timer("demo_priority")
+            td_errs = buffers["expert"].compute_td_errors(
+                agent.q_net, agent.q_target, gamma=agent.gamma
+            )
+            demo_sampler.set_td_errors(td_errs)
+            metrics.stop_timer("demo_priority")
+
         episodes = []
         if args.num_rl_frames > 0:
             # If online_rl is enabled and we don't have enough episodes yet,
@@ -677,6 +779,8 @@ def main():
                     num_frames=args.num_rl_frames,
                     metrics=metrics,
                     min_episodes=min_episodes,
+                    demo_sampler=demo_sampler,
+                    demo_start_envs=args.demo_start_envs,
                 )
             else:
                 episodes = run_rl_collection(

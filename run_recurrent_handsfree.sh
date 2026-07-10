@@ -121,38 +121,114 @@ echo "=========================================================="
 # 7c anneals the CQL anchor 1.0 -> 0 over the first 500k frames: imitation
 #    jumpstart + likeness early, free policy late. Matched 1-step so it
 #    compares directly against the finished online_offline / online_dqn runs.
+# for seed in {10..12}
+# do
+#     # echo ""
+#     # echo "[Exp 7a] Online DQN + 5-step returns (Seed $seed)  [RETIRED]"
+#     # python3 recurrent_main.py --env $ENV --online_rl --n_step 5 \
+#     #     --num_rl_frames $RL_FRAMES \
+#     #     --num_unified_epochs $EPOCHS_ONLINE \
+#     #     --total_iterations $ITERATIONS_ONLINE \
+#     #     --num_envs 8 \
+#     #     --preload_expert_data "" \
+#     #     --experiment_name "online_dqn_n5" --seed $seed
+
+#     echo ""
+#     echo "[Exp 7b] R2D3 + 5-step returns on demos only (Seed $seed)  [DONE: ~6.9, = online_dqn, CE at chance]"
+#     python3 recurrent_main.py --env $ENV --online_rl --r2d3 --n_step_expert 5 \
+#         --num_rl_frames $RL_FRAMES \
+#         --num_unified_epochs $EPOCHS_ONLINE \
+#         --total_iterations $ITERATIONS_ONLINE \
+#         --num_envs 8 \
+#         --preload_expert_data $CLEANED_EXPERT_DATA \
+#         --experiment_name "r2d3_ne5" --seed $seed
+
+#     echo ""
+#     echo "[Exp 7c] Online+Offline, annealed CQL anchor (Seed $seed)  [DONE: plateaus 5.4-5.5 even at 2.3M frames]"
+#     python3 recurrent_main.py --env $ENV --online_rl --offline_rl \
+#         --cql_alpha 1.0 --cql_alpha_end 0.0 --cql_alpha_decay_frames 500000 \
+#         --num_rl_frames $RL_FRAMES \
+#         --num_unified_epochs $EPOCHS_ONLINE \
+#         --total_iterations $ITERATIONS_ONLINE \
+#         --num_envs 8 \
+#         --preload_expert_data $CLEANED_EXPERT_DATA \
+#         --experiment_name "online_offline_anneal" --seed $seed
+# done
+
+# --- EXPERIMENT 8: imitation term on demos + free online TD ---
+# Gap analysis (2026-07-09): agents stall at wood tier — collect_stone ~0.48
+# but make_stone_pickaxe <=0.01 for 1.5M frames (expert: 1.00/1.00), and die
+# ~190 steps vs expert median 559. Q-only demo channels transfer nothing
+# (r2d3 CE = chance); a global CQL anchor transfers likeness but caps return.
+# Untested quadrant: supervised imitation on demos EVERY epoch + unconstrained
+# online TD, imitation annealed 1.0 -> 0.1 floor over 500k frames (floor pins
+# likeness; --bc_epsilon 0.02 keeps BC targets sharp, decoupled from the
+# exploration eps 0.05 floor).
+# 8a: BC + online TD only — no demo TD anywhere (cleanest test of the term).
+# 8b: DQfD-lite — adds the 1/16 5-step demo TD channel from 7b on top; with
+#     --bc the demo batch now samples every epoch and only demo TD is gated.
+# for seed in {10..12}
+# do
+#     echo ""
+#     echo "[Exp 8a] Online DQN + annealed demo BC (Seed $seed)  [DONE: 7.1 = online-only; stone pickaxes n.s.]"
+#     python3 recurrent_main.py --env $ENV --online_rl --bc \
+#         --bc_epsilon 0.02 \
+#         --bc_weight 1.0 --bc_weight_end 0.1 --bc_weight_decay_frames 500000 \
+#         --num_rl_frames $RL_FRAMES \
+#         --num_unified_epochs $EPOCHS_ONLINE \
+#         --total_iterations $ITERATIONS_ONLINE \
+#         --num_envs 8 \
+#         --preload_expert_data $CLEANED_EXPERT_DATA \
+#         --experiment_name "online_bc_anneal" --seed $seed
+
+#     echo ""
+#     echo "[Exp 8b] DQfD-lite (Seed $seed)  [DONE: ~8, 18 stone pickaxes — best arm, reward gain still small]"
+#     python3 recurrent_main.py --env $ENV --online_rl --bc --r2d3 --n_step_expert 5 \
+#         --bc_epsilon 0.02 \
+#         --bc_weight 1.0 --bc_weight_end 0.1 --bc_weight_decay_frames 500000 \
+#         --num_rl_frames $RL_FRAMES \
+#         --num_unified_epochs $EPOCHS_ONLINE \
+#         --total_iterations $ITERATIONS_ONLINE \
+#         --num_envs 8 \
+#         --preload_expert_data $CLEANED_EXPERT_DATA \
+#         --experiment_name "dqfd_lite" --seed $seed
+# done
+
+# --- EXPERIMENT 9: demo-state episode starts (Backplay) ---
+# Change the START DISTRIBUTION instead of the loss: the first 2 of 8 envs
+# (25%) reset from mid-demo states (world rebuilt from info['semantic'] +
+# inventory/achievements/player_pos; only NEW achievements pay reward), so
+# online TD learns at stone/iron-tier states on the agent's own policy.
+# Restart points are re-scored each iteration against the current nets and
+# sampled with priority toward states just BEFORE large TD error on the demo
+# (--demo_start_priority 0.6, lookahead 50, 20% uniform floor).
+# 9a: online-only from the new start distribution (baseline for 9b).
+# 9b: dqfd_lite (Exp 8b) + demo starts.
 for seed in {10..12}
 do
-    # echo ""
-    # echo "[Exp 7a] Online DQN + 5-step returns (Seed $seed)  [RETIRED]"
-    # python3 recurrent_main.py --env $ENV --online_rl --n_step 5 \
-    #     --num_rl_frames $RL_FRAMES \
-    #     --num_unified_epochs $EPOCHS_ONLINE \
-    #     --total_iterations $ITERATIONS_ONLINE \
-    #     --num_envs 8 \
-    #     --preload_expert_data "" \
-    #     --experiment_name "online_dqn_n5" --seed $seed
-
     echo ""
-    echo "[Exp 7b] R2D3 + 5-step returns on demos only (Seed $seed)"
-    python3 recurrent_main.py --env $ENV --online_rl --r2d3 --n_step_expert 5 \
+    echo "[Exp 9a] Online DQN + demo-state starts (Seed $seed)"
+    python3 recurrent_main.py --env $ENV --online_rl \
+        --demo_start_envs 2 --demo_start_priority 0.6 \
         --num_rl_frames $RL_FRAMES \
         --num_unified_epochs $EPOCHS_ONLINE \
         --total_iterations $ITERATIONS_ONLINE \
         --num_envs 8 \
         --preload_expert_data $CLEANED_EXPERT_DATA \
-        --experiment_name "r2d3_ne5" --seed $seed
+        --experiment_name "online_demostart" --seed $seed
 
     echo ""
-    echo "[Exp 7c] Online+Offline, annealed CQL anchor (Seed $seed)"
-    python3 recurrent_main.py --env $ENV --online_rl --offline_rl \
-        --cql_alpha 1.0 --cql_alpha_end 0.0 --cql_alpha_decay_frames 500000 \
+    echo "[Exp 9b] DQfD-lite + demo-state starts (Seed $seed)"
+    python3 recurrent_main.py --env $ENV --online_rl --bc --r2d3 --n_step_expert 5 \
+        --bc_epsilon 0.02 \
+        --bc_weight 1.0 --bc_weight_end 0.1 --bc_weight_decay_frames 500000 \
+        --demo_start_envs 2 --demo_start_priority 0.6 \
         --num_rl_frames $RL_FRAMES \
         --num_unified_epochs $EPOCHS_ONLINE \
         --total_iterations $ITERATIONS_ONLINE \
         --num_envs 8 \
         --preload_expert_data $CLEANED_EXPERT_DATA \
-        --experiment_name "online_offline_anneal" --seed $seed
+        --experiment_name "dqfd_demostart" --seed $seed
 done
 
 # --- RESUME EXAMPLE: continue a finished run that is still trending up ---

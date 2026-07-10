@@ -115,6 +115,9 @@ class RCQLAgent(Agent):
         self.gamma = 0.99
         self.tau = 0.005
         self.cql_alpha = 1.0
+        # Weight on the demo imitation (BC) loss; annealable from the runner
+        # like cql_alpha. Scales the gradient only — reported loss stays raw.
+        self.bc_weight = 1.0
 
         self.q_hidden = None
         self.last_q = None
@@ -439,7 +442,7 @@ class RCQLAgent(Agent):
 
                 self.q_optimizer.zero_grad()
                 if loss.requires_grad:
-                    loss.backward()
+                    (self.bc_weight * loss).backward()
                     torch.nn.utils.clip_grad_norm_(
                         self.q_net.parameters(), max_norm=1.0
                     )
@@ -471,7 +474,7 @@ class RCQLAgent(Agent):
 
                 self.q_optimizer.zero_grad()
                 if loss.requires_grad:
-                    loss.backward()
+                    (self.bc_weight * loss).backward()
                     torch.nn.utils.clip_grad_norm_(
                         self.q_net.parameters(), max_norm=1.0
                     )

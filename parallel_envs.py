@@ -23,7 +23,13 @@ def _worker(remote):
             }
             remote.send((obs, reward, done, info_lite))
         elif cmd == "reset":
-            obs = env.reset()
+            if data is None:
+                obs = env.reset()
+            else:
+                # Demo-state restart: data is a DemoStartSampler payload.
+                from demo_starts import restore_env_from_info
+
+                obs = restore_env_from_info(env, data)
             remote.send(obs)
         elif cmd == "close":
             remote.close()
@@ -44,19 +50,23 @@ class ParallelCrafterEnvs:
         for wr in work_remotes:
             wr.close()
 
-    def reset_all(self):
-        for r in self.remotes:
-            r.send(("reset", None))
+    def reset_all(self, payloads=None):
+        """payloads: optional {env_idx: demo-start payload}; envs not in the
+        dict (or with a None value) do a normal fresh-world reset."""
+        payloads = payloads or {}
+        for i, r in enumerate(self.remotes):
+            r.send(("reset", payloads.get(i)))
         return [r.recv() for r in self.remotes]
 
-    def reset_one(self, i):
-        self.remotes[i].send(("reset", None))
+    def reset_one(self, i, payload=None):
+        self.remotes[i].send(("reset", payload))
         return self.remotes[i].recv()
 
-    def reset_async(self, i):
+    def reset_async(self, i, payload=None):
         """Fire a reset without waiting; crafter world generation takes ~100ms+,
-        so the other envs keep stepping while this one regenerates."""
-        self.remotes[i].send(("reset", None))
+        so the other envs keep stepping while this one regenerates. An optional
+        payload restarts the env from a demo state instead of a fresh world."""
+        self.remotes[i].send(("reset", payload))
 
     def poll_reset(self, i):
         """Returns the new obs if the async reset finished, else None."""
