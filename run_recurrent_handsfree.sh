@@ -21,8 +21,8 @@ CLEANED_EXPERT_DATA="expert_demonstrations_crafter_cleaned.pkl"
 # 3 epochs x 64 seqs x 48 steps ~= 9.2k samples per 2k collected frames (~4.6x).
 ITERATIONS_BC=15
 EPOCHS_BC=100
-ITERATIONS_ONLINE=400
-EPOCHS_ONLINE=30
+ITERATIONS_ONLINE=600
+EPOCHS_ONLINE=40
 RL_FRAMES=2000
 
 echo "=========================================================="
@@ -204,8 +204,19 @@ echo "=========================================================="
 # (--demo_start_priority 0.6, lookahead 50, 20% uniform floor).
 # 9a: online-only from the new start distribution (baseline for 9b).
 # 9b: dqfd_lite (Exp 8b) + demo starts.
-for seed in {10..12}
+for seed in {42..44}
 do
+    echo "[Exp 9a] Online DQN (Seed $seed)"
+    python3 recurrent_main.py --env $ENV --online_rl \
+        --demo_start_envs 2 --demo_start_priority 0.6 \
+        --num_rl_frames $RL_FRAMES \
+        --num_unified_epochs $EPOCHS_ONLINE \
+        --total_iterations $ITERATIONS_ONLINE \
+        --num_envs 8 \
+        --preload_expert_data $CLEANED_EXPERT_DATA \
+        --experiment_name "online" --seed $seed
+
+    echo ""
     echo ""
     echo "[Exp 9a] Online DQN + demo-state starts (Seed $seed)"
     python3 recurrent_main.py --env $ENV --online_rl \

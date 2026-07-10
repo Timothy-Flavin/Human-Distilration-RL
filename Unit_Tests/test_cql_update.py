@@ -14,7 +14,7 @@ class TestCQLUpdate(unittest.TestCase):
     def test_cql_target_terminated_vs_truncated(self):
         # Mock target Q values: Q(s, a) = 10 for all a
         self.agent.q_target = MagicMock()
-        self.agent.q_target.side_effect = lambda x: torch.ones(x.shape[0], self.action_dim) * 10.0
+        self.agent.q_target.side_effect = lambda x: torch.ones(x.shape[0], self.action_dim) # * 10.0
         
         obs = np.random.rand(1, self.obs_dim).astype(np.float32)
         next_obs = np.random.rand(1, self.obs_dim).astype(np.float32)
