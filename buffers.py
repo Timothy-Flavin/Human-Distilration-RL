@@ -9,7 +9,7 @@ class FastGPUEpisodicBuffer:
     Eliminates the (max_episodes, max_ep_len) zero-padding.
     """
     def __init__(self, max_total_transitions=200000, device="cuda", obs_shape=(3, 64, 64), hidden_dim=512,
-                 prioritized=False, per_alpha=0.6, per_eps=1e-3, track_td=False):
+                 prioritized=False, per_alpha=0.6, per_eps=1e-3, per_burn_in=16, track_td=False):
         self.max_transitions = max_total_transitions
         self.device = device
         self.obs_shape = obs_shape
@@ -34,12 +34,20 @@ class FastGPUEpisodicBuffer:
         self.current_size_episodes = 0
 
         # --- Prioritized replay (per-transition) ---
-        # priorities holds raw |TD error| + eps; 0 marks slots with no live
-        # episode (never sampled). New episodes enter at max_priority so they
-        # are seen at least once before their real TD error takes over.
+        # priorities holds raw |TD error| + eps; 0 marks slots that must never
+        # anchor a sample: dead slots (no live episode) AND the first
+        # per_burn_in steps of every episode. Windows can't start before the
+        # episode head, so those head steps are only ever burn-in context —
+        # they can never sit in a window's active loss region, so their
+        # priority would never be refreshed by update_priorities and they'd
+        # stay pinned at insertion max_priority forever, starving the rest of
+        # the buffer of anchors. New episodes' trainable steps enter at
+        # max_priority so they are seen at least once before their real TD
+        # error takes over.
         self.prioritized = prioritized
         self.per_alpha = per_alpha
         self.per_eps = per_eps
+        self.per_burn_in = per_burn_in
         self.max_priority = 1.0
         if prioritized:
             self.priorities = torch.zeros(max_total_transitions, dtype=torch.float32, device=device)
@@ -141,6 +149,9 @@ class FastGPUEpisodicBuffer:
         self.episode_metadata.append((start_ptr, ep_len, next_obs_final))
         if self.prioritized:
             self.priorities[start_ptr:end_ptr] = self.max_priority
+            # Head steps can never be trained on (see __init__): keep them at
+            # 0 so they never anchor. They still serve as burn-in context.
+            self.priorities[start_ptr:start_ptr + min(self.per_burn_in, ep_len)] = 0.0
             self.ep_start_map[start_ptr:end_ptr] = start_ptr
             self.ep_len_map[start_ptr:end_ptr] = ep_len
             self._meta_by_start[start_ptr] = (ep_len, next_obs_final)
@@ -267,6 +278,10 @@ class FastGPUEpisodicBuffer:
             self.priorities ** self.per_alpha,
             torch.zeros((), device=self.device),
         )
+        if probs_raw.sum() <= 0:
+            # Degenerate case (e.g. only episodes shorter than per_burn_in):
+            # anchor uniformly over live slots instead.
+            probs_raw = (self.ep_start_map >= 0).float()
         probs = probs_raw / probs_raw.sum()
         anchors = torch.multinomial(probs, batch_size, replacement=True)
 
@@ -323,6 +338,8 @@ class FastGPUEpisodicBuffer:
             self.priorities[start_ptr:start_ptr + ep_len] = (
                 torch.as_tensor(d, device=self.device) + self.per_eps
             )
+            # Untrainable head steps stay non-anchoring (see __init__)
+            self.priorities[start_ptr:start_ptr + min(self.per_burn_in, ep_len)] = 0.0
 
     def record_td(self, flat_idx, td_abs, masks=None):
         """Remember |TD error| for the transitions a training update just

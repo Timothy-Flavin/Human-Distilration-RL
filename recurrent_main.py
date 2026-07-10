@@ -581,8 +581,9 @@ def main():
                              "TD errors already computed during demo TD training "
                              "updates (0 = sweep every iteration, the old behavior)")
     parser.add_argument("--encoder", type=str, default="impala",
-                        choices=["impala", "nature"],
-                        help="CNN encoder: IMPALA ResNet (default) or the old Nature "
+                        choices=["impala", "impala_elu", "nature"],
+                        help="CNN encoder: IMPALA ResNet (default), impala_elu "
+                             "(ELU activations, ablation), or the old Nature "
                              "CNN (required to load pre-impala checkpoints)")
     parser.add_argument("--no_per", action="store_true",
                         help="Disable prioritized replay on the online buffer "

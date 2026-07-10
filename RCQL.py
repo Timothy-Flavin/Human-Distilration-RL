@@ -58,28 +58,29 @@ class NatureCNNEncoder(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, act=F.relu):
         super().__init__()
+        self.act = act
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
-        out = F.relu(x)
+        out = self.act(x)
         out = self.conv1(out)
-        out = F.relu(out)
+        out = self.act(out)
         out = self.conv2(out)
         return x + out
 
 
 class ImpalaBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, act=F.relu):
         super().__init__()
         self.conv = nn.Conv2d(
             in_channels, out_channels, kernel_size=3, stride=1, padding=1
         )
         self.max_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.res1 = ResidualBlock(out_channels)
-        self.res2 = ResidualBlock(out_channels)
+        self.res1 = ResidualBlock(out_channels, act=act)
+        self.res2 = ResidualBlock(out_channels, act=act)
 
     def forward(self, x):
         x = self.conv(x)
@@ -90,12 +91,16 @@ class ImpalaBlock(nn.Module):
 
 
 class ImpalaCNN(nn.Module):
-    def __init__(self, in_channels=3, img_size=64, depths=[16, 32, 32], out_size=256):
+    def __init__(self, in_channels=3, img_size=64, depths=[16, 32, 32], out_size=256,
+                 act=F.relu):
         super().__init__()
+        # act=F.elu gives the "impala_elu" ablation variant: the Nature
+        # encoder was deliberately moved to ELU to avoid dead units during
+        # BPTT, and default-impala reintroduced ReLU everywhere.
         blocks = []
         ch = in_channels
         for out_channels in depths:
-            blocks.append(ImpalaBlock(ch, out_channels))
+            blocks.append(ImpalaBlock(ch, out_channels, act=act))
             ch = out_channels
         self.blocks = nn.Sequential(*blocks)
 
@@ -104,8 +109,9 @@ class ImpalaCNN(nn.Module):
         dummy = torch.zeros(1, in_channels, img_size, img_size)
         with torch.no_grad():
             flatten_size = self.blocks(dummy).numel()
+        act_mod = nn.ELU() if act is F.elu else nn.ReLU()
         self.fc = nn.Sequential(
-            nn.Flatten(), nn.ReLU(), nn.Linear(flatten_size, out_size), nn.ReLU()
+            nn.Flatten(), act_mod, nn.Linear(flatten_size, out_size), act_mod
         )
 
     def forward(self, x):
@@ -125,6 +131,8 @@ class RecurrentQNetwork(nn.Module):
         # depends on that width.
         if encoder == "impala":
             self.encoder = ImpalaCNN(in_channels, img_size, out_size=512)
+        elif encoder == "impala_elu":
+            self.encoder = ImpalaCNN(in_channels, img_size, out_size=512, act=F.elu)
         elif encoder == "nature":
             self.encoder = NatureCNNEncoder(in_channels, img_size)
         else:

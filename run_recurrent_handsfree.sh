@@ -206,17 +206,20 @@ echo "=========================================================="
 # 9b: dqfd_lite (Exp 8b) + demo starts.
 for seed in {42..44}
 do
-    echo "[Exp 9a] Online DQN (Seed $seed)"
-    python3 recurrent_main.py --env $ENV --online_rl \
+    
+    
+    echo "[Exp 9b] DQfD-lite + demo-state starts (Seed $seed)"
+    python3 recurrent_main.py --env $ENV --online_rl --bc --r2d3 --n_step_expert 5 \
+        --bc_epsilon 0.02 \
+        --bc_weight 1.0 --bc_weight_end 0.1 --bc_weight_decay_frames 500000 \
         --demo_start_envs 2 --demo_start_priority 0.6 \
         --num_rl_frames $RL_FRAMES \
         --num_unified_epochs $EPOCHS_ONLINE \
         --total_iterations $ITERATIONS_ONLINE \
         --num_envs 8 \
         --preload_expert_data $CLEANED_EXPERT_DATA \
-        --experiment_name "online" --seed $seed
-
-    echo ""
+        --experiment_name "dqfd_demostart" --seed $seed
+    echo "[Exp 9a] Online DQN (Seed $seed)"
     echo ""
     echo "[Exp 9a] Online DQN + demo-state starts (Seed $seed)"
     python3 recurrent_main.py --env $ENV --online_rl \
@@ -229,17 +232,16 @@ do
         --experiment_name "online_demostart" --seed $seed
 
     echo ""
-    echo "[Exp 9b] DQfD-lite + demo-state starts (Seed $seed)"
-    python3 recurrent_main.py --env $ENV --online_rl --bc --r2d3 --n_step_expert 5 \
-        --bc_epsilon 0.02 \
-        --bc_weight 1.0 --bc_weight_end 0.1 --bc_weight_decay_frames 500000 \
+    python3 recurrent_main.py --env $ENV --online_rl \
         --demo_start_envs 2 --demo_start_priority 0.6 \
         --num_rl_frames $RL_FRAMES \
         --num_unified_epochs $EPOCHS_ONLINE \
         --total_iterations $ITERATIONS_ONLINE \
         --num_envs 8 \
         --preload_expert_data $CLEANED_EXPERT_DATA \
-        --experiment_name "dqfd_demostart" --seed $seed
+        --experiment_name "online" --seed $seed
+    echo ""
+    
 done
 
 # --- RESUME EXAMPLE: continue a finished run that is still trending up ---
