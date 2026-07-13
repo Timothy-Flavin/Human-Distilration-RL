@@ -120,7 +120,12 @@ class FastGPUEpisodicBuffer:
 
         act_np = np.array([t['action'] for t in transitions], dtype=np.int64)
         rew_np = np.array([t['reward'] for t in transitions], dtype=np.float32)
-        done_np = np.array([float(t['terminated'] or t['truncated']) for t in transitions], dtype=np.float32)
+        # TD bootstrap mask: only TERMINATED zeroes the bootstrap. Truncated
+        # episodes (expert quit, time limits) were cut off at a live state —
+        # their value continues through next_obs_final, exactly like the old
+        # flags-both-False expert quits behaved. Truncation still ends the
+        # episode for windowing via episode_metadata.
+        done_np = np.array([float(t['terminated']) for t in transitions], dtype=np.float32)
 
         # Write to GPU
         idx_range = torch.arange(start_ptr, end_ptr, device=self.device)

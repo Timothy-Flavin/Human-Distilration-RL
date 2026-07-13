@@ -6,17 +6,45 @@ import numpy as np
 import glob
 
 
-def aggregate_and_plot(experiment_dir, output_dir):
+def aggregate_and_plot(experiment_dirs, output_dirs):
     """
     Produces 6 paper-ready graphs by aggregating across multiple seeds.
+    experiment_dirs: one experiment's directory in each results root
+    (seeds of the same experiment split across machines are pooled).
+    The same plots are written to every output_dir, so each root's copy
+    of the experiment carries current plots.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    metrics_files = glob.glob(
-        os.path.join(experiment_dir, "**", "metrics_latest.json"), recursive=True
-    )
+    if isinstance(experiment_dirs, str):
+        experiment_dirs = [experiment_dirs]
+    if isinstance(output_dirs, str):
+        output_dirs = [output_dirs]
+    for od in output_dirs:
+        os.makedirs(od, exist_ok=True)
+
+    def save(fname):
+        for od in output_dirs:
+            plt.savefig(os.path.join(od, fname))
+    metrics_files = []
+    for d in experiment_dirs:
+        metrics_files.extend(
+            glob.glob(os.path.join(d, "**", "metrics_latest.json"), recursive=True)
+        )
+
+    # Same seed present in more than one root (copied results) would be
+    # double-counted in the mean: keep the first root's copy.
+    seen_seeds = set()
+    unique_files = []
+    for f_path in metrics_files:
+        seed_key = os.path.basename(os.path.dirname(f_path))
+        if seed_key in seen_seeds:
+            print(f"Note: skipping duplicate seed dir {f_path}")
+            continue
+        seen_seeds.add(seed_key)
+        unique_files.append(f_path)
+    metrics_files = unique_files
 
     if not metrics_files:
-        print(f"No metrics files found in {experiment_dir}")
+        print(f"No metrics files found in {experiment_dirs}")
         return
 
     all_data = []
@@ -28,7 +56,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
             print(f"Warning: skipping invalid metrics file {f_path}: {e}")
 
     if not all_data:
-        print(f"No valid metrics files found in {experiment_dir}")
+        print(f"No valid metrics files found in {experiment_dirs}")
         return
 
     num_seeds = len(all_data)
@@ -192,7 +220,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.ylabel("Eval Return")
     plt.grid(True)
     plt.legend()
-    plt.savefig(os.path.join(output_dir, "1_sample_efficiency.png"))
+    save("1_sample_efficiency.png")
 
     # --- Plot 2: Wall-clock Time vs Eval Score ---
     plt.figure(figsize=(10, 6))
@@ -207,7 +235,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.ylabel("Eval Return")
     plt.grid(True)
     plt.legend()
-    plt.savefig(os.path.join(output_dir, "2_realtime_performance.png"))
+    save("2_realtime_performance.png")
 
     # --- Plot 3: Human Likeness (Cross Entropy) ---
     plt.figure(figsize=(10, 6))
@@ -221,7 +249,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.ylabel("Cross-Entropy Loss (Expert Data)")
     plt.grid(True)
     plt.legend()
-    plt.savefig(os.path.join(output_dir, "3_human_likeness.png"))
+    save("3_human_likeness.png")
 
     # --- Plot 4: Active Human Time vs Eval Score ---
     plt.figure(figsize=(10, 6))
@@ -239,7 +267,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.ylabel("Eval Return")
     plt.grid(True)
     plt.legend()
-    plt.savefig(os.path.join(output_dir, "4_human_effort_efficiency.png"))
+    save("4_human_effort_efficiency.png")
 
     # --- Plot 5: Bar-graph of Frames by Category ---
     plt.figure(figsize=(12, 7))
@@ -250,7 +278,7 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.bar(f_labels, f_means, yerr=f_stds, color="green", alpha=0.7, capsize=10)
     plt.title("Distribution of Environment Samples")
     plt.ylabel("Total Frames")
-    plt.savefig(os.path.join(output_dir, "5_frame_distribution.png"))
+    save("5_frame_distribution.png")
 
     # --- Plot 6: Bar-graph of Time by Category ---
     plt.figure(figsize=(12, 7))
@@ -261,21 +289,28 @@ def aggregate_and_plot(experiment_dir, output_dir):
     plt.title("Time Allocation Breakdown")
     plt.xlabel("Seconds")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "6_time_breakdown.png"))
+    save("6_time_breakdown.png")
 
-    print(f"Paper-ready graphs saved to {output_dir}")
+    print(f"Paper-ready graphs saved to {output_dirs}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="LunarLander-v3")
     parser.add_argument("--experiment_name", type=str, required=True)
+    parser.add_argument("--roots", type=str, nargs="+", default=["results"],
+                        help="Results roots to search (e.g. results lab-impala); "
+                             "seeds found in any root are pooled into one plot")
     args = parser.parse_args()
 
-    experiment_dir = os.path.join("results", args.env, args.experiment_name)
-    output_dir = os.path.join(experiment_dir, "plots")
-
-    if not os.path.exists(experiment_dir):
-        print(f"Error: Experiment directory not found at {experiment_dir}")
+    experiment_dirs = [
+        d for d in (os.path.join(r, args.env, args.experiment_name) for r in args.roots)
+        if os.path.exists(d)
+    ]
+    if not experiment_dirs:
+        print(f"Error: Experiment '{args.experiment_name}' not found under any of "
+              f"{[os.path.join(r, args.env) for r in args.roots]}")
     else:
-        aggregate_and_plot(experiment_dir, output_dir)
+        # Plots land next to the first root that has the experiment
+        output_dirs = [os.path.join(d, "plots") for d in experiment_dirs]
+        aggregate_and_plot(experiment_dirs, output_dirs)

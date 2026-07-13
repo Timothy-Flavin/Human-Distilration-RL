@@ -27,6 +27,14 @@ elif [ -f "./.venv/bin/activate" ]; then
     source ./.venv/bin/activate
 fi
 
+# The dqfd x impala arm holds two full IMPALA activation graphs per epoch
+# and runs ~1GB from the 16GB ceiling. Resumes front-load checkpoint load +
+# 20k-frame warmup + expert hidden refresh BEFORE the first training epoch,
+# fragmenting the allocator so the twin graphs can't be placed (OOM with
+# 1.5GB reserved-but-unallocated). Expandable segments removes the
+# contiguity requirement.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 ENV="crafter"
 CLEANED_EXPERT_DATA="expert_demonstrations_crafter_cleaned.pkl"
 EPOCHS=30

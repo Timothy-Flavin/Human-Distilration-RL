@@ -273,6 +273,13 @@ def main():
             obs = next_obs
             
         if episode_transitions:
+            # Quitting ('Q' / window close) breaks out before env.step, so a
+            # quit episode's last transition has neither flag set: mark it
+            # truncated (cut off at a live state; consumers bootstrap through
+            # it, unlike terminated).
+            last = episode_transitions[-1]
+            if not last['terminated'] and not last['truncated']:
+                last['truncated'] = True
             duration = time.time() - start_time
             dataset.append({
                 "transitions": episode_transitions,
