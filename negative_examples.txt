@@ -1,6 +1,0 @@
-You are spinning out of control and going down fast, hit the correct rotation thruster until you start rotating back towards vertical then try to thrust out of the fall with the main engine until you crash or your vertical velocity cancels out enough to stop the spin back. {'x_pos': 0.12610730528831482, 'y_pos': 1.4390538930892944, 'x_vel': 0.3537416458129883, 'y_vel': -0.3047916293144226, 'angle': 0.519317090511322, 'angular_vel': 0.8656536340713501, 'leg1_contact': False, 'leg2_contact': False, 'readable_summary': 'Pos:(0.13, 1.44), Vel:(0.35, -0.30), Angle:0.52'}
-
-
-
-
-ignore height between 0.2 and 1.2, focus on horizontal centering
