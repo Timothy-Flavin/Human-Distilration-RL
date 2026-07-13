@@ -72,6 +72,18 @@ class ResidualBlock(nn.Module):
         return x + out
 
 
+class ConvLayerNorm(nn.Module):
+    """LayerNorm over the channel dim of a (B, C, H, W) feature map
+    (channels-last style, per spatial position)."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.ln = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
 class ImpalaBlock(nn.Module):
     def __init__(self, in_channels, out_channels, act=F.relu):
         super().__init__()
@@ -92,27 +104,41 @@ class ImpalaBlock(nn.Module):
 
 class ImpalaCNN(nn.Module):
     def __init__(self, in_channels=3, img_size=64, depths=[16, 32, 32], out_size=256,
-                 act=F.relu):
+                 act=F.relu, pool="flatten", layer_norm=False):
         super().__init__()
         # act=F.elu gives the "impala_elu" ablation variant: the Nature
         # encoder was deliberately moved to ELU to avoid dead units during
         # BPTT, and default-impala reintroduced ReLU everywhere.
+        # pool="avg" + layer_norm=True gives the "impoola" variant: global
+        # average pooling replaces the flatten (Impoola architecture) and a
+        # channelwise LayerNorm follows each conv block.
         blocks = []
         ch = in_channels
         for out_channels in depths:
             blocks.append(ImpalaBlock(ch, out_channels, act=act))
+            if layer_norm:
+                blocks.append(ConvLayerNorm(out_channels))
             ch = out_channels
         self.blocks = nn.Sequential(*blocks)
 
-        # For a 64x64 input, 3 max pools of stride 2 yield an 8x8 spatial resolution.
-        # 8 * 8 * 32 (final depth) = 2048. Computed dynamically for other sizes.
-        dummy = torch.zeros(1, in_channels, img_size, img_size)
-        with torch.no_grad():
-            flatten_size = self.blocks(dummy).numel()
         act_mod = nn.ELU() if act is F.elu else nn.ReLU()
-        self.fc = nn.Sequential(
-            nn.Flatten(), act_mod, nn.Linear(flatten_size, out_size), act_mod
-        )
+        if pool == "avg":
+            # Global average pooling: fc input is just the final channel
+            # count (32 by default), independent of spatial resolution.
+            self.fc = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1), nn.Flatten(), act_mod,
+                nn.Linear(depths[-1], out_size), act_mod
+            )
+        else:
+            # For a 64x64 input, 3 max pools of stride 2 yield an 8x8 spatial
+            # resolution. 8 * 8 * 32 (final depth) = 2048. Computed
+            # dynamically for other sizes.
+            dummy = torch.zeros(1, in_channels, img_size, img_size)
+            with torch.no_grad():
+                flatten_size = self.blocks(dummy).numel()
+            self.fc = nn.Sequential(
+                nn.Flatten(), act_mod, nn.Linear(flatten_size, out_size), act_mod
+            )
 
     def forward(self, x):
         # Ensure input is scaled to [0, 1] if passing raw pixels
@@ -123,16 +149,35 @@ class ImpalaCNN(nn.Module):
 
 class RecurrentQNetwork(nn.Module):
     def __init__(self, action_dim, in_channels=3, img_size=64, hidden_dim=512,
-                 encoder="impala"):
+                 encoder="impala", encoder_width=1, encoder_chunks=1):
         super(RecurrentQNetwork, self).__init__()
+        # encoder_chunks > 1: activation-checkpoint the CNN forward in that
+        # many frame chunks — conv activations are recomputed chunk-by-chunk
+        # during backward instead of stored, so the live graph shrinks by
+        # roughly that factor (needed for width-2 encoders on a 16GB card)
+        # at the cost of one extra encoder forward per update. Exact same
+        # gradients; no_grad paths (burn-in, target net, acting) unaffected.
+        self.encoder_chunks = encoder_chunks
         # IMPALA ResNet encoder by default; "nature" keeps the old Nature CNN
         # (needed to load pre-impala checkpoints). Both emit 512-d features —
         # buffer replay code (refresh_hidden_states / compute_td_errors)
         # depends on that width.
+        # encoder_width = Impoola-paper tau: channel depths [16,32,32]*tau
+        # (their recommended config is tau=2). Ignored by the nature encoder.
+        depths = [16 * encoder_width, 32 * encoder_width, 32 * encoder_width]
         if encoder == "impala":
-            self.encoder = ImpalaCNN(in_channels, img_size, out_size=512)
+            self.encoder = ImpalaCNN(in_channels, img_size, depths=depths,
+                                     out_size=512)
         elif encoder == "impala_elu":
-            self.encoder = ImpalaCNN(in_channels, img_size, out_size=512, act=F.elu)
+            self.encoder = ImpalaCNN(in_channels, img_size, depths=depths,
+                                     out_size=512, act=F.elu)
+        elif encoder == "impoola":
+            self.encoder = ImpalaCNN(in_channels, img_size, depths=depths,
+                                     out_size=512, pool="avg", layer_norm=True)
+        elif encoder == "impoola_elu":
+            self.encoder = ImpalaCNN(in_channels, img_size, depths=depths,
+                                     out_size=512, act=F.elu, pool="avg",
+                                     layer_norm=True)
         elif encoder == "nature":
             self.encoder = NatureCNNEncoder(in_channels, img_size)
         else:
@@ -146,7 +191,15 @@ class RecurrentQNetwork(nn.Module):
         if features is None:
             # Flatten batch and sequence for the CNN forward pass
             x_flat = x.reshape(batch_size * seq_len, c, h, w)
-            features = self.encoder(x_flat)
+            if self.encoder_chunks > 1 and torch.is_grad_enabled() and self.training:
+                features = torch.cat([
+                    torch.utils.checkpoint.checkpoint(
+                        self.encoder, chunk, use_reentrant=False
+                    )
+                    for chunk in x_flat.chunk(self.encoder_chunks)
+                ])
+            else:
+                features = self.encoder(x_flat)
             features = features.reshape(batch_size, seq_len, -1)
 
         lstm_out, hidden = self.lstm(features, hidden)
@@ -173,6 +226,9 @@ class RCQLAgent(Agent):
         lr=3e-4,
         epsilon=0.1,
         encoder="impala",
+        encoder_width=1,
+        encoder_chunks=1,
+        amp=False,
     ):
         super().__init__(obs_dim, action_dim, name, save_dir, device_name)
 
@@ -181,9 +237,13 @@ class RCQLAgent(Agent):
 
         self.hidden_dim = hidden_dim
         self.epsilon = epsilon
+        # bf16 autocast for the update forwards (--amp). bf16 needs no
+        # GradScaler (fp32 exponent range); params/grads/optimizer stay fp32.
+        self.amp = amp
 
         self.q_net = RecurrentQNetwork(
-            action_dim, in_channels, img_size, hidden_dim, encoder=encoder
+            action_dim, in_channels, img_size, hidden_dim, encoder=encoder,
+            encoder_width=encoder_width, encoder_chunks=encoder_chunks,
         ).to(self.device_name)
         self.q_target = copy.deepcopy(self.q_net)
         self.q_optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
@@ -198,6 +258,13 @@ class RCQLAgent(Agent):
         self.q_hidden = None
         self.last_q = None
         self.replay_buffer = collections.deque(maxlen=1000)
+
+    def _autocast(self):
+        """bf16 autocast context for update-path forwards; no-op unless
+        --amp and CUDA. Backwards/steps always run OUTSIDE this context —
+        autograd replays the recorded (bf16) ops and accumulates fp32 grads."""
+        enabled = self.amp and str(self.device_name).startswith("cuda")
+        return torch.autocast("cuda", dtype=torch.bfloat16, enabled=enabled)
 
     def reset_hidden(self):
         self.q_hidden = None
@@ -299,35 +366,48 @@ class RCQLAgent(Agent):
         burn_in=16,
         train=False,
     ) -> dict:
-        h0 = self._make_hidden(init_hidden)
-        if burn_in > 0:
-            with torch.no_grad():
-                burn_obs = obs[:, :burn_in, :]
-                _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
-                _, _, _, h_q_target = self.q_target(burn_obs, hidden=h0)
-        else:
-            h_q, h_q_target = h0, h0
+        with self._autocast():
+            h0 = self._make_hidden(init_hidden)
+            if burn_in > 0:
+                with torch.no_grad():
+                    burn_obs = obs[:, :burn_in, :]
+                    _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
+                    _, _, _, h_q_target = self.q_target(burn_obs, hidden=h0)
+            else:
+                h_q, h_q_target = h0, h0
 
-        obs_active = obs[:, burn_in:, :]
+            obs_active = obs[:, burn_in:, :]
+
+            if train:
+                _, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
+                current_v = v_full[:, :-1, :].squeeze(-1)
+
+                with torch.no_grad():
+                    _, v_target_full, _, _ = self.q_target(
+                        obs_active, hidden=h_q_target
+                    )
+                    next_v = v_target_full[:, 1:, :].squeeze(-1)
+
+                r_active = rewards[:, burn_in:]
+                d_active = dones[:, burn_in:]
+                m_active = masks[:, burn_in:]
+
+                target_v = r_active + (1.0 - d_active) * self.gamma * next_v
+                loss_v_unmasked = F.mse_loss(current_v, target_v, reduction="none")
+
+                valid_steps = m_active.sum() + 1e-8
+                loss_v = (loss_v_unmasked * m_active).sum() / valid_steps
+            else:
+                with torch.no_grad():
+                    _, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
+                    current_v = v_full[:, :-1, :].squeeze(-1)
+
+                    _, v_target_full, _, _ = self.q_target(
+                        obs_active, hidden=h_q_target
+                    )
+                    next_v = v_target_full[:, 1:, :].squeeze(-1)
 
         if train:
-            _, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
-            current_v = v_full[:, :-1, :].squeeze(-1)
-
-            with torch.no_grad():
-                _, v_target_full, _, _ = self.q_target(obs_active, hidden=h_q_target)
-                next_v = v_target_full[:, 1:, :].squeeze(-1)
-
-            r_active = rewards[:, burn_in:]
-            d_active = dones[:, burn_in:]
-            m_active = masks[:, burn_in:]
-
-            target_v = r_active + (1.0 - d_active) * self.gamma * next_v
-            loss_v_unmasked = F.mse_loss(current_v, target_v, reduction="none")
-
-            valid_steps = m_active.sum() + 1e-8
-            loss_v = (loss_v_unmasked * m_active).sum() / valid_steps
-
             self.q_optimizer.zero_grad()
             loss_v.backward()
             torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
@@ -343,12 +423,6 @@ class RCQLAgent(Agent):
             loss_v_val = loss_v.item()
             self.epsilon = 0.01
         else:
-            with torch.no_grad():
-                _, v_full, _, _ = self.q_net(obs_active, hidden=h_q)
-                current_v = v_full[:, :-1, :].squeeze(-1)
-
-                _, v_target_full, _, _ = self.q_target(obs_active, hidden=h_q_target)
-                next_v = v_target_full[:, 1:, :].squeeze(-1)
             loss_v_val = 0.0
 
         return {
@@ -376,59 +450,60 @@ class RCQLAgent(Agent):
         PER importance-sampling corrections applied to the TD term. Returns
         (loss, aux) where aux includes per-step |TD error| ("td_abs", detached,
         active region only) for priority updates."""
-        with torch.no_grad():
-            h0 = self._make_hidden(init_hidden)
-            if burn_in > 0:
-                burn_obs = obs[:, :burn_in, :]
-                _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
-                _, _, _, h_q_target = self.q_target(burn_obs, hidden=h0)
+        with self._autocast():
+            with torch.no_grad():
+                h0 = self._make_hidden(init_hidden)
+                if burn_in > 0:
+                    burn_obs = obs[:, :burn_in, :]
+                    _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
+                    _, _, _, h_q_target = self.q_target(burn_obs, hidden=h0)
+                else:
+                    h_q, h_q_target = h0, h0
+
+            obs_active = obs[:, burn_in:, :]
+            a_active = actions[:, burn_in:]
+            r_active = rewards[:, burn_in:]
+            d_active = dones[:, burn_in:]
+            m_active = masks[:, burn_in:]
+
+            q_logits_full, v_full, adv_full, _ = self.q_net(obs_active, hidden=h_q)
+            q_logits = q_logits_full[:, :-1, :]
+            current_q = q_logits.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
+            current_v = v_full[:, :-1, :].squeeze(-1)
+
+            with torch.no_grad():
+                q_target_full, v_target_full, _, _ = self.q_target(
+                    obs_active, hidden=h_q_target
+                )
+                # Double DQN: action selection by the online net, evaluation by the target net
+                next_actions = q_logits_full[:, 1:, :].argmax(dim=2, keepdim=True)
+                next_q = q_target_full[:, 1:, :].gather(2, next_actions).squeeze(-1)
+                next_v = v_target_full[:, 1:, :].squeeze(-1)
+                target_q = r_active + (1.0 - d_active) * self.gamma * next_q
+                # Uncorrected n-step returns (Rainbow/R2D2 style). Each pass deepens
+                # every position's return by one step via its right neighbor,
+                # truncating at episode ends (dones) and at the window end (the
+                # last column keeps its shallower return).
+                for _ in range(n_step - 1):
+                    shifted = torch.cat([target_q[:, 1:], target_q[:, -1:]], dim=1)
+                    extended = r_active + (1.0 - d_active) * self.gamma * shifted
+                    extended[:, -1] = target_q[:, -1]
+                    target_q = extended
+
+            q_td_loss_unmasked = F.mse_loss(current_q, target_q, reduction="none")
+            if is_weights is not None:
+                q_td_loss_unmasked = q_td_loss_unmasked * is_weights.unsqueeze(1)
+
+            valid_steps = m_active.sum() + 1e-8
+            q_loss = (q_td_loss_unmasked * m_active).sum() / valid_steps
+
+            cql_loss = torch.tensor(0.0).to(self.device_name)
+            if use_cql:
+                cql_loss_unmasked = torch.logsumexp(q_logits, dim=2) - current_q
+                cql_loss = (cql_loss_unmasked * m_active).sum() / valid_steps
+                total_loss = q_loss + self.cql_alpha * cql_loss
             else:
-                h_q, h_q_target = h0, h0
-
-        obs_active = obs[:, burn_in:, :]
-        a_active = actions[:, burn_in:]
-        r_active = rewards[:, burn_in:]
-        d_active = dones[:, burn_in:]
-        m_active = masks[:, burn_in:]
-
-        q_logits_full, v_full, adv_full, _ = self.q_net(obs_active, hidden=h_q)
-        q_logits = q_logits_full[:, :-1, :]
-        current_q = q_logits.gather(2, a_active.unsqueeze(-1)).squeeze(-1)
-        current_v = v_full[:, :-1, :].squeeze(-1)
-
-        with torch.no_grad():
-            q_target_full, v_target_full, _, _ = self.q_target(
-                obs_active, hidden=h_q_target
-            )
-            # Double DQN: action selection by the online net, evaluation by the target net
-            next_actions = q_logits_full[:, 1:, :].argmax(dim=2, keepdim=True)
-            next_q = q_target_full[:, 1:, :].gather(2, next_actions).squeeze(-1)
-            next_v = v_target_full[:, 1:, :].squeeze(-1)
-            target_q = r_active + (1.0 - d_active) * self.gamma * next_q
-            # Uncorrected n-step returns (Rainbow/R2D2 style). Each pass deepens
-            # every position's return by one step via its right neighbor,
-            # truncating at episode ends (dones) and at the window end (the
-            # last column keeps its shallower return).
-            for _ in range(n_step - 1):
-                shifted = torch.cat([target_q[:, 1:], target_q[:, -1:]], dim=1)
-                extended = r_active + (1.0 - d_active) * self.gamma * shifted
-                extended[:, -1] = target_q[:, -1]
-                target_q = extended
-
-        q_td_loss_unmasked = F.mse_loss(current_q, target_q, reduction="none")
-        if is_weights is not None:
-            q_td_loss_unmasked = q_td_loss_unmasked * is_weights.unsqueeze(1)
-
-        valid_steps = m_active.sum() + 1e-8
-        q_loss = (q_td_loss_unmasked * m_active).sum() / valid_steps
-
-        cql_loss = torch.tensor(0.0).to(self.device_name)
-        if use_cql:
-            cql_loss_unmasked = torch.logsumexp(q_logits, dim=2) - current_q
-            cql_loss = (cql_loss_unmasked * m_active).sum() / valid_steps
-            total_loss = q_loss + self.cql_alpha * cql_loss
-        else:
-            total_loss = q_loss
+                total_loss = q_loss
 
         aux = {
             "q_loss": q_loss.item(),
@@ -502,24 +577,25 @@ class RCQLAgent(Agent):
         # bc_epsilon decouples the BC target entropy from the exploration schedule;
         # None preserves the coupled behavior (self.epsilon).
         eps = self.epsilon if bc_epsilon is None else bc_epsilon
-        if h_q is None:
-            with torch.no_grad():
-                h0 = self._make_hidden(init_hidden)
-                if burn_in > 0:
-                    burn_obs = obs[:, :burn_in, :]
-                    _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
-                else:
-                    h_q = h0
+        with self._autocast():
+            if h_q is None:
+                with torch.no_grad():
+                    h0 = self._make_hidden(init_hidden)
+                    if burn_in > 0:
+                        burn_obs = obs[:, :burn_in, :]
+                        _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
+                    else:
+                        h_q = h0
 
-        obs_active = obs[:, burn_in:-1, :]
-        a_active = actions[:, burn_in:]
-        m_active = masks[:, burn_in:]
+            obs_active = obs[:, burn_in:-1, :]
+            a_active = actions[:, burn_in:]
+            m_active = masks[:, burn_in:]
 
-        q_logits, _, adv_active, _ = self.q_net(obs_active, hidden=h_q)
-        loss = self._imitation_loss_core(
-            q_logits, adv_active, a_active, m_active,
-            advantages=advantages, naive=naive, eps=eps,
-        )
+            q_logits, _, adv_active, _ = self.q_net(obs_active, hidden=h_q)
+            loss = self._imitation_loss_core(
+                q_logits, adv_active, a_active, m_active,
+                advantages=advantages, naive=naive, eps=eps,
+            )
         return loss, h_q
 
     def _imitation_loss_core(self, q_logits, adv_active, a_active, m_active,
@@ -630,68 +706,120 @@ class RCQLAgent(Agent):
         is_weights: (B,) PER corrections for the online TD term.
         expert_advantages_fn: callable(aux) -> advantages for AWBC, given the
         demo TD aux dict (current_v / next_v); used only when awbc and demo_td.
-        """
-        total = None
-        out = {}
 
+        Each term's graph is backwarded as soon as it is complete, with
+        gradients accumulating in .grad, then ONE clip / optimizer step at the
+        end — numerically the same single update as backwarding the summed
+        loss, but only one IMPALA activation graph (~GBs) is live at a time
+        instead of two (the arm's expert + online graphs together OOM a 16GB
+        card). The demo TD + imitation terms share a forward, so they
+        backward together.
+        """
+        out = {}
+        total_loss_val = 0.0
+        did_backward = False
+        self.q_optimizer.zero_grad()
+
+        expert_term = None
         if expert_batch is not None and demo_td:
             loss_e, aux_e = self.td_loss(
                 *expert_batch, burn_in=burn_in,
                 use_cql=use_cql, n_step=expert_n_step,
             )
-            total = loss_e
+            expert_term = loss_e
             out["loss_td_expert"] = loss_e.item()
             out["cql_loss"] = aux_e["cql_loss"]
             out["h_q_expert"] = aux_e["h_q"]
             out["expert_aux"] = aux_e
 
         if expert_batch is not None and (bc or awbc) and self.bc_weight > 0:
-            advantages = None
-            if awbc and expert_advantages_fn is not None:
-                # fn receives the demo TD aux (with current_v/next_v) when the
-                # demo TD term ran this epoch, else None and may fall back to a
-                # compute-only value forward.
-                advantages = expert_advantages_fn(out.get("expert_aux"))
+            eps = self.epsilon if bc_epsilon is None else bc_epsilon
             if "expert_aux" in out:
                 # Reuse the demo TD forward's outputs — its q_logits/adv cover
                 # exactly the imitation term's active region, so no second
-                # activation graph is built for the expert batch.
+                # activation graph is built for the expert batch; for AWBC its
+                # current_v/next_v also supply the advantage weights for free.
                 aux_e = out["expert_aux"]
-                eps = self.epsilon if bc_epsilon is None else bc_epsilon
+                advantages = (
+                    expert_advantages_fn(aux_e)
+                    if awbc and expert_advantages_fn is not None else None
+                )
                 loss_bc = self._imitation_loss_core(
                     aux_e["q_logits"], aux_e["adv_active"],
                     expert_batch[1][:, burn_in:], expert_batch[4][:, burn_in:],
                     advantages=advantages, eps=eps,
                 )
+            elif awbc and expert_advantages_fn is not None:
+                # No demo TD forward this epoch: build the imitation forward
+                # over the full active window (as td_loss does) so its own
+                # (detached) V estimates feed the advantage weights — no
+                # separate update_value rebuild of V(s); only next-state V
+                # needs a no-grad target-net pass. Values are identical to
+                # the old rebuild: same weights, same burn-in hiddens, and
+                # the LSTM is causal so the extra trailing frame changes
+                # nothing for the sliced steps. (In offline-only AWBC the fn
+                # ignores this dict and trains V itself — see train_v.)
+                obs_e, act_e = expert_batch[0], expert_batch[1]
+                mask_e, hid_e = expert_batch[4], expert_batch[5]
+                with self._autocast():
+                    with torch.no_grad():
+                        h0 = self._make_hidden(hid_e)
+                        if burn_in > 0:
+                            burn_obs = obs_e[:, :burn_in, :]
+                            _, _, _, h_q = self.q_net(burn_obs, hidden=h0)
+                            _, _, _, h_t = self.q_target(burn_obs, hidden=h0)
+                        else:
+                            h_q, h_t = h0, h0
+                    obs_active = obs_e[:, burn_in:, :]
+                    q_full, v_full, adv_full, _ = self.q_net(
+                        obs_active, hidden=h_q
+                    )
+                    with torch.no_grad():
+                        _, v_t_full, _, _ = self.q_target(obs_active, hidden=h_t)
+                    advantages = expert_advantages_fn({
+                        "current_v": v_full[:, :-1, :].squeeze(-1).detach(),
+                        "next_v": v_t_full[:, 1:, :].squeeze(-1),
+                    })
+                    loss_bc = self._imitation_loss_core(
+                        q_full[:, :-1, :], adv_full[:, :-1, :],
+                        act_e[:, burn_in:], mask_e[:, burn_in:],
+                        advantages=advantages, eps=eps,
+                    )
             else:
                 loss_bc, _ = self.supervised_loss(
                     expert_batch[0], expert_batch[1], expert_batch[4],
                     init_hidden=expert_batch[5], burn_in=burn_in,
-                    advantages=advantages,
                     bc_epsilon=bc_epsilon,
                 )
-            total = loss_bc * self.bc_weight if total is None else total + loss_bc * self.bc_weight
+            weighted_bc = loss_bc * self.bc_weight
+            expert_term = weighted_bc if expert_term is None else expert_term + weighted_bc
             out["loss_supervised"] = loss_bc.item()
+
+        if expert_term is not None and expert_term.requires_grad:
+            total_loss_val += expert_term.item()
+            expert_term.backward()
+            did_backward = True
 
         if online_batch is not None:
             loss_o, aux_o = self.td_loss(
                 *online_batch, burn_in=burn_in,
                 use_cql=False, n_step=online_n_step, is_weights=is_weights,
             )
-            total = loss_o if total is None else total + loss_o
             out["loss_td_online"] = loss_o.item()
             out["td_abs_online"] = aux_o["td_abs"]
             out["m_active_online"] = aux_o["m_active"]
+            if loss_o.requires_grad:
+                total_loss_val += loss_o.item()
+                loss_o.backward()
+                did_backward = True
 
-        if total is None or not total.requires_grad:
+        if not did_backward:
             return out
 
-        self.q_optimizer.zero_grad()
-        total.backward()
         torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.q_optimizer.step()
         self.soft_update_target()
-        out["loss_total"] = total.item()
+        out["loss_total"] = total_loss_val
         return out
 
     def get_bc_loss(self, obs, actions, masks, init_hidden=None, burn_in=16) -> float:

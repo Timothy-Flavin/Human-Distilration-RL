@@ -363,13 +363,15 @@ def unified_train_step(args, agent, buffers, metrics):
                 on_batch = buffers["online"].sample_batch(batch_size, seq_len=seq_len)
             total_frames_processed += batch_size * (seq_len + 1)
 
-        # AWBC advantages: A = r + gamma*V(s') - V(s). V comes from the demo
-        # TD forward when it ran this epoch, else from a value forward
-        # (trained only in offline-only mode, as before).
+        # AWBC advantages: A = r + gamma*V(s') - V(s). V comes from whichever
+        # forward unified_update already ran this epoch (demo TD aux, or the
+        # imitation forward's own V) — no separate value rebuild. Offline-only
+        # mode ignores the provided values and runs update_value(train=True)
+        # so V actually trains, as before.
         train_v = args.awbc and not (args.online_rl or args.offline_rl)
 
         def expert_advantages(td_aux, _exp=exp_batch):
-            if td_aux is not None:
+            if td_aux is not None and not train_v:
                 v_s, v_ns = td_aux["current_v"], td_aux["next_v"]
             else:
                 v_results = agent.update_value(*_exp, burn_in=burn_in, train=train_v)
@@ -581,10 +583,32 @@ def main():
                              "TD errors already computed during demo TD training "
                              "updates (0 = sweep every iteration, the old behavior)")
     parser.add_argument("--encoder", type=str, default="impala",
-                        choices=["impala", "impala_elu", "nature"],
+                        choices=["impala", "impala_elu", "impoola", "impoola_elu",
+                                 "nature"],
                         help="CNN encoder: IMPALA ResNet (default), impala_elu "
-                             "(ELU activations, ablation), or the old Nature "
+                             "(ELU activations, ablation), impoola / impoola_elu "
+                             "(global avg pool instead of flatten + LayerNorm "
+                             "after each conv block), or the old Nature "
                              "CNN (required to load pre-impala checkpoints)")
+    parser.add_argument("--encoder_width", type=int, default=1,
+                        help="Impoola-paper width multiplier tau for the "
+                             "IMPALA-family encoders: channel depths become "
+                             "[16,32,32]*tau (paper recommends 2). Ignored by "
+                             "the nature encoder; must match the checkpoint "
+                             "when resuming.")
+    parser.add_argument("--encoder_chunks", type=int, default=1,
+                        help="Activation-checkpoint the encoder's training "
+                             "forward in N frame chunks (1 = off). Cuts the "
+                             "live conv graph ~N-fold for one extra encoder "
+                             "forward per update; gradients are unchanged. "
+                             "Needed for --encoder_width 2 on a 16GB card.")
+    parser.add_argument("--amp", action="store_true",
+                        help="bf16 autocast on the update-path forwards "
+                             "(td/imitation/value losses). ~2x faster updates "
+                             "and ~40%% less activation memory than fp32; "
+                             "grads differ ~0.5%% from fp32 (params/optimizer "
+                             "stay fp32, no GradScaler needed with bf16). "
+                             "Acting/eval/hidden-refresh stay fp32.")
     parser.add_argument("--no_per", action="store_true",
                         help="Disable prioritized replay on the online buffer "
                              "(PER is on by default; expert buffer stays uniform)")
@@ -624,6 +648,9 @@ def main():
         save_dir=results_base_dir,
         device_name=device,
         encoder=args.encoder,
+        encoder_width=args.encoder_width,
+        encoder_chunks=args.encoder_chunks,
+        amp=args.amp,
     )
 
     # Eval-only probe: no buffers, no training — evaluate a checkpoint and exit.
